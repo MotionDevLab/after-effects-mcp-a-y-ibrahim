@@ -307,6 +307,13 @@ server.tool(
       "openProject",
       "saveProject",
       "closeProject",
+      "importFootage",
+      "importFolder",
+      "replaceFootage",
+      "findMissingFootage",
+      "collectFiles",
+      "reduceProject",
+      "organizeProjectItems",
     ];
 
     if (!allowedScripts.includes(script)) {
@@ -573,6 +580,188 @@ server.tool(
     } catch (error) {
       return {
         content: [{ type: "text", text: `Error closing project: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "import-footage",
+  "Import a file into the After Effects project as footage.",
+  {
+    filePath: z.string().describe("Absolute path to the file to import."),
+    name: z.string().optional().describe("Optional name to give the imported item (defaults to the file name)."),
+    sequence: z
+      .boolean()
+      .optional()
+      .describe("Import as an image sequence (treats the file as the first frame of a sequence)."),
+    forceAlphabetical: z
+      .boolean()
+      .optional()
+      .describe("When importing a sequence, force alphabetical ordering of frames."),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("importFootage", params, 15000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error importing footage: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "import-folder",
+  "Import every supported file in a folder into the project, optionally recursing into " +
+    "subfolders (creating a matching project-panel folder structure). Files that fail to " +
+    "import are skipped and reported individually rather than silently dropped.",
+  {
+    folderPath: z.string().describe("Absolute path to the folder to import."),
+    recursive: z
+      .boolean()
+      .optional()
+      .describe("Recurse into subfolders, creating a matching project-panel folder for each."),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("importFolder", params, 30000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error importing folder: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "replace-footage",
+  "Replace a project item's source file with a different file, keeping the same item " +
+    "(and all its usages in compositions) in place. Target the item by itemId or itemName.",
+  {
+    itemId: z.number().int().positive().optional().describe("Project item id (from getProjectInfo/inspect-comp)."),
+    itemName: z.string().optional().describe("Project item name (alternative to itemId)."),
+    newPath: z.string().describe("Absolute path to the replacement file."),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("replaceFootage", params, 15000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error replacing footage: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "find-missing-footage",
+  "List every footage item in the project whose source file is currently missing/offline.",
+  {},
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("findMissingFootage", params, 10000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error finding missing footage: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "collect-files",
+  "Copy the project's footage files and the project file itself into an output folder, " +
+    "for archiving or sharing a self-contained copy. The currently open project's own file " +
+    "path is never changed by this - it copies the existing saved .aep file rather than " +
+    "saving a new one, so requires the project to already be saved.",
+  {
+    outputPath: z.string().describe("Absolute path to the output folder (created if it doesn't exist)."),
+    includeFootage: z
+      .boolean()
+      .optional()
+      .describe("Copy referenced footage files into an output/footage subfolder (default true)."),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("collectFiles", params, 60000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error collecting files: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "reduce-project",
+  "Permanently delete every project item not used by the given composition(s), keeping " +
+    "only what those comps depend on. This is a native After Effects operation and is not " +
+    "reliably undoable. Requires confirm:true (no default) and at least one compName - " +
+    "there is no fallback to the active composition, to avoid silently reducing based on " +
+    "whatever happens to be active.",
+  {
+    compNames: z
+      .array(z.string())
+      .min(1)
+      .describe("Names of the composition(s) whose dependencies should be kept."),
+    confirm: z
+      .boolean()
+      .describe("Required, no default. Must be true to proceed - this permanently deletes unused project items."),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("reduceProject", params, 30000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error reducing project: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "organize-project-items",
+  "Organize top-level project panel items into folders. structure:'type' groups by " +
+    "Compositions/Footage/Solids; 'usage' groups by Used/Unused (referenced in any comp or " +
+    "not); 'custom' creates the folders you specify in customFolders and moves the named " +
+    "items into them.",
+  {
+    structure: z
+      .enum(["type", "usage", "custom"])
+      .optional()
+      .describe("Organization scheme to apply (default 'type')."),
+    customFolders: z
+      .array(
+        z.object({
+          folderName: z.string().describe("Name of the folder to create."),
+          itemNames: z.array(z.string()).optional().describe("Project item names to move into this folder."),
+          itemIds: z.array(z.number().int()).optional().describe("Project item ids to move into this folder (alternative/addition to itemNames)."),
+        }),
+      )
+      .optional()
+      .describe("Required when structure is 'custom'. One entry per folder to create."),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("organizeProjectItems", params, 20000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error organizing project items: ${String(error)}` }],
         isError: true,
       };
     }

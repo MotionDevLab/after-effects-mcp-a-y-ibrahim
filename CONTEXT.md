@@ -185,6 +185,9 @@ feature comparison below, so signing was not pursued.
 - `render-status` (empty-state response confirmed)
 - `create-project`, `open-project`, `save-project`, `close-project` (full
   12-step safety test, see the project-lifecycle spec section above)
+- `import-footage`, `import-folder`, `replace-footage`, `find-missing-footage`,
+  `collect-files`, `reduce-project`, `organize-project-items` (full 46-step
+  safety test, see the asset-management spec section above)
 
 ## Not yet tested
 
@@ -397,15 +400,97 @@ expect "no project open" as a resulting state.
    assume), and a never-saved dirty project with `saveFirst:true` (confirm
    the informed error fires instead of a crash or silent no-op).
 
+## SPEC: asset-management tools — IMPLEMENTED and verified 2026-07-29
+(branch `feature/asset-management-tools`)
+
+Written and implemented 2026-07-29, branched off
+`feature/project-lifecycle-tools` (a deliberate stack, not the general
+"branch from main" default — these two blocks are being built sequentially
+this time).
+
+Closes ishu86 gap #2: `import_footage`, `import_folder`, `replace_footage`,
+`find_missing_footage`, `collect_files`, `reduce_project`,
+`organize_project_items`. ishu86's CEP extension can't execute here (see the
+CEP blocker section above), so its **source** was read directly as ground
+truth for the real AE ExtendScript API surface rather than guessed from
+memory.
+
+**Confirmed from ishu86's source** (`assetGenerators.ts` /
+`projectGenerators.ts`):
+- `item.replace(file)` and `app.project.reduceProject([comp, ...])` are
+  genuine single native AE API calls — direct 1:1 ports.
+- "Import a folder," "find missing footage," "collect files," and "organize
+  into folders" have **no native AE API** — all four are hand-rolled via
+  `app.project.numItems`/`item(i)` iteration plus real properties
+  (`footageMissing`, `usedIn`, `parentFolder`, `items.addFolder()`) and real
+  `File`/`Folder` methods (`File.copy()`, `Folder.getFiles()`).
+- ishu86's zod schemas (`schemas.ts`) are dead code — never imported by the
+  actual handler, which casts args to `any`. Not evidence of what's actually
+  validated in that project.
+
+**Three deliberate deviations from ishu86**, decided before implementation:
+
+1. **`collect-files` does not repoint the live project.** ishu86 calls
+   `app.project.save(newPath)` to write the collected copy, which silently
+   changes what `app.project.file` points to — a later plain "save" would
+   overwrite the collected copy instead of the user's original. This version
+   requires the project already be saved, then uses `File.copy()` on the
+   existing `.aep` (never `app.project.save()` on the new path), so the live
+   project's identity never changes.
+2. **`reduce-project` requires explicit `confirm:true` (no default) and
+   explicit `compNames` (no active-comp fallback).** It permanently deletes
+   unused project items and isn't reliably undoable via Edit>Undo — same
+   informed-consent pattern as `saveFirst` on the project-lifecycle tools.
+3. **`organize-project-items`'s `custom` mode is a genuine new feature, not a
+   port.** ishu86's own `custom` mode creates named folders but never
+   actually moves any item into them (an unfinished no-op in their code).
+   This version adds a real `customFolders: [{folderName, itemNames?,
+   itemIds?}]` mapping so items actually land where specified.
+
+Also: `import-folder` and `collect-files` both accumulate a `note` string of
+per-item failures (matching the existing pattern in `seeFrame()`) instead of
+ishu86's silent `catch (e) {}` swallowing.
+
+None of the 7 join `NO_UNDO_GROUP_COMMANDS` — a plain per-command undo group
+is correct for all of them. `find-missing-footage` joins `READ_ONLY_COMMANDS`
+(genuinely read-only, matches ishu86 not wrapping it in an undo group
+either).
+
+Full schema/logic detail for all 7 tools is implemented directly in
+`src/index.ts` (schemas) and `src/scripts/mcp-bridge-auto.jsx` (bridge
+functions) — this section records the *why*, the code itself is the
+authoritative *what*.
+
+**Verified 2026-07-29** via `manual-tests/asset-management-test.mjs`, a
+46-step scripted test following the same safety discipline as
+project-lifecycle: saved and closed the real project first, ran every
+mutating/destructive case (imports, replace, organize in all 3 modes,
+reduce-project's confirm gate, collect-files) against disposable scratch
+projects only, then restored the real project and confirmed its 3 layers
+still intact. All assertions passed on the second run (first run had two
+test-script bugs, not product bugs — a wrong expected count for
+`organize-project-items` type mode once `import-folder`'s own root-folder
+nesting was accounted for, and a forgotten `save-project` call before testing
+`collect-files`'s save-required gate — both fixed in the test, not the
+tools). Notably, `replace-footage` was verified via an independent
+`execute-script` check reading `itemByID(id).file.fsName` back, not just
+trusting the tool's success message, and `collect-files`'s no-repoint
+behavior was directly asserted by confirming `getProjectInfo`'s `path`
+matched the pre-collect saved path exactly afterward.
+
+Re-run `node manual-tests/asset-management-test.mjs` (from the repo root)
+after any future change to these 7 tools.
+
 ## Next planned step
 
 Decide which remaining ishu86 capabilities are worth reimplementing here.
 Recommended priority order: ~~(1) project lifecycle~~ **done 2026-07-29**,
-(2) asset management, (3) expression suite, (4) keyframe timeline
-manipulation. All three remaining are plain ExtendScript domain work and do
-not depend on ishu86's CEP architecture, so they can be written directly
-against this fork's existing bridge dispatcher (`executeCommand()` in
-`src/scripts/mcp-bridge-auto.jsx` + a matching `server.tool()` registration in
-`src/index.ts`) — the project-lifecycle tools just added are a concrete,
-already-verified template for exactly this kind of addition (see the spec
+~~(2) asset management~~ **done 2026-07-29, see spec above**, (3) expression
+suite, (4) keyframe timeline manipulation. All are plain ExtendScript domain
+work and do not depend on ishu86's CEP architecture, so they can be written
+directly against this fork's existing bridge dispatcher (`executeCommand()`
+in `src/scripts/mcp-bridge-auto.jsx` + a matching `server.tool()`
+registration in `src/index.ts`) — the project-lifecycle tools are a
+concrete, already-verified template for exactly this kind of addition (see
+the spec
 section above for the wiring checklist).

@@ -2557,7 +2557,8 @@ var READ_ONLY_COMMANDS = {
     "getLayerFull": true,
     "getCompFull": true,
     "getLayerClipFrames": true,
-    "getLayerAudioInfo": true
+    "getLayerAudioInfo": true,
+    "findMissingFootage": true
 };
 // MUST mirror getAETempDir() on the Node server side. On Windows we use
 // LOCALAPPDATA (never redirected by OneDrive) so both processes resolve to the
@@ -2733,6 +2734,290 @@ function closeProject(args) {
         if (gate) return gate;
         app.project.close(CloseOptions.DO_NOT_SAVE_CHANGES);
         return JSON.stringify({ status: "success", message: "Project closed. After Effects may have automatically opened a new blank project." });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+// Shared project-item lookup by id (fast, uses the real itemByID API) or name
+// (linear scan, matching the existing _resolveComp() pattern above). Returns
+// null if neither identifies an item.
+function _findProjectItemByIdOrName(itemId, itemName) {
+    if (itemId !== undefined && itemId !== null) {
+        var byId = app.project.itemByID(itemId);
+        if (byId) return byId;
+    }
+    if (itemName) {
+        for (var i = 1; i <= app.project.numItems; i++) {
+            var it = app.project.item(i);
+            if (it.name === itemName) return it;
+        }
+    }
+    return null;
+}
+
+function importFootage(args) {
+    try {
+        var filePath = args && args.filePath;
+        if (!filePath) return JSON.stringify({ status: "error", error: "filePath is required." });
+        var file = new File(filePath);
+        if (!file.exists) return JSON.stringify({ status: "error", error: "File not found: " + filePath });
+
+        var importOptions = new ImportOptions(file);
+        if (args.sequence) {
+            importOptions.sequence = true;
+            if (args.forceAlphabetical) importOptions.forceAlphabetical = true;
+        }
+        var imported = app.project.importFile(importOptions);
+        if (args.name) imported.name = args.name;
+
+        return JSON.stringify({
+            status: "success",
+            item: {
+                id: imported.id,
+                name: imported.name,
+                width: imported.width,
+                height: imported.height,
+                duration: (imported.duration !== undefined ? imported.duration : null),
+                frameRate: (imported.frameRate !== undefined ? imported.frameRate : null)
+            }
+        });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function importFolder(args) {
+    try {
+        var folderPath = args && args.folderPath;
+        if (!folderPath) return JSON.stringify({ status: "error", error: "folderPath is required." });
+        var folder = new Folder(folderPath);
+        if (!folder.exists) return JSON.stringify({ status: "error", error: "Folder not found: " + folderPath });
+
+        var recursive = !!(args && args.recursive);
+        var imported = [];
+        var note = null;
+
+        function walk(f, parentFolderItem) {
+            var entries = f.getFiles();
+            for (var i = 0; i < entries.length; i++) {
+                var entry = entries[i];
+                if (entry instanceof Folder) {
+                    if (!recursive) continue;
+                    var subFolderItem = app.project.items.addFolder(entry.name);
+                    if (parentFolderItem) subFolderItem.parentFolder = parentFolderItem;
+                    walk(entry, subFolderItem);
+                } else if (entry instanceof File) {
+                    try {
+                        var item = app.project.importFile(new ImportOptions(entry));
+                        if (parentFolderItem) item.parentFolder = parentFolderItem;
+                        imported.push({ id: item.id, name: item.name });
+                    } catch (fileErr) {
+                        note = (note ? note + " " : "") + "Failed to import \"" + entry.name + "\": " + fileErr.toString();
+                    }
+                }
+            }
+        }
+
+        var rootFolderItem = app.project.items.addFolder(folder.name);
+        walk(folder, rootFolderItem);
+
+        var out = { status: "success", importedCount: imported.length, items: imported };
+        if (note) out.note = note;
+        return JSON.stringify(out);
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function replaceFootage(args) {
+    try {
+        var item = _findProjectItemByIdOrName(args && args.itemId, args && args.itemName);
+        if (!item) return JSON.stringify({ status: "error", error: "Project item not found (checked itemId and itemName)." });
+        if (!(item instanceof FootageItem)) return JSON.stringify({ status: "error", error: "Item \"" + item.name + "\" is not a footage item." });
+
+        var newPath = args && args.newPath;
+        if (!newPath) return JSON.stringify({ status: "error", error: "newPath is required." });
+        var newFile = new File(newPath);
+        if (!newFile.exists) return JSON.stringify({ status: "error", error: "Replacement file not found: " + newPath });
+
+        item.replace(newFile);
+        return JSON.stringify({ status: "success", message: "Replaced source for \"" + item.name + "\".", id: item.id, name: item.name });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function findMissingFootage(args) {
+    try {
+        var missing = [];
+        for (var i = 1; i <= app.project.numItems; i++) {
+            var item = app.project.item(i);
+            if (item instanceof FootageItem && item.footageMissing) {
+                var info = { id: item.id, name: item.name };
+                if (item.file) info.path = item.file.fsName;
+                missing.push(info);
+            }
+        }
+        return JSON.stringify({ status: "success", missingCount: missing.length, items: missing });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function collectFiles(args) {
+    try {
+        if (!app.project.file) {
+            return JSON.stringify({ status: "error", error: "Project must be saved before collecting files - call save-project first." });
+        }
+        var outputPath = args && args.outputPath;
+        if (!outputPath) return JSON.stringify({ status: "error", error: "outputPath is required." });
+
+        var outputFolder = new Folder(outputPath);
+        if (!outputFolder.exists && !outputFolder.create()) {
+            return JSON.stringify({ status: "error", error: "Could not create output folder: " + outputPath });
+        }
+
+        var includeFootage = (args.includeFootage === undefined || args.includeFootage === null) ? true : !!args.includeFootage;
+        var collected = [];
+        var note = null;
+
+        if (includeFootage) {
+            var footageFolder = new Folder(outputFolder.fsName + "/footage");
+            if (!footageFolder.exists) footageFolder.create();
+            for (var i = 1; i <= app.project.numItems; i++) {
+                var item = app.project.item(i);
+                if (item instanceof FootageItem && item.file) {
+                    try {
+                        var destPath = footageFolder.fsName + "/" + item.file.name;
+                        if (item.file.copy(destPath)) {
+                            collected.push(item.file.name);
+                        } else {
+                            note = (note ? note + " " : "") + "Failed to copy \"" + item.file.name + "\".";
+                        }
+                    } catch (copyErr) {
+                        note = (note ? note + " " : "") + "Failed to copy \"" + item.name + "\": " + copyErr.toString();
+                    }
+                }
+            }
+        }
+
+        // Copy the EXISTING saved project file into the output folder rather than
+        // calling app.project.save() on a new path - that would repoint the live
+        // project's file identity to the collected copy, which is a surprising side
+        // effect (a later plain "save" would then overwrite the copy, not the
+        // user's original file). See CONTEXT.md for the full rationale.
+        var projectDestPath = outputFolder.fsName + "/" + app.project.file.name;
+        var projectCopied = app.project.file.copy(projectDestPath);
+
+        var out = {
+            status: "success",
+            outputPath: outputFolder.fsName,
+            collectedFootageCount: collected.length,
+            collectedFootage: collected,
+            projectFileCopied: !!projectCopied
+        };
+        if (note) out.note = note;
+        return JSON.stringify(out);
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function reduceProject(args) {
+    try {
+        var confirm = !!(args && args.confirm === true);
+        if (!confirm) {
+            return JSON.stringify({ status: "error", error: "reduce-project permanently deletes unused project items; pass confirm:true to proceed." });
+        }
+        var compNames = (args && args.compNames) || [];
+        if (!compNames.length) {
+            return JSON.stringify({ status: "error", error: "compNames must contain at least one composition name." });
+        }
+
+        var comps = [];
+        for (var n = 0; n < compNames.length; n++) {
+            var found = null;
+            for (var i = 1; i <= app.project.numItems; i++) {
+                var it = app.project.item(i);
+                if (it instanceof CompItem && it.name === compNames[n]) { found = it; break; }
+            }
+            if (!found) return JSON.stringify({ status: "error", error: "Composition not found: " + compNames[n] });
+            comps.push(found);
+        }
+
+        app.project.reduceProject(comps);
+        return JSON.stringify({ status: "success", remainingItems: app.project.numItems });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function organizeProjectItems(args) {
+    try {
+        var structure = (args && args.structure) || "type";
+        var organizedCount = 0;
+        var note = null;
+
+        if (structure === "type") {
+            var compsFolder = null, footageFolder = null, solidsFolder = null;
+            for (var i = 1; i <= app.project.numItems; i++) {
+                var item = app.project.item(i);
+                if (item instanceof FolderItem) continue;
+                if (item.parentFolder !== app.project.rootFolder) continue;
+                if (item instanceof CompItem) {
+                    if (!compsFolder) compsFolder = app.project.items.addFolder("Compositions");
+                    item.parentFolder = compsFolder;
+                    organizedCount++;
+                } else if (item instanceof FootageItem) {
+                    if (item.mainSource instanceof SolidSource) {
+                        if (!solidsFolder) solidsFolder = app.project.items.addFolder("Solids");
+                        item.parentFolder = solidsFolder;
+                    } else {
+                        if (!footageFolder) footageFolder = app.project.items.addFolder("Footage");
+                        item.parentFolder = footageFolder;
+                    }
+                    organizedCount++;
+                }
+            }
+        } else if (structure === "usage") {
+            var usedFolder = app.project.items.addFolder("Used");
+            var unusedFolder = app.project.items.addFolder("Unused");
+            for (var j = 1; j <= app.project.numItems; j++) {
+                var uitem = app.project.item(j);
+                if (uitem instanceof FolderItem) continue;
+                if (uitem.parentFolder !== app.project.rootFolder) continue;
+                uitem.parentFolder = (uitem.usedIn && uitem.usedIn.length > 0) ? usedFolder : unusedFolder;
+                organizedCount++;
+            }
+        } else if (structure === "custom") {
+            var customFolders = (args && args.customFolders) || [];
+            if (!customFolders.length) {
+                return JSON.stringify({ status: "error", error: "customFolders must contain at least one entry when structure is 'custom'." });
+            }
+            for (var c = 0; c < customFolders.length; c++) {
+                var spec = customFolders[c];
+                var folderItem = app.project.items.addFolder(spec.folderName);
+                var names = spec.itemNames || [];
+                var ids = spec.itemIds || [];
+                for (var ni = 0; ni < names.length; ni++) {
+                    var byName = _findProjectItemByIdOrName(null, names[ni]);
+                    if (byName) { byName.parentFolder = folderItem; organizedCount++; }
+                    else note = (note ? note + " " : "") + "Item not found: \"" + names[ni] + "\".";
+                }
+                for (var ii = 0; ii < ids.length; ii++) {
+                    var byId = _findProjectItemByIdOrName(ids[ii], null);
+                    if (byId) { byId.parentFolder = folderItem; organizedCount++; }
+                    else note = (note ? note + " " : "") + "Item id not found: " + ids[ii] + ".";
+                }
+            }
+        } else {
+            return JSON.stringify({ status: "error", error: "Unknown structure: " + structure + ". Use 'type', 'usage', or 'custom'." });
+        }
+
+        var out = { status: "success", structure: structure, organizedCount: organizedCount };
+        if (note) out.note = note;
+        return JSON.stringify(out);
     } catch (e) {
         return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
     }
@@ -3755,6 +4040,41 @@ function executeCommand(command, args) {
                 logToPanel("Calling closeProject function...");
                 result = closeProject(args);
                 logToPanel("Returned from closeProject.");
+                break;
+            case "importFootage":
+                logToPanel("Calling importFootage function...");
+                result = importFootage(args);
+                logToPanel("Returned from importFootage.");
+                break;
+            case "importFolder":
+                logToPanel("Calling importFolder function...");
+                result = importFolder(args);
+                logToPanel("Returned from importFolder.");
+                break;
+            case "replaceFootage":
+                logToPanel("Calling replaceFootage function...");
+                result = replaceFootage(args);
+                logToPanel("Returned from replaceFootage.");
+                break;
+            case "findMissingFootage":
+                logToPanel("Calling findMissingFootage function...");
+                result = findMissingFootage(args);
+                logToPanel("Returned from findMissingFootage.");
+                break;
+            case "collectFiles":
+                logToPanel("Calling collectFiles function...");
+                result = collectFiles(args);
+                logToPanel("Returned from collectFiles.");
+                break;
+            case "reduceProject":
+                logToPanel("Calling reduceProject function...");
+                result = reduceProject(args);
+                logToPanel("Returned from reduceProject.");
+                break;
+            case "organizeProjectItems":
+                logToPanel("Calling organizeProjectItems function...");
+                result = organizeProjectItems(args);
+                logToPanel("Returned from organizeProjectItems.");
                 break;
             case "createComposition":
                 logToPanel("Calling createComposition function...");
