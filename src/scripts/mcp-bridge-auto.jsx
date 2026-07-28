@@ -669,6 +669,198 @@ function setLayerExpression(compIndex, layerIndex, propertyName, expressionStrin
     }
 }
 
+// Shared property lookup for the expression-suite tools, matching the exact
+// search order setLayerExpression()/setLayerKeyframe() already use above:
+// Transform Group, then Effect Parade, then Text Properties.
+function _resolveLayerProperty(layer, propertyName) {
+    var transformGroup = layer.property("ADBE Transform Group");
+    var property = transformGroup ? transformGroup.property(propertyName) : null;
+    if (!property) {
+        if (layer.property("ADBE Effect Parade") && layer.property("ADBE Effect Parade").property(propertyName)) {
+            property = layer.property("ADBE Effect Parade").property(propertyName);
+        } else if (layer.property("ADBE Text Properties") && layer.property("ADBE Text Properties").property(propertyName)) {
+            property = layer.property("ADBE Text Properties").property(propertyName);
+        }
+    }
+    return property || null;
+}
+
+function _resolveCompAndLayerSimple(compIndex, layerIndex) {
+    var comp = app.project.items[compIndex];
+    if (!comp || !(comp instanceof CompItem)) {
+        throw new Error("Composition not found at index " + compIndex);
+    }
+    var layer = comp.layers[layerIndex];
+    if (!layer) {
+        throw new Error("Layer not found at index " + layerIndex + " in composition '" + comp.name + "'");
+    }
+    return { comp: comp, layer: layer };
+}
+
+function getExpression(args) {
+    try {
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var property = _resolveLayerProperty(cl.layer, args.propertyName);
+        if (!property) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' not found on layer '" + cl.layer.name + "'." });
+        }
+        return JSON.stringify({
+            status: "success",
+            expression: property.expression || "",
+            expressionEnabled: !!property.expressionEnabled,
+            expressionError: property.expressionError || null
+        });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function enableExpression(args) {
+    try {
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var property = _resolveLayerProperty(cl.layer, args.propertyName);
+        if (!property) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' not found on layer '" + cl.layer.name + "'." });
+        }
+        if (!property.expression) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' has no expression to enable/disable." });
+        }
+        property.expressionEnabled = !!args.enabled;
+        return JSON.stringify({ status: "success", expressionEnabled: !!property.expressionEnabled });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+var EXPRESSION_CONTROL_MATCH_NAMES = {
+    "slider": "ADBE Slider Control",
+    "color": "ADBE Color Control",
+    "point": "ADBE Point Control",
+    "checkbox": "ADBE Checkbox Control",
+    "dropdown": "ADBE Dropdown Control",
+    "angle": "ADBE Angle Control",
+    "layer": "ADBE Layer Control"
+};
+// Sub-property name (friendly name, matching this file's existing convention
+// of using friendly names like layer.Effects rather than raw match-names)
+// used to set each control's default value. Dropdown intentionally omitted -
+// see addExpressionControl()'s note for why.
+var EXPRESSION_CONTROL_VALUE_PROP = {
+    "slider": "Slider",
+    "color": "Color",
+    "point": "Point",
+    "checkbox": "Checkbox",
+    "angle": "Angle",
+    "layer": "Layer"
+};
+
+function addExpressionControl(args) {
+    try {
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var matchName = EXPRESSION_CONTROL_MATCH_NAMES[args.controlType];
+        if (!matchName) {
+            return JSON.stringify({ status: "error", error: "Unknown controlType: " + args.controlType });
+        }
+
+        var effect = cl.layer.Effects.addProperty(matchName);
+        effect.name = args.controlName;
+
+        var note = null;
+        if (args.defaultValue !== undefined && args.defaultValue !== null) {
+            if (args.controlType === "dropdown") {
+                note = "Dropdown Control's default value is not settable via this implementation's scripting API; the control was created without a default.";
+            } else {
+                var valueProp = effect.property(EXPRESSION_CONTROL_VALUE_PROP[args.controlType]);
+                if (valueProp) valueProp.setValue(args.defaultValue);
+            }
+        }
+
+        var out = { status: "success", effectName: effect.name, matchName: matchName };
+        if (note) out.note = note;
+        return JSON.stringify(out);
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function linkProperties(args) {
+    try {
+        var comp = app.project.items[args.compIndex];
+        if (!comp || !(comp instanceof CompItem)) {
+            return JSON.stringify({ status: "error", error: "Composition not found at index " + args.compIndex });
+        }
+        var sourceLayer = (args.sourceLayerIndex !== undefined && args.sourceLayerIndex !== null) ? comp.layers[args.sourceLayerIndex] : null;
+        var targetLayer = (args.targetLayerIndex !== undefined && args.targetLayerIndex !== null) ? comp.layers[args.targetLayerIndex] : null;
+        if (!sourceLayer) return JSON.stringify({ status: "error", error: "Source layer not found at index " + args.sourceLayerIndex });
+        if (!targetLayer) return JSON.stringify({ status: "error", error: "Target layer not found at index " + args.targetLayerIndex });
+
+        var sourceProp = _resolveLayerProperty(sourceLayer, args.sourceProperty);
+        var targetProp = _resolveLayerProperty(targetLayer, args.targetProperty);
+        if (!sourceProp) return JSON.stringify({ status: "error", error: "Source property '" + args.sourceProperty + "' not found on layer '" + sourceLayer.name + "'." });
+        if (!targetProp) return JSON.stringify({ status: "error", error: "Target property '" + args.targetProperty + "' not found on layer '" + targetLayer.name + "'." });
+        if (!sourceProp.canSetExpression) {
+            return JSON.stringify({ status: "error", error: "Source property '" + args.sourceProperty + "' does not support expressions." });
+        }
+
+        var expr = "thisComp.layer(" + args.targetLayerIndex + ").property(\"" + args.targetProperty + "\").value";
+        if (args.offset !== undefined && args.offset !== null) {
+            expr += " + " + (args.offset instanceof Array ? JSON.stringify(args.offset) : args.offset);
+        }
+        sourceProp.expression = expr;
+
+        return JSON.stringify({ status: "success", expression: expr });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+var EXPRESSION_TEMPLATES = {
+    "wiggle": { text: "wiggle({{freq}}, {{amp}})", defaults: { freq: 2, amp: 20 } },
+    "loop": { text: "loopOut(\"{{type}}\")", defaults: { type: "cycle" } },
+    "time": { text: "time * {{speed}}", defaults: { speed: 1 } },
+    "bounce": {
+        text: "n = 0;\nif (numKeys > 0) {\n  n = nearestKey(time).index;\n  if (nearestKey(time).time > time) n--;\n}\nif (n == 0) value;\nelse {\n  t = time - key(n).time;\n  amp = {{amp}};\n  freq = {{freq}};\n  decay = {{decay}};\n  value + amp * Math.sin(freq * t * 2 * Math.PI) / Math.exp(decay * t);\n}",
+        defaults: { amp: 50, freq: 3, decay: 4 }
+    },
+    "inertia": {
+        text: "n = 0;\nif (numKeys > 0) {\n  n = nearestKey(time).index;\n  if (nearestKey(time).time > time) n--;\n}\nif (n == 0) value;\nelse {\n  t = time - key(n).time;\n  amp = {{amp}};\n  decay = {{decay}};\n  value + (velocityAtTime(key(n).time - 0.001) * amp) * Math.exp(-decay * t);\n}",
+        defaults: { amp: 0.05, decay: 4 }
+    },
+    "overshoot": {
+        text: "freq = {{freq}};\ndecay = {{decay}};\nn = 0;\nif (numKeys > 0) {\n  n = nearestKey(time).index;\n  if (nearestKey(time).time > time) n--;\n}\nif (n == 0) value;\nelse {\n  t = time - key(n).time;\n  value + (velocityAtTime(key(n).time - 0.001)) * (Math.sin(freq * t * 2 * Math.PI) / Math.exp(decay * t)) / (freq * 2 * Math.PI);\n}",
+        defaults: { freq: 2, decay: 6 }
+    }
+};
+
+function applyExpressionTemplate(args) {
+    try {
+        var template = EXPRESSION_TEMPLATES[args.template];
+        if (!template) {
+            return JSON.stringify({ status: "error", error: "Unknown template: " + args.template });
+        }
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var property = _resolveLayerProperty(cl.layer, args.propertyName);
+        if (!property) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' not found on layer '" + cl.layer.name + "'." });
+        }
+        if (!property.canSetExpression) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' does not support expressions." });
+        }
+
+        var expr = template.text;
+        var params = args.params || {};
+        for (var key in template.defaults) {
+            var value = (params[key] !== undefined && params[key] !== null) ? params[key] : template.defaults[key];
+            expr = expr.split("{{" + key + "}}").join(value);
+        }
+
+        property.expression = expr;
+        return JSON.stringify({ status: "success", expression: expr });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
 function tryAddEffect(layer, identifier, mode) {
     if (!identifier) {
         return null;
@@ -2558,7 +2750,8 @@ var READ_ONLY_COMMANDS = {
     "getCompFull": true,
     "getLayerClipFrames": true,
     "getLayerAudioInfo": true,
-    "findMissingFootage": true
+    "findMissingFootage": true,
+    "getExpression": true
 };
 // MUST mirror getAETempDir() on the Node server side. On Windows we use
 // LOCALAPPDATA (never redirected by OneDrive) so both processes resolve to the
@@ -4115,6 +4308,31 @@ function executeCommand(command, args) {
                 logToPanel("Calling setLayerExpression function...");
                 result = setLayerExpression(args.compIndex, args.layerIndex, args.propertyName, args.expressionString);
                 logToPanel("Returned from setLayerExpression.");
+                break;
+            case "getExpression":
+                logToPanel("Calling getExpression function...");
+                result = getExpression(args);
+                logToPanel("Returned from getExpression.");
+                break;
+            case "enableExpression":
+                logToPanel("Calling enableExpression function...");
+                result = enableExpression(args);
+                logToPanel("Returned from enableExpression.");
+                break;
+            case "addExpressionControl":
+                logToPanel("Calling addExpressionControl function...");
+                result = addExpressionControl(args);
+                logToPanel("Returned from addExpressionControl.");
+                break;
+            case "linkProperties":
+                logToPanel("Calling linkProperties function...");
+                result = linkProperties(args);
+                logToPanel("Returned from linkProperties.");
+                break;
+            case "applyExpressionTemplate":
+                logToPanel("Calling applyExpressionTemplate function...");
+                result = applyExpressionTemplate(args);
+                logToPanel("Returned from applyExpressionTemplate.");
                 break;
             case "applyEffect":
                 logToPanel("Calling applyEffect function...");

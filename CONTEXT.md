@@ -188,6 +188,9 @@ feature comparison below, so signing was not pursued.
 - `import-footage`, `import-folder`, `replace-footage`, `find-missing-footage`,
   `collect-files`, `reduce-project`, `organize-project-items` (full 46-step
   safety test, see the asset-management spec section above)
+- `get-expression`, `enable-expression`, `add-expression-control`,
+  `link-properties`, `apply-expression-template` (22-step test, see the
+  expression-suite spec section above)
 
 ## Not yet tested
 
@@ -481,12 +484,77 @@ matched the pre-collect saved path exactly afterward.
 Re-run `node manual-tests/asset-management-test.mjs` (from the repo root)
 after any future change to these 7 tools.
 
+## SPEC: expression-suite tools — IMPLEMENTED and verified 2026-07-29
+(branch `feature/expression-suite-tools`)
+
+Written 2026-07-29, branched off `feature/asset-management-tools` (continuing
+the sequential stack). Closes ishu86 gap #3. **Scoped tighter than the
+previous two blocks** — this session had ~25% of a 5h budget left when this
+block started, so fewer tools than ishu86 has, reusing existing helpers
+wherever possible.
+
+ishu86's `expressionGenerators.ts` was read directly as ground truth:
+- `set_expression`/`remove_expression` are just `prop.expression = "..."`/`""`
+  — **already fully covered by this fork's existing `setLayerExpression`**
+  (empty string already clears it per its own description). Not
+  reimplemented — would be pure duplication.
+- `add_expression_control` = adding a Slider/Angle/Color/Point/Checkbox/Layer
+  Control **effect** via match-name (`"ADBE Slider Control"` etc.), then
+  setting its one sub-property. ishu86 silently discards Dropdown Control's
+  default value (no map entry). Not replicated - see deviation below.
+- `link_properties` = a hand-rolled one-way expression
+  (`thisComp.layer("X").property("Y").value [+ offset]`) — **not** AE
+  parenting. ishu86 also has a `if (params.targetLayerIndex)` truthy-check
+  bug (breaks for index 0, low-impact since AE layers are 1-indexed anyway,
+  but fixed here for free using `!== undefined` consistently).
+- `apply_expression_template` = 20 hardcoded expression strings + naive
+  `{{param}}` substitution on top of `set_expression`. **Deliberately shipped
+  a smaller 6-template set here** (wiggle, loop, time, bounce, inertia,
+  overshoot) instead of porting all 20 - a budget-driven scope cut, easy to
+  extend later.
+- ishu86 also built (but never wired to a tool) a batch-expression-setter and
+  a template-introspection tool. **Deferred, not ported this round** - noted
+  here as a real, cheap future addition if wanted.
+
+**Reuse, not reinvention**: `findPropertyByNameOrMatchName(container,
+propertyName)` (`mcp-bridge-auto.jsx:858`) resolves a property by name or
+matchName - used by every new tool instead of writing new resolution logic.
+`LayerIdentifierSchema` (`compIndex`/`layerIndex`, already used by
+`setLayerKeyframe`/`setLayerExpression`) is the schema shape for every new
+tool's layer target - no new schema design needed there either.
+
+**Five tools added**: `get-expression` (read-only: expression string +
+enabled + error), `enable-expression` (toggles `.expressionEnabled` without
+touching the string - distinct from clearing via `setLayerExpression`),
+`add-expression-control`, `link-properties` (same-comp only, matching
+ishu86's actual scope), `apply-expression-template`. Full schema/logic detail
+is in `src/index.ts` and `src/scripts/mcp-bridge-auto.jsx` - this section
+records the *why*.
+
+**Verified 2026-07-29** via `manual-tests/expression-suite-test.mjs` (22
+steps, one disposable scratch project, lean per the budget constraint) - all
+assertions passed on the first real run (after fixing a test-script schema
+mistake for `createSolidLayer`, an existing tool called via `run-script`
+whose args I had wrong - `compName` not `compIndex`, `color` as a `[r,g,b]`
+0-1 array not an `{r,g,b}` 0-255 object, `size` not `width`/`height`; not a
+new-tool bug). Notably confirmed: `get-expression` round-trips a string set
+via the existing `setLayerExpression`; `enable-expression` toggles state
+without altering the expression text; `add-expression-control`'s default
+value was verified actually applied via an independent `execute-script`
+read (not just the tool's own success message), and the dropdown limitation
+surfaces as a `note` rather than silently vanishing; `link-properties`
+produces a real cross-layer expression string; `apply-expression-template`
+substitutes params with no leftover `{{...}}` tokens. Real project (3
+layers) restored intact at the end.
+
 ## Next planned step
 
 Decide which remaining ishu86 capabilities are worth reimplementing here.
 Recommended priority order: ~~(1) project lifecycle~~ **done 2026-07-29**,
-~~(2) asset management~~ **done 2026-07-29, see spec above**, (3) expression
-suite, (4) keyframe timeline manipulation. All are plain ExtendScript domain
+~~(2) asset management~~ **done 2026-07-29, see spec above**,
+~~(3) expression suite~~ **done 2026-07-29, see spec above**, (4) keyframe
+timeline manipulation (offset/scale/reverse/copy existing keyframes - not yet
+started). All are plain ExtendScript domain
 work and do not depend on ishu86's CEP architecture, so they can be written
 directly against this fork's existing bridge dispatcher (`executeCommand()`
 in `src/scripts/mcp-bridge-auto.jsx` + a matching `server.tool()`

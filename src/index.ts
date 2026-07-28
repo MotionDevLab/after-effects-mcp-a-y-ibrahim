@@ -314,6 +314,11 @@ server.tool(
       "collectFiles",
       "reduceProject",
       "organizeProjectItems",
+      "getExpression",
+      "enableExpression",
+      "addExpressionControl",
+      "linkProperties",
+      "applyExpressionTemplate",
     ];
 
     if (!allowedScripts.includes(script)) {
@@ -990,6 +995,135 @@ server.tool(
             text: `Error queuing setLayerExpression command: ${String(error)}`,
           },
         ],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "get-expression",
+  "Read a property's current expression, whether it's enabled, and any expression error.",
+  {
+    ...LayerIdentifierSchema,
+    propertyName: z.string().describe("Name of the property to read (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("getExpression", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error getting expression: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "enable-expression",
+  "Toggle a property's expression on/off without changing the expression string itself " +
+    "(unlike setLayerExpression, which requires supplying or clearing the actual text).",
+  {
+    ...LayerIdentifierSchema,
+    propertyName: z.string().describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+    enabled: z.boolean().describe("Whether the expression should be enabled."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("enableExpression", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error toggling expression: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "add-expression-control",
+  "Add an expression control effect (Slider/Color/Point/Checkbox/Dropdown/Angle/Layer " +
+    "Control) to a layer, for driving expressions on other properties from a single " +
+    "user-adjustable value. Note: Dropdown Control's default value cannot be set via " +
+    "scripting - the control is created but defaultValue is ignored for that type.",
+  {
+    ...LayerIdentifierSchema,
+    controlType: z
+      .enum(["slider", "color", "point", "checkbox", "dropdown", "angle", "layer"])
+      .describe("Type of control effect to add."),
+    controlName: z.string().describe("Name to give the new effect."),
+    defaultValue: z.any().optional().describe("Initial value for the control (ignored for dropdown - see note above)."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("addExpressionControl", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error adding expression control: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "link-properties",
+  "Make one property follow another property's live value via a one-way expression " +
+    "(e.g. 'Position tracks another layer's Position'). This is NOT After Effects parenting - " +
+    "it's a hand-written expression, same-comp only, and breaks if the target layer/property " +
+    "is later renamed or deleted.",
+  {
+    compIndex: z.number().int().positive().describe("1-based index of the composition (both layers must be in this comp)."),
+    sourceLayerIndex: z.number().int().positive().describe("1-based index of the layer whose property will follow the target."),
+    sourceProperty: z.string().describe("Name of the property to set the expression on (e.g., 'Position')."),
+    targetLayerIndex: z.number().int().positive().describe("1-based index of the layer to follow."),
+    targetProperty: z.string().describe("Name of the property to follow on the target layer."),
+    offset: z
+      .union([z.number(), z.array(z.number())])
+      .optional()
+      .describe("Optional value added to the target's value (a single number or an array matching the property's dimensions)."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("linkProperties", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error linking properties: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "apply-expression-template",
+  "Apply a well-known parameterized expression template to a property: wiggle, loop " +
+    "(loopOut), time (time remapping/speed), bounce, inertia, or overshoot.",
+  {
+    ...LayerIdentifierSchema,
+    propertyName: z.string().describe("Name of the property to apply the expression to (e.g., 'Position', 'Rotation')."),
+    template: z.enum(["wiggle", "loop", "time", "bounce", "inertia", "overshoot"]).describe("Which template to apply."),
+    params: z
+      .record(z.union([z.string(), z.number()]))
+      .optional()
+      .describe(
+        "Template parameters (all optional, sensible defaults used otherwise). wiggle: freq, amp. " +
+          "loop: type ('cycle'|'pingpong'|'offset'|'continue'). time: speed. bounce: amp, freq, decay. " +
+          "inertia: amp, decay. overshoot: freq, decay.",
+      ),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("applyExpressionTemplate", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error applying expression template: ${String(error)}` }],
         isError: true,
       };
     }
