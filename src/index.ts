@@ -303,6 +303,10 @@ server.tool(
       "getLayerFull",
       "getCompFull",
       "bridgeTestEffects",
+      "createProject",
+      "openProject",
+      "saveProject",
+      "closeProject",
     ];
 
     if (!allowedScripts.includes(script)) {
@@ -478,6 +482,102 @@ Note: The auto-running panel can be left open in After Effects to continuously l
     ],
   };
 });
+
+const SAVE_FIRST_DESCRIPTION =
+  "Required, no default. If true, save the current/outgoing project first " +
+  "(if it has unsaved changes) - errors instead of proceeding if it has never " +
+  "been saved to a file path. If false, any unsaved changes in the " +
+  "current/outgoing project are discarded. This tool never relies on After " +
+  "Effects' own 'save changes?' prompt (dialogs are suppressed for all bridge " +
+  "commands), so you must decide explicitly.";
+
+server.tool(
+  "create-project",
+  "Create a new, empty After Effects project, replacing the currently open one. " +
+    "Because this can discard unsaved work, saveFirst is required with no default.",
+  {
+    saveFirst: z.boolean().describe(SAVE_FIRST_DESCRIPTION),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("createProject", params, 15000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error creating project: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "open-project",
+  "Open an After Effects project (.aep) file, replacing the currently open one. " +
+    "Because this can discard unsaved work, saveFirst is required with no default.",
+  {
+    filePath: z.string().describe("Absolute path to the .aep project file to open."),
+    saveFirst: z.boolean().describe(SAVE_FIRST_DESCRIPTION),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("openProject", params, 20000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error opening project: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "save-project",
+  "Save the current After Effects project. Omit filePath to save to the " +
+    "project's existing file path (errors if it has never been saved); " +
+    "provide filePath to save-as.",
+  {
+    filePath: z
+      .string()
+      .optional()
+      .describe(
+        "Absolute path to save to (save-as). Omit to save to the project's existing file path.",
+      ),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("saveProject", params, 20000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error saving project: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "close-project",
+  "Close the current After Effects project. Because this can discard unsaved " +
+    "work, saveFirst is required with no default. After closing, After Effects " +
+    "typically opens a new blank untitled project automatically.",
+  {
+    saveFirst: z.boolean().describe(SAVE_FIRST_DESCRIPTION),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("closeProject", params, 15000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error closing project: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
 
 server.tool(
   "create-composition",

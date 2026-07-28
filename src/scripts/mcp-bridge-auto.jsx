@@ -2655,6 +2655,89 @@ function getProjectInfo() {
     return JSON.stringify(result, null, 2);
 }
 
+// Shared dirty-check/save-first gate for the project-lifecycle commands that
+// can discard unsaved work (createProject, openProject, closeProject).
+// executeCommand() suppresses all AE dialogs for every command
+// (app.beginSuppressDialogs()), so these commands must never rely on AE's own
+// "save changes?" prompt (CloseOptions.PROMPT_TO_SAVE_CHANGES) - its behavior
+// under suppression is undocumented/version-dependent. The caller must say
+// explicitly what to do via the required saveFirst arg instead.
+// Returns null if it is safe to proceed, or a JSON error string if the caller
+// must be stopped (never silently discards, never silently proceeds unsaved).
+function _resolveSaveFirst(saveFirst) {
+    if (!app.project.dirty) return null; // nothing unsaved; proceed regardless of saveFirst
+    if (saveFirst === true) {
+        if (!app.project.file) {
+            return JSON.stringify({
+                status: "error",
+                error: "Project has unsaved changes and no file path yet; cannot saveFirst. Call save-project with an explicit filePath first, or pass saveFirst:false to discard."
+            });
+        }
+        app.project.save();
+        return null;
+    }
+    // saveFirst === false: explicit, informed-consent discard path.
+    return null;
+}
+
+function createProject(args) {
+    try {
+        var gate = _resolveSaveFirst(args && args.saveFirst);
+        if (gate) return gate;
+        app.newProject();
+        return JSON.stringify({ status: "success", message: "Created a new project." });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function openProject(args) {
+    try {
+        var filePath = args && args.filePath;
+        if (!filePath) {
+            return JSON.stringify({ status: "error", error: "filePath is required." });
+        }
+        var file = new File(filePath);
+        if (!file.exists) {
+            return JSON.stringify({ status: "error", error: "Project file not found: " + filePath });
+        }
+        var gate = _resolveSaveFirst(args && args.saveFirst);
+        if (gate) return gate;
+        app.open(file);
+        return JSON.stringify({ status: "success", message: "Opened project: " + filePath, path: filePath });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function saveProject(args) {
+    try {
+        var filePath = args && args.filePath;
+        if (filePath) {
+            app.project.save(new File(filePath));
+            return JSON.stringify({ status: "success", message: "Project saved to: " + filePath, path: filePath });
+        }
+        if (!app.project.file) {
+            return JSON.stringify({ status: "error", error: "Project has never been saved and no filePath was provided. Provide filePath to save it for the first time." });
+        }
+        app.project.save();
+        return JSON.stringify({ status: "success", message: "Project saved.", path: app.project.file.fsName });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function closeProject(args) {
+    try {
+        var gate = _resolveSaveFirst(args && args.saveFirst);
+        if (gate) return gate;
+        app.project.close(CloseOptions.DO_NOT_SAVE_CHANGES);
+        return JSON.stringify({ status: "success", message: "Project closed. After Effects may have automatically opened a new blank project." });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
 function listCompositions() {
     var project = app.project;
     var result = {
@@ -3101,6 +3184,24 @@ function _importWithRetry(file) {
     throw lastErr;
 }
 
+// Wait for a just-written file to actually land on disk. saveFrameToPng() can
+// return before the file is readable (same Windows write-lock/flush lag as
+// _importWithRetry above, confirmed via diagnostic: file.exists was false
+// immediately after saveFrameToPng() returned, then true after a single 50ms
+// poll). Used by seeFrame(), which - unlike contact-sheet/match-reference -
+// hands the raw path back to Node instead of importing it itself, so it has
+// no retry loop to absorb the lag otherwise.
+function _waitForFileReady(file, timeoutMs) {
+    var waited = 0;
+    var step = 50;
+    var limit = (typeof timeoutMs === "number" && timeoutMs > 0) ? timeoutMs : 3000;
+    while (!file.exists && waited < limit) {
+        $.sleep(step);
+        waited += step;
+    }
+    return file.exists;
+}
+
 // see-frame: render one or more frames of a comp to PNG and return their paths so
 // the Node side can hand the actual pixels back to the model. Renders a downscaled
 // nested comp when maxWidth < comp.width, so AE performs the downscale before any
@@ -3155,7 +3256,11 @@ function seeFrame(args) {
             _seeFrameSeq++;
             var path = folder + "/__mcp_seeframe_" + _seeFrameSeq + "_" + i + ".png";
             try {
-                target.saveFrameToPng(times[i], new File(path));
+                var pngFile = new File(path);
+                target.saveFrameToPng(times[i], pngFile);
+                if (!_waitForFileReady(pngFile, 3000)) {
+                    throw new Error("Timed out waiting for rendered PNG to appear on disk.");
+                }
                 frames.push({ time: times[i], path: path, w: target.width, h: target.height });
             } catch (fe) {
                 note = (note ? note + " " : "") + "Frame at t=" + times[i] + "s failed: " + fe.toString();
@@ -3605,7 +3710,11 @@ function executeCommand(command, args) {
         "manageRenderQueue": true,
         "seeFrame": true,
         "contactSheet": true,
-        "matchReference": true
+        "matchReference": true,
+        "createProject": true,
+        "openProject": true,
+        "saveProject": true,
+        "closeProject": true
     };
     var useUndoGroup = !READ_ONLY_COMMANDS[command] && !NO_UNDO_GROUP_COMMANDS[command];
     // Suppress any AE modal for the whole execution so a dialog can never block the
@@ -3626,6 +3735,26 @@ function executeCommand(command, args) {
                 break;
             case "getLayerInfo":
                 result = getLayerInfo();
+                break;
+            case "createProject":
+                logToPanel("Calling createProject function...");
+                result = createProject(args);
+                logToPanel("Returned from createProject.");
+                break;
+            case "openProject":
+                logToPanel("Calling openProject function...");
+                result = openProject(args);
+                logToPanel("Returned from openProject.");
+                break;
+            case "saveProject":
+                logToPanel("Calling saveProject function...");
+                result = saveProject(args);
+                logToPanel("Returned from saveProject.");
+                break;
+            case "closeProject":
+                logToPanel("Calling closeProject function...");
+                result = closeProject(args);
+                logToPanel("Returned from closeProject.");
                 break;
             case "createComposition":
                 logToPanel("Calling createComposition function...");
