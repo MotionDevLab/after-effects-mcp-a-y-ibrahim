@@ -372,6 +372,439 @@ function createSolidLayer(args) {
 }
 
 
+// Shared comp resolution for the layer-creation-style functions above and the
+// motion-graphics template functions below: resolve by name, falling back to
+// the active comp. Factored out of createTextLayer/createSolidLayer/
+// createShapeLayer's identical inline logic (those three are left untouched -
+// this is used only by new code) so it isn't quadrupled again here.
+function _resolveCompByNameOrActive(compName) {
+    var comp = null;
+    if (compName) {
+        for (var i = 1; i <= app.project.numItems; i++) {
+            var item = app.project.item(i);
+            if (item instanceof CompItem && item.name === compName) { comp = item; break; }
+        }
+    }
+    if (!comp) {
+        if (app.project.activeItem instanceof CompItem) { comp = app.project.activeItem; }
+        else { throw new Error("No composition found with name '" + (compName || "") + "' and no active composition."); }
+    }
+    return comp;
+}
+
+// Apply an ease + interpolation pair at a keyframe already created via
+// setValueAtTime. Order matters: setTemporalEaseAtKey appears to force/promote
+// a key to BEZIER interpolation as a side effect (confirmed while fixing the
+// keyframe-manipulation tools), so ease is always applied first and
+// interpolation type last so it's the one that sticks. "linear" easing means
+// literal LINEAR interpolation (no bezier curve at all); "easeIn"/"easeOut"/
+// "easeInOut" mean BEZIER interpolation with the given ease on the relevant
+// side(s).
+// Ease-array dimensionality is NOT the same as value dimensionality: a
+// spatial property (Position) uses ONE unified ease for the whole motion
+// path even though its value is [x,y,z] (length 3) - using value.length here
+// would reproduce the exact crash found and fixed in apply-easy-ease
+// ("Value array does not have 1 elements"). A non-spatial multi-dimensional
+// property (Scale) genuinely does take one ease per axis. propertyValueType
+// distinguishes the two; value.length is only trustworthy for the non-spatial
+// case.
+function _easeDimensionForProperty(property) {
+    try {
+        var t = property.propertyValueType;
+        if (t === PropertyValueType.TwoD_SPATIAL || t === PropertyValueType.ThreeD_SPATIAL) return 1;
+        if (t === PropertyValueType.TwoD || t === PropertyValueType.ThreeD) {
+            var v = property.value;
+            return (v instanceof Array) ? v.length : 1;
+        }
+    } catch (e) {}
+    return 1;
+}
+
+function _applyEasingAtKey(property, keyIndex, easing, isFirstKey, isLastKey) {
+    if (easing === "linear" || !easing) {
+        try { property.setInterpolationTypeAtKey(keyIndex, KeyframeInterpolationType.LINEAR, KeyframeInterpolationType.LINEAR); } catch (e) {}
+        return;
+    }
+    var dim = _easeDimensionForProperty(property);
+    var easedIn = buildEaseArray(dim, 0, 75);
+    var easedOut = buildEaseArray(dim, 0, 75);
+    // KeyframeEase influence must be in [0.1, 100] - 0.1 is the real minimum,
+    // used here to approximate "practically no ease" on the untouched side of
+    // an easeIn/easeOut keyframe (an earlier 0.01 was below AE's valid range
+    // and crashed the Constructor call).
+    var linearArr = buildEaseArray(dim, 0, 0.1);
+    var inEase = (easing === "easeIn" && isFirstKey) ? linearArr : easedIn;
+    var outEase = (easing === "easeOut" && isLastKey) ? linearArr : easedOut;
+    try { property.setTemporalEaseAtKey(keyIndex, inEase, outEase); } catch (e3) {}
+    try { property.setInterpolationTypeAtKey(keyIndex, KeyframeInterpolationType.BEZIER, KeyframeInterpolationType.BEZIER); } catch (e4) {}
+}
+
+var LOWER_THIRD_STYLES = {
+    "modern":    { barHeight: 8,  textSize: 42, subtitleSize: 26, font: "Arial-BoldMT", animDuration: 0.5 },
+    "corporate": { barHeight: 60, textSize: 38, subtitleSize: 24, font: "Georgia-Bold", animDuration: 0.6 },
+    "news":      { barHeight: 50, textSize: 44, subtitleSize: 26, font: "Impact",       animDuration: 0.3 },
+    "minimal":   { barHeight: 4,  textSize: 36, subtitleSize: 22, font: "ArialMT",       animDuration: 0.5 },
+    "social":    { barHeight: 70, textSize: 46, subtitleSize: 28, font: "Verdana-Bold",  animDuration: 0.4 }
+};
+
+function createLowerThird(args) {
+    try {
+        var comp = _resolveCompByNameOrActive(args.compName);
+        var title = args.title;
+        if (!title) return JSON.stringify({ status: "error", error: "title is required." });
+        var subtitle = args.subtitle || "";
+        var styleName = args.style || "modern";
+        var style = LOWER_THIRD_STYLES[styleName];
+        if (!style) return JSON.stringify({ status: "error", error: "Unknown style: " + styleName + ". Use one of: " + (function () { var k = []; for (var n in LOWER_THIRD_STYLES) k.push(n); return k.join(", "); })() });
+
+        var primaryColor = args.primaryColor || [0.1, 0.4, 0.9];
+        // secondaryColor: a real, functional accent stripe above the main bar -
+        // ishu86 accepts this param but never uses it anywhere; here it actually
+        // does something, defaulting to primaryColor rather than being ignored.
+        var secondaryColor = args.secondaryColor || primaryColor;
+        var textColor = args.textColor || [1, 1, 1];
+        var fontFamily = args.fontFamily || style.font;
+        var position = args.position || "bottomLeft";
+        var startTime = (args.startTime !== undefined && args.startTime !== null) ? Number(args.startTime) : 0;
+        var duration = (args.duration !== undefined && args.duration !== null) ? Number(args.duration) : 5;
+        var animateIn = (args.animateIn === undefined || args.animateIn === null) ? true : !!args.animateIn;
+        var animateOut = (args.animateOut === undefined || args.animateOut === null) ? true : !!args.animateOut;
+        var animDuration = style.animDuration;
+
+        var ltHeight = style.barHeight + (subtitle ? 90 : 60);
+        var ltComp = app.project.items.addComp("Lower Third - " + title, comp.width, ltHeight, 1, duration, comp.frameRate);
+
+        var accent = ltComp.layers.addSolid(secondaryColor, "Accent", ltComp.width, 4, 1);
+        _transformProp(accent, "ADBE Position").setValue([ltComp.width / 2, 2]);
+
+        var bar = ltComp.layers.addSolid(primaryColor, "Bar", ltComp.width, style.barHeight, 1);
+        _transformProp(bar, "ADBE Position").setValue([ltComp.width / 2, style.barHeight / 2 + 4]);
+
+        var titleRes = JSON.parse(createTextLayer({
+            compName: ltComp.name, text: title, fontSize: style.textSize, color: textColor,
+            fontFamily: fontFamily, position: [20, style.barHeight + 30], alignment: "left"
+        }));
+        var titleLayer = ltComp.layer(titleRes.layer.index);
+
+        var subtitleLayer = null;
+        if (subtitle) {
+            var subRes = JSON.parse(createTextLayer({
+                compName: ltComp.name, text: subtitle, fontSize: style.subtitleSize, color: textColor,
+                fontFamily: fontFamily, position: [20, style.barHeight + 30 + style.textSize * 0.9], alignment: "left"
+            }));
+            subtitleLayer = ltComp.layer(subRes.layer.index);
+        }
+
+        var animLayers = [accent, bar, titleLayer];
+        if (subtitleLayer) animLayers.push(subtitleLayer);
+        for (var li = 0; li < animLayers.length; li++) {
+            var lyr = animLayers[li];
+            var op = _transformProp(lyr, "ADBE Opacity");
+            if (animateIn) {
+                op.setValueAtTime(0, 0);
+                op.setValueAtTime(animDuration, 100);
+            }
+            if (animateOut) {
+                op.setValueAtTime(duration - animDuration, 100);
+                op.setValueAtTime(duration, 0);
+            }
+        }
+
+        var mainLayer = comp.layers.add(ltComp);
+        mainLayer.startTime = startTime;
+        var mx = (position === "bottomRight") ? comp.width - ltComp.width / 2 - 20 : (position === "bottomCenter" ? comp.width / 2 : ltComp.width / 2 + 20);
+        _transformProp(mainLayer, "ADBE Position").setValue([mx, comp.height - ltHeight / 2 - 20]);
+
+        return JSON.stringify({ status: "success", message: "Lower third created.", compName: ltComp.name, layerIndex: mainLayer.index });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function createTitleCard(args) {
+    try {
+        var comp = _resolveCompByNameOrActive(args.compName);
+        var title = args.title;
+        if (!title) return JSON.stringify({ status: "error", error: "title is required." });
+        var subtitle = args.subtitle || "";
+        var style = args.style || "minimal";
+        var validStyles = { "cinematic": true, "documentary": true, "social": true, "minimal": true };
+        if (!validStyles[style]) return JSON.stringify({ status: "error", error: "Unknown style: " + style + ". Use one of: cinematic, documentary, social, minimal." });
+
+        var backgroundColor = args.backgroundColor || null;
+        var fontFamily = args.fontFamily || "Arial-BoldMT";
+        var fontSize = (args.fontSize !== undefined && args.fontSize !== null) ? Number(args.fontSize) : 64;
+        var textColor = args.textColor || [1, 1, 1];
+        var startTime = (args.startTime !== undefined && args.startTime !== null) ? Number(args.startTime) : 0;
+        var duration = (args.duration !== undefined && args.duration !== null) ? Number(args.duration) : 4;
+
+        if (backgroundColor) {
+            var bg = comp.layers.addSolid(backgroundColor, "Title Background", comp.width, comp.height, 1);
+            bg.startTime = startTime;
+            bg.outPoint = startTime + duration;
+        }
+
+        var titleRes = JSON.parse(createTextLayer({
+            compName: comp.name, text: title, fontSize: fontSize, color: textColor,
+            fontFamily: fontFamily, position: [comp.width / 2, comp.height / 2 - (subtitle ? fontSize * 0.4 : 0)], alignment: "center",
+            startTime: startTime, duration: duration
+        }));
+        var titleLayer = comp.layer(titleRes.layer.index);
+        var titleOp = _transformProp(titleLayer, "ADBE Opacity");
+        var titleScale = _transformProp(titleLayer, "ADBE Scale");
+        var titlePos = _transformProp(titleLayer, "ADBE Position");
+
+        var subtitleLayer = null;
+        if (subtitle) {
+            var subRes = JSON.parse(createTextLayer({
+                compName: comp.name, text: subtitle, fontSize: Math.floor(fontSize * 0.4), color: textColor,
+                fontFamily: "ArialMT", position: [comp.width / 2, comp.height / 2 + fontSize * 0.6], alignment: "center",
+                startTime: startTime, duration: duration
+            }));
+            subtitleLayer = comp.layer(subRes.layer.index);
+        }
+
+        if (style === "cinematic") {
+            titleOp.setValueAtTime(startTime, 0);
+            titleOp.setValueAtTime(startTime + 1.2, 100);
+            titleScale.setValueAtTime(startTime, [110, 110, 100]);
+            titleScale.setValueAtTime(startTime + 1.2, [100, 100, 100]);
+            titleOp.setValueAtTime(startTime + duration - 1, 100);
+            titleOp.setValueAtTime(startTime + duration, 0);
+        } else if (style === "documentary") {
+            titleOp.setValueAtTime(startTime, 0);
+            titleOp.setValueAtTime(startTime + 0.8, 100);
+            titleOp.setValueAtTime(startTime + duration - 0.8, 100);
+            titleOp.setValueAtTime(startTime + duration, 0);
+        } else if (style === "social") {
+            titleScale.setValueAtTime(startTime, [60, 60, 100]);
+            titleScale.setValueAtTime(startTime + 0.4, [110, 110, 100]);
+            titleScale.setValueAtTime(startTime + 0.6, [100, 100, 100]);
+            titleOp.setValueAtTime(startTime, 0);
+            titleOp.setValueAtTime(startTime + 0.2, 100);
+        } else {
+            titleOp.setValueAtTime(startTime, 0);
+            titleOp.setValueAtTime(startTime + 0.5, 100);
+        }
+        if (subtitleLayer) {
+            var subOp = _transformProp(subtitleLayer, "ADBE Opacity");
+            subOp.setValueAtTime(startTime + 0.3, 0);
+            subOp.setValueAtTime(startTime + 1, 100);
+        }
+
+        return JSON.stringify({ status: "success", message: "Title card created.", titleLayerIndex: titleLayer.index });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function createTransition(args) {
+    try {
+        var comp = _resolveCompByNameOrActive(args.compName);
+        var type = args.type;
+        var validTypes = { "wipe_left": true, "wipe_right": true, "wipe_up": true, "wipe_down": true, "dissolve": true, "push": true, "slide": true, "zoom": true };
+        if (!type || !validTypes[type]) return JSON.stringify({ status: "error", error: "type is required and must be one of: wipe_left, wipe_right, wipe_up, wipe_down, dissolve, push, slide, zoom." });
+
+        var color = args.color || [0, 0, 0];
+        var startTime = (args.startTime !== undefined && args.startTime !== null) ? Number(args.startTime) : 0;
+        var duration = (args.duration !== undefined && args.duration !== null) ? Number(args.duration) : 1;
+        var easing = args.easing || "linear";
+
+        var layer = comp.layers.addSolid(color, "Transition", comp.width, comp.height, 1);
+        layer.startTime = startTime;
+        layer.outPoint = startTime + duration;
+        var endTime = startTime + duration;
+
+        function setTwoKeys(property, t0, v0, t1, v1) {
+            property.setValueAtTime(t0, v0);
+            var i0 = findKeyIndexAtTime(property, t0);
+            if (i0 > 0) _applyEasingAtKey(property, i0, easing, true, false);
+            property.setValueAtTime(t1, v1);
+            var i1 = findKeyIndexAtTime(property, t1);
+            if (i1 > 0) _applyEasingAtKey(property, i1, easing, false, true);
+        }
+
+        if (type.indexOf("wipe_") === 0) {
+            var wipe = layer.property("ADBE Effect Parade").addProperty("ADBE Linear Wipe");
+            var angleMap = { "wipe_left": 0, "wipe_right": 180, "wipe_up": 90, "wipe_down": 270 };
+            var wipeAngle = _safeProp(wipe, "ADBE Linear Wipe-0002", "Wipe Angle");
+            if (wipeAngle) wipeAngle.setValue(angleMap[type]);
+            var completion = _safeProp(wipe, "ADBE Linear Wipe-0001", "Transition Completion");
+            if (completion) setTwoKeys(completion, startTime, 0, endTime, 100);
+        } else if (type === "dissolve") {
+            setTwoKeys(_transformProp(layer, "ADBE Opacity"), startTime, 100, endTime, 0);
+        } else if (type === "push" || type === "slide") {
+            var pos = _transformProp(layer, "ADBE Position");
+            var startX = comp.width / 2 + comp.width;
+            var endX = comp.width / 2;
+            setTwoKeys(pos, startTime, [startX, comp.height / 2], endTime, [endX, comp.height / 2]);
+        } else if (type === "zoom") {
+            setTwoKeys(_transformProp(layer, "ADBE Scale"), startTime, [0, 0, 100], endTime, [100, 100, 100]);
+        }
+
+        return JSON.stringify({ status: "success", message: "Transition created.", layerIndex: layer.index, type: type });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function createLogoReveal(args) {
+    try {
+        var comp = _resolveCompByNameOrActive(args.compName);
+
+        // Explicit validation instead of ishu86's raw ReferenceError when neither
+        // logoItemId nor logoItemName is given (that path in ishu86 never declares
+        // the variable it then checks).
+        if ((args.logoItemId === undefined || args.logoItemId === null) && !args.logoItemName) {
+            return JSON.stringify({ status: "error", error: "Provide logoItemId or logoItemName." });
+        }
+        var logoItem = null;
+        if (args.logoItemId !== undefined && args.logoItemId !== null) {
+            logoItem = app.project.itemByID(args.logoItemId);
+        }
+        if (!logoItem && args.logoItemName) {
+            for (var i = 1; i <= app.project.numItems; i++) {
+                var it = app.project.item(i);
+                if (it.name === args.logoItemName) { logoItem = it; break; }
+            }
+        }
+        if (!logoItem) return JSON.stringify({ status: "error", error: "Logo item not found (checked logoItemId and logoItemName)." });
+
+        var style = args.style || "fade";
+        // "particle" dropped rather than accepted-and-silently-ignored - ishu86's
+        // schema lists it but has no implementation branch for it at all.
+        var validStyles = { "fade": true, "scale": true, "slide": true, "spin": true, "glitch": true };
+        if (!validStyles[style]) return JSON.stringify({ status: "error", error: "Unknown style: " + style + ". Use one of: fade, scale, slide, spin, glitch." });
+
+        var backgroundColor = args.backgroundColor || null;
+        var startTime = (args.startTime !== undefined && args.startTime !== null) ? Number(args.startTime) : 0;
+        var duration = (args.duration !== undefined && args.duration !== null) ? Number(args.duration) : 3;
+
+        if (backgroundColor) {
+            var bg = comp.layers.addSolid(backgroundColor, "Logo Background", comp.width, comp.height, 1);
+            bg.startTime = startTime;
+            bg.outPoint = startTime + duration;
+        }
+
+        var logoLayer = comp.layers.add(logoItem);
+        logoLayer.startTime = startTime;
+        logoLayer.outPoint = startTime + duration;
+        _transformProp(logoLayer, "ADBE Position").setValue([comp.width / 2, comp.height / 2]);
+
+        var op = _transformProp(logoLayer, "ADBE Opacity");
+        var scale = _transformProp(logoLayer, "ADBE Scale");
+        var rotation = _transformProp(logoLayer, "ADBE Rotation");
+
+        if (style === "fade") {
+            op.setValueAtTime(startTime, 0);
+            op.setValueAtTime(startTime + 1, 100);
+        } else if (style === "scale") {
+            scale.setValueAtTime(startTime, [0, 0, 100]);
+            scale.setValueAtTime(startTime + 0.6, [110, 110, 100]);
+            scale.setValueAtTime(startTime + 0.8, [100, 100, 100]);
+            op.setValueAtTime(startTime, 0);
+            op.setValueAtTime(startTime + 0.2, 100);
+        } else if (style === "slide") {
+            var pos = _transformProp(logoLayer, "ADBE Position");
+            pos.setValueAtTime(startTime, [-comp.width * 0.2, comp.height / 2]);
+            pos.setValueAtTime(startTime + 0.8, [comp.width / 2, comp.height / 2]);
+        } else if (style === "spin") {
+            rotation.setValueAtTime(startTime, -180);
+            rotation.setValueAtTime(startTime + 1, 0);
+            scale.setValueAtTime(startTime, [0, 0, 100]);
+            scale.setValueAtTime(startTime + 1, [100, 100, 100]);
+            op.setValueAtTime(startTime, 0);
+            op.setValueAtTime(startTime + 0.3, 100);
+        } else if (style === "glitch") {
+            try { _transformProp(logoLayer, "ADBE Position").expression = "wiggle(30, 5)"; } catch (eGlitch) {}
+            op.setValueAtTime(startTime, 0);
+            op.setValueAtTime(startTime + 0.1, 100);
+            op.setValueAtTime(startTime + 0.15, 0);
+            op.setValueAtTime(startTime + 0.2, 100);
+        }
+
+        return JSON.stringify({ status: "success", message: "Logo reveal created.", layerIndex: logoLayer.index, style: style });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function createTextAnimator(args) {
+    try {
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var layer = cl.layer;
+        if (!(layer instanceof TextLayer)) {
+            return JSON.stringify({ status: "error", error: "Layer '" + layer.name + "' is not a text layer." });
+        }
+        var animatorType = args.animatorType;
+        var validTypes = { "typewriter": true, "fadeInChars": true, "scaleInChars": true, "slideInChars": true, "randomize": true, "wave": true };
+        if (!animatorType || !validTypes[animatorType]) {
+            return JSON.stringify({ status: "error", error: "animatorType is required and must be one of: typewriter, fadeInChars, scaleInChars, slideInChars, randomize, wave." });
+        }
+        var startTime = (args.startTime !== undefined && args.startTime !== null) ? Number(args.startTime) : 0;
+        var duration = (args.duration !== undefined && args.duration !== null) ? Number(args.duration) : 2;
+        // delay: genuine per-character stagger (ishu86 accepts this but never uses
+        // it) - wired via a textIndex-based expression on the selector's Offset,
+        // the standard AE technique for staggering a per-character animator.
+        var delay = (args.delay !== undefined && args.delay !== null) ? Number(args.delay) : 0.05;
+
+        var textProp = layer.property("ADBE Text Properties");
+        var animators = textProp.property("Animators");
+        var animator = animators.addProperty("ADBE Text Animator");
+        animator.name = animatorType;
+        var selectors = animator.property("Selectors");
+        var selector = selectors.addProperty("ADBE Text Selector");
+
+        var startProp = _safeProp(selector, "ADBE Text Percent Start", "Start");
+        var endProp = _safeProp(selector, "ADBE Text Percent End", "End");
+        var offsetProp = _safeProp(selector, "ADBE Text Percent Offset", "Offset");
+
+        if (animatorType === "randomize") {
+            try { selector.property("ADBE Text Randomize Order").setValue(1); } catch (eRand) {}
+        }
+        if (offsetProp) {
+            try { offsetProp.expression = "textIndex * " + delay + " * 100 / Math.max(1, textIndex.length)"; } catch (eOff) {}
+        }
+        if (startProp && endProp) {
+            startProp.setValueAtTime(startTime, 0);
+            endProp.setValueAtTime(startTime, 0);
+            startProp.setValueAtTime(startTime + duration, 100);
+            endProp.setValueAtTime(startTime + duration, 100);
+        }
+
+        // "ADBE Text Animator Properties" (real match name), not the friendly
+        // string "Properties" - the latter resolves to AE's full ~103-entry
+        // catalog of every possible per-character property (Anchor Point first),
+        // not the small collection of properties actually added to this
+        // animator, so addProperty()/property(1) against it silently operated
+        // on the wrong group (confirmed live: numProperties came back 103 with
+        // "Anchor Point" at index 1, not the one property just added).
+        var properties = _safeProp(animator, "ADBE Text Animator Properties", "Properties");
+        if (animatorType === "typewriter" || animatorType === "fadeInChars") {
+            properties.addProperty("ADBE Text Opacity").setValue(0);
+        } else if (animatorType === "scaleInChars") {
+            properties.addProperty("ADBE Text Scale 3D").setValue([0, 0, 100]);
+        } else if (animatorType === "slideInChars") {
+            properties.addProperty("ADBE Text Position 3D").setValue([0, 50, 0]);
+        } else if (animatorType === "randomize") {
+            properties.addProperty("ADBE Text Opacity").setValue(0);
+        } else if (animatorType === "wave") {
+            // Real per-character oscillation via expression on the animator's own
+            // Position, keyed off textIndex - not ishu86's shared, non-oscillating
+            // offset + scrolling selector window (which produces a moving band,
+            // not per-character motion, despite its description).
+            var waveAmp = (args.waveAmplitude !== undefined && args.waveAmplitude !== null) ? Number(args.waveAmplitude) : 20;
+            var waveSpeed = (args.waveSpeed !== undefined && args.waveSpeed !== null) ? Number(args.waveSpeed) : 4;
+            var wavePos = properties.addProperty("ADBE Text Position 3D");
+            wavePos.expression = "amp = " + waveAmp + ";\nspeed = " + waveSpeed + ";\n[0, Math.sin(time*speed + textIndex*0.5)*amp, 0];";
+        }
+
+        return JSON.stringify({ status: "success", message: "Text animator added.", animatorName: animator.name });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
 function setLayerProperties(args) {
     try {
         var compName = args.compName || "";
@@ -686,7 +1119,14 @@ function _resolveLayerProperty(layer, propertyName) {
 }
 
 function _resolveCompAndLayerSimple(compIndex, layerIndex) {
-    var comp = app.project.items[compIndex];
+    // app.project.item(index) (method call), not app.project.items[index]
+    // (bracket indexing) - the latter does not reliably return the item at
+    // that position once a project has more than a couple of items (confirmed
+    // live: failed with "Composition not found" for a valid compIndex once the
+    // motion-graphics-templates test's project grew past its first couple of
+    // items, despite working in every earlier, simpler single-comp test). Every
+    // other comp-lookup in this file already uses the .item(i) method form.
+    var comp = app.project.item(compIndex);
     if (!comp || !(comp instanceof CompItem)) {
         throw new Error("Composition not found at index " + compIndex);
     }
@@ -3142,6 +3582,17 @@ function createProject(args) {
     try {
         var gate = _resolveSaveFirst(args && args.saveFirst);
         if (gate) return gate;
+        // Explicitly close the current project before creating the new one,
+        // instead of relying on app.newProject()'s own internal handling of a
+        // dirty current project. Confirmed live: app.beginSuppressDialogs() does
+        // NOT reliably suppress the native "save changes?" dialog that app.open()/
+        // app.newProject() raise themselves for a dirty project - it blocked the
+        // whole bridge (and thus every other MCP tool) until manually dismissed,
+        // even though _resolveSaveFirst had already decided discarding was fine.
+        // Project.close(CloseOptions.DO_NOT_SAVE_CHANGES) has been reliable with
+        // no dialog across every call in this codebase's own test suites, so do
+        // that explicitly first rather than trusting the dialog suppression.
+        try { app.project.close(CloseOptions.DO_NOT_SAVE_CHANGES); } catch (eClose) {}
         app.newProject();
         return JSON.stringify({ status: "success", message: "Created a new project." });
     } catch (e) {
@@ -3161,6 +3612,10 @@ function openProject(args) {
         }
         var gate = _resolveSaveFirst(args && args.saveFirst);
         if (gate) return gate;
+        // See the comment in createProject() above: explicitly close the current
+        // project first rather than relying on app.open()'s own (unreliable)
+        // dialog suppression for a dirty current project.
+        try { app.project.close(CloseOptions.DO_NOT_SAVE_CHANGES); } catch (eClose) {}
         app.open(file);
         return JSON.stringify({ status: "success", message: "Opened project: " + filePath, path: filePath });
     } catch (e) {
@@ -4627,6 +5082,31 @@ function executeCommand(command, args) {
                 logToPanel("Calling applyEasyEase function...");
                 result = applyEasyEase(args);
                 logToPanel("Returned from applyEasyEase.");
+                break;
+            case "createLowerThird":
+                logToPanel("Calling createLowerThird function...");
+                result = createLowerThird(args);
+                logToPanel("Returned from createLowerThird.");
+                break;
+            case "createTitleCard":
+                logToPanel("Calling createTitleCard function...");
+                result = createTitleCard(args);
+                logToPanel("Returned from createTitleCard.");
+                break;
+            case "createTransition":
+                logToPanel("Calling createTransition function...");
+                result = createTransition(args);
+                logToPanel("Returned from createTransition.");
+                break;
+            case "createLogoReveal":
+                logToPanel("Calling createLogoReveal function...");
+                result = createLogoReveal(args);
+                logToPanel("Returned from createLogoReveal.");
+                break;
+            case "createTextAnimator":
+                logToPanel("Calling createTextAnimator function...");
+                result = createTextAnimator(args);
+                logToPanel("Returned from createTextAnimator.");
                 break;
             case "applyEffect":
                 logToPanel("Calling applyEffect function...");

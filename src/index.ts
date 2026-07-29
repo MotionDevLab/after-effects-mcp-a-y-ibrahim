@@ -325,6 +325,11 @@ server.tool(
       "reverseKeyframes",
       "copyKeyframes",
       "applyEasyEase",
+      "createLowerThird",
+      "createTitleCard",
+      "createTransition",
+      "createLogoReveal",
+      "createTextAnimator",
     ];
 
     if (!allowedScripts.includes(script)) {
@@ -1269,6 +1274,151 @@ server.tool(
     } catch (error) {
       return {
         content: [{ type: "text", text: `Error applying easy ease: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "create-lower-third",
+  "Build a complete animated lower-third graphic (precomp with an accent stripe, main " +
+    "bar, title, and optional subtitle) and add it to a composition. Style controls bar " +
+    "height, text size, default font, and animation timing.",
+  {
+    compName: z.string().optional().describe("Composition to add the lower third to (defaults to the active comp)."),
+    title: z.string().describe("Main title text."),
+    subtitle: z.string().optional().describe("Optional subtitle text below the title."),
+    style: z.enum(["modern", "corporate", "news", "minimal", "social"]).optional().describe("Visual style preset (default 'modern')."),
+    primaryColor: z.array(z.number()).length(3).optional().describe("Main bar color as [r,g,b], each 0-1 (default a blue)."),
+    secondaryColor: z.array(z.number()).length(3).optional().describe("Accent stripe color as [r,g,b], each 0-1 (defaults to primaryColor)."),
+    textColor: z.array(z.number()).length(3).optional().describe("Text color as [r,g,b], each 0-1 (default white)."),
+    fontFamily: z.string().optional().describe("Font override (defaults to a per-style font)."),
+    position: z.enum(["bottomLeft", "bottomRight", "bottomCenter"]).optional().describe("Where to place it in the target comp (default 'bottomLeft')."),
+    startTime: z.number().optional().describe("Start time in seconds (default 0)."),
+    duration: z.number().optional().describe("Total duration in seconds (default 5)."),
+    animateIn: z.boolean().optional().describe("Fade in at the start (default true)."),
+    animateOut: z.boolean().optional().describe("Fade out at the end (default true)."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("createLowerThird", parameters, 15000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error creating lower third: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "create-title-card",
+  "Add a title (and optional subtitle, and optional full-frame background) to a " +
+    "composition, animated per style: cinematic (scale+fade), documentary (fade only), " +
+    "social (bounce in), or minimal (simple fade).",
+  {
+    compName: z.string().optional().describe("Composition to add the title card to (defaults to the active comp)."),
+    title: z.string().describe("Title text."),
+    subtitle: z.string().optional().describe("Optional subtitle text below the title."),
+    style: z.enum(["cinematic", "documentary", "social", "minimal"]).optional().describe("Animation style (default 'minimal')."),
+    backgroundColor: z.array(z.number()).length(3).optional().describe("Full-frame background color as [r,g,b], each 0-1. Omit for no background layer."),
+    fontFamily: z.string().optional().describe("Font for the title (default 'Arial-BoldMT')."),
+    fontSize: z.number().optional().describe("Title font size (default 64)."),
+    textColor: z.array(z.number()).length(3).optional().describe("Text color as [r,g,b], each 0-1 (default white)."),
+    startTime: z.number().optional().describe("Start time in seconds (default 0)."),
+    duration: z.number().optional().describe("Duration in seconds (default 4)."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("createTitleCard", parameters, 15000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error creating title card: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "create-transition",
+  "Add a full-frame transition layer to a composition: a wipe (via the Linear Wipe " +
+    "effect), dissolve, push, slide, or zoom. easing controls the keyframe interpolation " +
+    "and is genuinely applied (linear = literal linear motion, easeIn/easeOut/easeInOut = " +
+    "eased bezier motion).",
+  {
+    compName: z.string().optional().describe("Composition to add the transition to (defaults to the active comp)."),
+    type: z.enum(["wipe_left", "wipe_right", "wipe_up", "wipe_down", "dissolve", "push", "slide", "zoom"]).describe("Transition type."),
+    color: z.array(z.number()).length(3).optional().describe("Transition layer color as [r,g,b], each 0-1 (default black)."),
+    startTime: z.number().optional().describe("Start time in seconds (default 0)."),
+    duration: z.number().optional().describe("Duration in seconds (default 1)."),
+    easing: z.enum(["linear", "easeIn", "easeOut", "easeInOut"]).optional().describe("Keyframe easing (default 'linear')."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("createTransition", parameters, 15000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error creating transition: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "create-logo-reveal",
+  "Add an existing project item (logo) to a composition with an animated reveal: fade, " +
+    "scale, slide, spin, or glitch (a wiggle expression + opacity flicker). Requires " +
+    "logoItemId or logoItemName.",
+  {
+    compName: z.string().optional().describe("Composition to add the logo to (defaults to the active comp)."),
+    logoItemId: z.number().int().optional().describe("Project item id of the logo footage (from getProjectInfo). Provide this or logoItemName."),
+    logoItemName: z.string().optional().describe("Project item name of the logo footage. Provide this or logoItemId."),
+    style: z.enum(["fade", "scale", "slide", "spin", "glitch"]).describe("Reveal style."),
+    backgroundColor: z.array(z.number()).length(3).optional().describe("Full-frame background color as [r,g,b], each 0-1. Omit for no background layer."),
+    startTime: z.number().optional().describe("Start time in seconds (default 0)."),
+    duration: z.number().optional().describe("Duration in seconds (default 3)."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("createLogoReveal", parameters, 15000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error creating logo reveal: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "create-text-animator",
+  "Add a per-character text animator to an existing text layer: typewriter, " +
+    "fadeInChars, scaleInChars, slideInChars, randomize, or wave (a real per-character " +
+    "oscillating expression, not a shared scrolling band). delay staggers the animation " +
+    "across characters.",
+  {
+    ...LayerIdentifierSchema,
+    animatorType: z.enum(["typewriter", "fadeInChars", "scaleInChars", "slideInChars", "randomize", "wave"]).describe("Animator type."),
+    startTime: z.number().optional().describe("Start time in seconds (default 0)."),
+    duration: z.number().optional().describe("Duration of the character reveal in seconds (default 2)."),
+    delay: z.number().optional().describe("Per-character stagger in seconds (default 0.05)."),
+    waveAmplitude: z.number().optional().describe("For the 'wave' type: oscillation amplitude in pixels (default 20)."),
+    waveSpeed: z.number().optional().describe("For the 'wave' type: oscillation speed (default 4)."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("createTextAnimator", parameters, 15000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error creating text animator: ${String(error)}` }],
         isError: true,
       };
     }

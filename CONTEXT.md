@@ -195,6 +195,10 @@ feature comparison below, so signing was not pursued.
   `reverse-keyframes`, `copy-keyframes`, `apply-easy-ease` (25-step test,
   found and fixed 2 real bugs during verification - see the
   keyframe-manipulation spec section above)
+- `create-lower-third`, `create-title-card`, `create-transition`,
+  `create-logo-reveal`, `create-text-animator` (28-step test, found and
+  fixed 4 real bugs during verification, one cross-cutting - see the
+  motion-graphics-templates spec section and "Known limitations" above)
 
 ## Not yet tested
 
@@ -638,13 +642,186 @@ its own untouched property) not a tool bug.
 Re-run `node manual-tests/keyframe-manipulation-test.mjs` (from the repo
 root) after any future change to these 6 tools.
 
+## SPEC: motion-graphics templates — IMPLEMENTED and verified 2026-07-29
+(branch `feature/motion-graphics-templates`, off `feature/keyframe-manipulation-tools`)
+
+Written 2026-07-29. Block #5, chosen over ishu86's deferred
+batch-expression/template-introspection tools because it's a genuinely new
+capability category (composite multi-layer builders for common real
+deliverables) rather than completing something already 90% done. Closes:
+`create_lower_third`, `create_title_card`, `create_transition`,
+`create_logo_reveal`, `create_text_animator`.
+
+ishu86's `templateGenerators.ts` was read directly as ground truth. Confirmed
+portable - every AE call in this category (`addComp`, `addText`, `addSolid`,
+TextDocument mutation, `addProperty("ADBE ...")`, `KeyframeEase`,
+`setTemporalEaseAtKey`, animator/selector match-names) is plain ExtendScript
+with zero CEP-specific surface, same conclusion as every previous block.
+Also confirmed: a second ishu86 file, `src/presets/motion-graphics/index.ts`,
+is dead code (unreferenced), same pattern as `schemas.ts` found earlier -
+not a source to trust for "what's actually wired."
+
+**Six real bugs found in ishu86, fixed here rather than replicated:**
+1. `create_lower_third` accepts `secondaryColor` but never uses it anywhere
+   in the function body - dead parameter. Fixed: implemented as a real thin
+   accent stripe under the main bar (defaults to `primaryColor` if omitted,
+   never silently ignored).
+2. `create_lower_third`'s title/subtitle font is hardcoded
+   (`Arial-BoldMT`/`ArialMT`) for every style, despite a *different*, unused
+   ishu86 file implying styles should carry their own font. Fixed: a
+   per-style font default, plus an optional `fontFamily` override (this
+   fork's `createTextLayer` already supports arbitrary fonts, so this is
+   cheap and consistent).
+3. `create_transition`'s `easing` param is declared in the schema and typed,
+   but never referenced in the function body at all - completely dead.
+   Fixed: genuinely wired using this fork's own existing `buildEaseArray`/
+   `KeyframeEase`/`setTemporalEaseAtKey` (already proven in the
+   keyframe-manipulation block), applied in the correct order discovered
+   last block (ease before interpolation type - `setTemporalEaseAtKey`
+   appears to force-promote to BEZIER, so setting interpolation type last is
+   what makes it stick).
+4. `create_logo_reveal`: if neither `logoItemId` nor `logoItemName` is
+   supplied (neither is in the schema's `required` list, so this is
+   reachable), the generated code never declares the `logoItem` variable in
+   that branch, then immediately checks `if (!logoItem)` - a raw ES3
+   `ReferenceError`, not the intended friendly error. Fixed: explicit
+   validation in the bridge function returns a clear error instead.
+5. `create_logo_reveal`'s `style` schema enum has 6 values but the
+   implementation only handles 5 - `particle` silently falls through with
+   zero animation (logo just appears, no reveal). Fixed: `particle` dropped
+   from the enum entirely rather than accepted-and-ignored, matching the
+   same principle as `organize-project-items`'s custom-mode decision in the
+   asset-management block (implement properly or omit, never silently no-op).
+6. `create_text_animator`'s `delay` param is read into a local variable and
+   then never used again - dead. Its `wave` style also isn't a true
+   per-character wave (a shared, non-oscillating position offset plus a
+   scrolling selector window, despite the description implying real
+   per-character motion). Fixed: `delay` genuinely wired as a per-character
+   stagger via a `textIndex`-based expression on the selector (the standard
+   AE technique); `wave` rewritten as a real per-character oscillating
+   expression (`Math.sin(time*speed + textIndex*phase) * amplitude` on the
+   animator's Position), not a keyframed approximation.
+
+**Reuse**: comp resolution (by name, falling back to the active comp) is
+already duplicated identically across `createTextLayer`/`createSolidLayer`/
+`createShapeLayer` - factored into one new shared `_resolveCompByNameOrActive`
+helper used by all 5 new functions, without touching those 3 existing
+functions. Color convention matches the existing `[r,g,b]` 0-1 array
+established by those same functions, not ishu86's differing format. New
+functions call raw AE APIs directly (matching ishu86's own approach and this
+fork's own style in the keyframe-manipulation block) rather than composing
+through the 3 existing functions, since those return JSON strings rather than
+live layer references, making composition more awkward than writing focused
+code directly.
+
+**Schema conventions**: the 4 layer-creating tools (`create-lower-third`,
+`create-title-card`, `create-transition`, `create-logo-reveal`) use
+`compName` (optional, falls back to active comp) matching `createTextLayer`/
+`createSolidLayer`/`createShapeLayer` exactly - they're peers of those
+functions (add something to a target comp), not of the
+`compIndex`+`layerIndex` tools (which modify an existing layer).
+`create-text-animator` uses `LayerIdentifierSchema` instead, since it
+modifies an existing text layer, not creates one.
+
+Full schema/logic detail is in `src/index.ts` and
+`src/scripts/mcp-bridge-auto.jsx` - this section records the *why*.
+
+**Verified 2026-07-29** via `manual-tests/motion-graphics-templates-test.mjs`
+(28 steps). This was the most bug-dense block so far - four real bugs found
+and fixed, one of them (#3 below) a **cross-cutting bug affecting nearly
+every tool built in every previous block**, not something specific to this
+one. See "Known limitations" below for the full writeup; short version:
+
+1. **Invalid ease influence value.** `_applyEasingAtKey` used `0.1` as
+   "practically no ease" - originally coded as `0.01`, below AE's actual
+   valid range of `[0.1, 100]` for `KeyframeEase`, which crashed
+   `create-transition` outright with a `Constructor` error. Fixed by using
+   the real minimum, `0.1`.
+2. **`app.beginSuppressDialogs()` does not reliably suppress AE's native
+   "unsaved changes" dialog** raised internally by `app.open()`/
+   `app.newProject()` for a dirty current project - it blocked the entire
+   bridge (every MCP tool, not just the one call) until manually dismissed,
+   *even though* `_resolveSaveFirst` had already decided discarding was
+   safe. Fixed in `createProject`/`openProject` by explicitly calling
+   `app.project.close(CloseOptions.DO_NOT_SAVE_CHANGES)` first (proven
+   reliable, no dialog, across dozens of calls all session) instead of
+   trusting `app.open()`/`app.newProject()` to handle a dirty project
+   silently themselves. This is a real reliability fix to the
+   project-lifecycle tools from block #1, only surfaced now because this
+   block's test created much heavier scratch-project state than any earlier
+   test.
+3. **`app.project.item(index)`'s positional index is not stable creation
+   order** - see "Known limitations" below, this is the big one.
+4. **A Text Animator's "Properties" group is a fixed ~103-slot catalog**
+   (every possible per-character property, Anchor Point always first), not
+   a growable list of what's been added. `addProperty(matchName)` activates
+   a specific slot and returns a working reference to it (so the *write*
+   side - what `create-text-animator` itself does - was correct all along);
+   but re-discovering "the one I just added" afterward via `.property(1)`
+   always returns Anchor Point regardless of what's active. The fix
+   (searching by `matchName` + a non-empty `.expression`/value) was only
+   needed in the *test's* verification code, not the tool itself - recorded
+   here anyway since it's a real, reusable lesson for any future work
+   touching Text Animator properties.
+
+Also fixed for consistency (not bugs, just correctness identified while
+writing the new code): `_easeDimensionForProperty` was added proactively so
+`create-transition`'s new easing code wouldn't reproduce the exact
+value-dimension-vs-ease-dimension crash already found and fixed in
+`apply-easy-ease` last block - applying that lesson before it could bite a
+second time, rather than after.
+
+Re-run `node manual-tests/motion-graphics-templates-test.mjs` (from the repo
+root) after any future change to these 5 tools.
+
+## Known limitations
+
+### `compIndex`'s positional index can shift as a project grows (discovered 2026-07-29)
+
+Every `compIndex`/`layerIndex`-based tool in this fork (the `LayerIdentifierSchema`
+convention - `setLayerKeyframe`, every expression-suite tool, every
+keyframe-manipulation tool, `create-text-animator`, and more) resolves a
+composition via `app.project.item(compIndex)`. That index is **the item's
+current position in the Project panel's flat item list, not a stable ID
+assigned at creation** - confirmed live: a composition created first (and
+initially at position 1) had shifted to **position 3** later in the same
+session, after only a few more items were added and After Effects
+auto-created its own built-in "Solids" folder (a real, automatic AE
+behavior whenever a solid-color layer is created). No tool in this codebase
+did anything to explicitly move or reorder that composition - the position
+simply isn't stable once a project has more than a couple of items or any
+folders.
+
+**Practical impact**: `compIndex` is safe to treat as stable only in a
+freshly-created, simple scratch project immediately after creating the
+target comp (which is exactly the shape of every previous block's test -
+why this was never caught until a test finally created enough items to
+trigger it). In any real project with multiple comps, imported footage, or
+folders (including AE's own auto-created "Solids"/"Comps" folders), a
+`compIndex` captured earlier in a session can silently point at the wrong
+composition later, since nothing about the target comp itself changed.
+
+**Not fixed here** - this is a pre-existing, cross-cutting design property
+of the whole `LayerIdentifierSchema` convention (present since block #1 or
+earlier, in code this fork inherited, not introduced this session), and
+fixing it properly (e.g. switching to `compName` everywhere, or resolving
+`compIndex` against `item.id` instead of positional index) would be a
+sweeping change across every tool in every block, out of scope for a single
+block's fix. Recorded here as a known limitation so a future session
+doesn't have to rediscover it, and so any caller relying on a `compIndex`
+captured earlier in a long session knows to re-resolve it (e.g. via
+`getProjectInfo`, matching by name) rather than trust it stays valid.
+
+**What already avoids this**: the four motion-graphics tools that create
+new content (`create-lower-third`, `create-title-card`, `create-transition`,
+`create-logo-reveal`) all use `compName` (falling back to the active comp),
+not `compIndex` - they were designed this way from the start, matching
+`createTextLayer`/`createSolidLayer`/`createShapeLayer`'s existing
+convention, and are unaffected by this limitation.
+
 ## Next planned step
 
-All four blocks on the original priority list are now complete:
-~~(1) project lifecycle~~, ~~(2) asset management~~, ~~(3) expression
-suite~~, ~~(4) keyframe timeline manipulation~~ - all done 2026-07-29. No
-5th block is currently planned. If one is wanted later, candidates noted
-along the way: ishu86's motion-graphics templates (lower thirds, title
-cards, transitions, logo reveals - a real category this fork still lacks),
-or the batch-expression-setter/template-introspection tools ishu86 itself
-built but never wired up (deferred in the expression-suite spec above).
+Decide whether a 6th block is wanted. Remaining candidate noted along the
+way: ishu86's batch-expression-setter/template-introspection tools, built
+but never wired up on their side (deferred in the expression-suite spec
+above).
