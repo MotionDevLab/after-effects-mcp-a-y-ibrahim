@@ -1032,14 +1032,92 @@ it's the direction this limitation already recommended moving toward - so
 new tools added going forward should default to that convention too, rather
 than perpetuating the raw-positional one.
 
+#### Full tool inventory by resolution family (researched 2026-07-29)
+
+A complete Explore pass over `src/index.ts` and `src/scripts/mcp-bridge-auto.jsx`
+found the raw-positional side is actually **three** subtly different
+implementations, not one, plus one tool that bypasses the bridge entirely.
+Use this table to know which counting rule applies before trusting a
+`compIndex` value with any specific tool:
+
+- **Raw-positional via `LayerIdentifierSchema` + `_resolveCompAndLayerSimple`**
+  (`app.project.item(compIndex)`, then bracket `comp.layers[layerIndex]`):
+  `setLayerKeyframe`, `setLayerExpression`, `get-expression`,
+  `enable-expression`, `add-expression-control`, `apply-expression-template`,
+  `get-keyframes`, `offset-keyframes`, `scale-keyframe-timing`,
+  `reverse-keyframes`, `apply-easy-ease`, `create-text-animator` (12 tools,
+  all bare-required `compIndex`+`layerIndex`, no `compName`/`layerName`
+  alternative).
+- **Raw-positional via the `resolveCompAndLayer` helper** (same
+  `app.project.item(compIndex)`, but method-call `comp.layer(layerIndex)`
+  and defaults both indices to `1` if omitted): `set-effect-property`,
+  `set-effect-keyframe`, `list-layer-effects`, `remove-effect`,
+  `set-audio-levels`.
+- **Raw-positional, resolved inline** (`app.project.item(compIndex)`
+  written directly in the bridge function, no shared helper at all):
+  `apply-effect`, `add-any-effect`, `apply-effect-template`, `add-marker`,
+  `get-audio-info`, `center-layers`, `get-layer-clip-frames`.
+- **Raw-positional via bracket indexing on the whole items collection**
+  (`app.project.items[compIndex]` - not even `.item()` - plus
+  `comp.layers[idx]` bracket for both layers): `link-properties`,
+  `copy-keyframes`. The least safe existing variant, and the only one with
+  *no* name-based alternative on the layer side either (no
+  `sourceLayerName`/`targetLayerName`).
+- **Comp-ordinal, `compName`-preferring (`_resolveComp`/`_resolveLayer`) -
+  already safe, no action needed**: `duplicate-layer`, `delete-layer`,
+  `set-composition-properties`, `set-layer-mask`,
+  `batch-set-layer-properties`, all 8 block-#6 tools
+  (`duplicate-composition`, `delete-composition`, `add-light-layer`,
+  `precompose-layers`, `reorder-effects`, `copy-effects`, `delete-marker`,
+  `set-work-area`), the 4 motion-graphics creators (`create-lower-third`,
+  `create-title-card`, `create-transition`, `create-logo-reveal`),
+  `localize-comp`, `create-camera`, `inspect-comp`, `inspect-layer`,
+  `animate-to-audio`/`animate-from-data`.
+- **Deliberately excluded from any future fix, vestigial**: `test-animation`
+  (`src/index.ts` ~line 1436). Bypasses the bridge dispatcher entirely -
+  writes a standalone `.jsx` temp file the user must manually run via
+  `File > Scripts > Run Script File...`, uses blocking `alert()` popups,
+  and duplicates what `setLayerKeyframe`/`setLayerExpression` already do
+  properly through the real bridge. Inherited from the base fork, not part
+  of the maintained tool surface - a candidate for removal, not migration,
+  if anyone ever revisits it.
+
+#### Mitigation adopted instead of a full refactor (decided 2026-07-29)
+
+A full standardization pass (migrate all ~20 tools above onto
+`_resolveComp`/`_resolveLayer`, delete `_resolveCompAndLayerSimple`/
+`resolveCompAndLayer`) was scoped out in detail but **deliberately not
+implemented**: the actual trigger condition for a wrong-target bug is
+narrow (a non-comp item before the target comp, *and* a caller reusing a
+`compIndex` across the wrong tool family without re-resolving), it hasn't
+caused a real observed incident, and the fix would be the single largest,
+most cross-cutting change of the whole project - including a breaking
+semantic change to `compIndex` on 12+ tools - for a bug class that's still
+hypothetical in practice.
+
+Instead, the safety net is enforced as **repo-resident agent guidance**
+rather than a code change: `.claude/skills/ae-mcp-compindex-safety/SKILL.md`
+(auto-discovered by any Claude Code session opened in this repo) and
+`AGENTS.md` (repo root, the cross-tool convention other coding agents like
+Codex auto-load) both codify the safe practice - prefer `compName`
+wherever a tool accepts it; if only `compIndex` is available, re-resolve it
+immediately before the call using the counting rule for that *specific*
+tool family from the table above, never reuse a `compIndex` captured for a
+different tool. If this bug class ever causes a real, observed
+wrong-target incident, that would be the trigger to revisit the full
+refactor with a concrete case to test against instead of a hypothetical
+one.
+
 ## Next planned step
 
-All 6 planned blocks are now implemented and verified (project lifecycle,
+All 6 planned tool blocks are implemented and verified (project lifecycle,
 asset management, expression suite, keyframe manipulation, motion-graphics
-templates, layer/composition management). Decide whether a 7th block is
-wanted. Remaining candidates noted along the way: ishu86's
-batch-expression-setter/template-introspection tools, built but never wired
-up on their side (deferred in the expression-suite spec above); or a
-project-wide standardization on one `compIndex` semantic (see "Known
-limitations" above) if the two-semantics inconsistency ever causes a real
-bug rather than staying a documented risk.
+templates, layer/composition management), plus a docs-only block adding
+`.claude/skills/ae-mcp-compindex-safety/SKILL.md` and `AGENTS.md` to
+mitigate the `compIndex` inconsistency without a full refactor (see "Known
+limitations" above). Remaining candidates if a future block is wanted:
+ishu86's batch-expression-setter/template-introspection tools, built but
+never wired up on their side (deferred in the expression-suite spec above);
+or the full `compIndex` semantic standardization, deliberately deferred
+until it causes a real observed incident rather than staying a
+documented/mitigated risk.
