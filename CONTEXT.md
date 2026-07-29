@@ -1277,3 +1277,21 @@ workaround, not yet investigated).
 The full `compIndex` semantic standardization remains deliberately
 deferred until it causes a real observed incident rather than staying a
 documented/mitigated risk (see "Known limitations" above).
+
+## SPEC: frameNumbers param on see-frame — IMPLEMENTED and verified 2026-07-29
+(branch `feature/frame-index-param`)
+
+Closes `GAPS.md` item #5: `see-frame`'s `times` param was seconds-only, so
+capturing an exact frame on a non-round frame rate (23.976, 29.97) required
+the caller to compute `frame / frameRate` themselves. Added a `frameNumbers`
+param (same `number | number[]` shape as `times`, combinable with it) -
+conversion happens in the bridge's `seeFrame()` using the resolved comp's
+own `frameRate`, right before the existing clamp-into-`[0, duration]` loop,
+so both params share the same clamping/rendering path. `contact-sheet` was
+deliberately left alone - it only takes a `count` (auto-sampled evenly), no
+explicit position list, so a frame-index alternative doesn't apply there.
+
+Verified via `manual-tests/frame-index-param-test.mjs` against the real
+project's "Comp 1" (29.97 fps): `times` alone, `frameNumbers` alone (single
+number and array form), and both combined in one call all returned the
+expected image counts.

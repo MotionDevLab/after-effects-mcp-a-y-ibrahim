@@ -106,7 +106,21 @@ the resulting property like any other keyframed property, which the
 existing `_resolveLayerProperty`/keyframe helpers can likely already handle
 once the property exists.
 
-### 5. Frame-index (not just seconds) parameter on `see-frame`/`contact-sheet`
+### 5. Frame-index (not just seconds) parameter on `see-frame` — IMPLEMENTED 2026-07-29
+Added a `frameNumbers` param to `see-frame` (branch `feature/frame-index-param`),
+combinable with the existing `times` param. `contact-sheet` was scoped out -
+it only ever accepts a `count` (auto-sampled evenly across the duration),
+not an explicit list of positions, so a frame-index alternative doesn't
+apply there. Conversion happens bridge-side, in `seeFrame()`
+(`mcp-bridge-auto.jsx`), using the resolved comp's own `frameRate` -
+`frameNumber / comp.frameRate` - right before the existing clamp-and-collect
+loop, so it shares the same clamping and rendering path as `times`.
+Verified via `manual-tests/frame-index-param-test.mjs` against the real
+project's "Comp 1" (29.97 fps, a genuine non-round rate): `frameNumbers`
+alone, `times` alone, and both combined in one call all returned the
+expected image counts.
+
+Original assessment (kept for reference):
 Minor, not a missing tool — an ergonomics gap. `see-frame`'s `times` param
 is in seconds; there's no `frameNumber` alternative. On non-round frame
 rates (23.976, 29.97) a caller has to do the `frame / frameRate` conversion
@@ -138,11 +152,10 @@ just a moderate-cost build:
    API doesn't support enabling/configuring Layer Styles at all
    (`canSetEnabled: false` everywhere, confirmed live). Not buildable as a
    write tool; see the corrected assessment above.
-3. **Shape layer path authoring** (#1) — next-highest real value; higher
-   cost, so worth confirming a concrete use case first (same discipline
-   used before building `batch-set-expression`).
-4. **Frame-index convenience param** (#5) — trivial to add, low but real
-   value; a good "while we're in there" addition alongside a larger block
-   rather than its own.
+3. ~~**Frame-index convenience param** (#5)~~ — **done**, see
+   `see-frame`'s `frameNumbers` param above.
+4. **Shape layer path authoring** (#1) — next up; higher cost, so worth
+   confirming a concrete use case first (same discipline used before
+   building `batch-set-expression`).
 5. **Puppet pin / mesh** (#2) — lowest recommended priority: niche use
    case, high implementation cost, thin scripting API to build against.

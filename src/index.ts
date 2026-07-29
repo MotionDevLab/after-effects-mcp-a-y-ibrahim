@@ -4166,6 +4166,12 @@ server.tool(
       .describe(
         "Time(s) in seconds to capture. A single number or an array. Defaults to the comp midpoint. Out-of-range values are clamped.",
       ),
+    frameNumbers: z
+      .union([z.number(), z.array(z.number())])
+      .optional()
+      .describe(
+        "Frame number(s) to capture instead of seconds (converted using the comp's own frameRate) - use this on non-round frame rates (23.976, 29.97) to avoid manually computing frame / frameRate and risking an off-by-one-frame rounding error. Combinable with times; a single number or an array.",
+      ),
     maxWidth: z
       .number()
       .int()
@@ -4196,6 +4202,7 @@ server.tool(
   async ({
     comp,
     times,
+    frameNumbers,
     maxWidth = 512,
     includeState = false,
     motionBlur = false,
@@ -4209,6 +4216,8 @@ server.tool(
           compName: typeof comp === "string" ? comp : undefined,
           compIndex: typeof comp === "number" ? comp : undefined,
           times: times === undefined ? undefined : Array.isArray(times) ? times : [times],
+          frameNumbers:
+            frameNumbers === undefined ? undefined : Array.isArray(frameNumbers) ? frameNumbers : [frameNumbers],
           maxWidth,
           includeState,
           motionBlur,

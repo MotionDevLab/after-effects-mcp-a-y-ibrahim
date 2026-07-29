@@ -4729,6 +4729,10 @@ function seeFrame(args) {
 
         var dur = comp.duration;
         // Build the list of capture times (clamp into [0, duration]).
+        // frameNumbers are converted to seconds via the comp's OWN frameRate
+        // right here, before any clamping - this is the whole point of the
+        // param: the caller doesn't have to do frame/frameRate math (and
+        // risk an off-by-one on non-round rates like 23.976/29.97) themselves.
         var times = [];
         if (args && args.times && args.times.length) {
             for (var t = 0; t < args.times.length; t++) {
@@ -4737,6 +4741,17 @@ function seeFrame(args) {
                     if (tv < 0) tv = 0;
                     if (tv > dur) tv = dur;
                     times.push(tv);
+                }
+            }
+        }
+        if (args && args.frameNumbers && args.frameNumbers.length) {
+            for (var f = 0; f < args.frameNumbers.length; f++) {
+                var fn = args.frameNumbers[f];
+                if (typeof fn === "number" && !isNaN(fn)) {
+                    var ft = fn / comp.frameRate;
+                    if (ft < 0) ft = 0;
+                    if (ft > dur) ft = dur;
+                    times.push(ft);
                 }
             }
         }
