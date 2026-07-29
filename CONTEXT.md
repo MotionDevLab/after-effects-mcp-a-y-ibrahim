@@ -222,9 +222,11 @@ useful source of feature ideas. Neither server dominates.
   `close_project`. This fork has *no* project-level tools at all — arguably
   the biggest single gap.~~ **Implemented 2026-07-29** — see "Fixes/features
   applied" below. No longer a gap.
-- **Asset management**: `import_footage`, `import_folder`, `replace_footage`,
+- ~~**Asset management**: `import_footage`, `import_folder`, `replace_footage`,
   `find_missing_footage`, `collect_files`, `reduce_project`,
-  `organize_project_items`.
+  `organize_project_items`.~~ **Implemented 2026-07-29.** (This bullet was
+  left un-struck by mistake when the block landed - fixed here, no code
+  change, doc-only correction.)
 - ~~**Keyframe timeline manipulation**: `offset_keyframes`,
   `scale_keyframe_timing`, `reverse_keyframes`, `copy_keyframes`,
   `apply_easy_ease`, `get_keyframes`.~~ **Implemented 2026-07-29.**
