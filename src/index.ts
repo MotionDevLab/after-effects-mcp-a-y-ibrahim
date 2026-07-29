@@ -338,6 +338,7 @@ server.tool(
       "copyEffects",
       "deleteMarker",
       "setWorkArea",
+      "batchSetExpression",
     ];
 
     if (!allowedScripts.includes(script)) {
@@ -947,6 +948,16 @@ const LayerIdentifierSchema = {
     .describe("1-based index of the target layer within the composition."),
 };
 
+const CompIdentifierSchema = {
+  compName: z.string().optional().describe("Composition name (or active comp if omitted)."),
+  compIndex: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("1-based index among compositions only (the Nth comp in the project), if compName is omitted."),
+};
+
 const KeyframeValueSchema = z
   .any()
   .describe(
@@ -1143,6 +1154,43 @@ server.tool(
     } catch (error) {
       return {
         content: [{ type: "text", text: `Error applying expression template: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "batch-set-expression",
+  "Apply the same expression string to one property across MANY layers in one call (e.g. add a wiggle to all text layers). Each target layer is identified by layerIndex or layerName; the property name and expression are shared across all targets.",
+  {
+    ...CompIdentifierSchema,
+    propertyName: z
+      .string()
+      .describe(
+        "Name of the property to set the expression on (e.g. 'Position', 'Opacity'), applied identically to every target layer.",
+      ),
+    expressionString: z
+      .string()
+      .describe(
+        'The JavaScript expression string. Provide an empty string ("") to remove the expression from every target layer.',
+      ),
+    targets: z
+      .array(
+        z.object({
+          layerIndex: z.number().int().positive().optional().describe("1-based layer index."),
+          layerName: z.string().optional().describe("Layer name (alternative to layerIndex)."),
+        }),
+      )
+      .describe("Layers to apply the expression to."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("batchSetExpression", parameters, 12000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error in batch set expression: ${String(error)}` }],
         isError: true,
       };
     }
@@ -3761,16 +3809,6 @@ server.tool(
     }
   },
 );
-
-const CompIdentifierSchema = {
-  compName: z.string().optional().describe("Composition name (or active comp if omitted)."),
-  compIndex: z
-    .number()
-    .int()
-    .positive()
-    .optional()
-    .describe("1-based index among compositions only (the Nth comp in the project), if compName is omitted."),
-};
 
 server.tool(
   "duplicate-composition",

@@ -199,6 +199,8 @@ feature comparison below, so signing was not pursued.
   `create-logo-reveal`, `create-text-animator` (28-step test, found and
   fixed 4 real bugs during verification, one cross-cutting - see the
   motion-graphics-templates spec section and "Known limitations" above)
+- `batch-set-expression` (5-scenario test, see the spec section above) -
+  also incidentally exercised `create-text-layer`, previously untested.
 
 ## Not yet tested
 
@@ -206,8 +208,8 @@ Everything else in the 50-tool catalog — effects (`apply-effect`,
 `list-available-effects`, `set-effect-property`, etc.), presets, audio tools,
 markers, rendering (`add-to-render-queue`, `start-render`, `render-aerender`),
 `contact-sheet`, `match-reference`, `execute-script` (used only as a diagnostic
-tool so far, not smoke-tested as a general capability), and all layer-creation
-tools (`create-text-layer`, `create-camera`, `duplicate-layer`, etc.).
+tool so far, not smoke-tested as a general capability), and most other
+layer-creation tools (`create-camera`, `duplicate-layer`, etc.).
 
 ## Feature comparison vs ishu86 (67 tools) — done 2026-07-29
 
@@ -526,8 +528,10 @@ ishu86's `expressionGenerators.ts` was read directly as ground truth:
   overshoot) instead of porting all 20 - a budget-driven scope cut, easy to
   extend later.
 - ishu86 also built (but never wired to a tool) a batch-expression-setter and
-  a template-introspection tool. **Deferred, not ported this round** - noted
-  here as a real, cheap future addition if wanted.
+  a template-introspection tool. Batch-expression-setter **implemented
+  2026-07-29** as `batch-set-expression` - see the spec section immediately
+  below. Template-introspection remains deferred (assessed as low-value: only
+  6 templates exist, already documented in the tool's own schema).
 
 **Reuse, not reinvention**: `findPropertyByNameOrMatchName(container,
 propertyName)` (`mcp-bridge-auto.jsx:858`) resolves a property by name or
@@ -559,6 +563,60 @@ surfaces as a `note` rather than silently vanishing; `link-properties`
 produces a real cross-layer expression string; `apply-expression-template`
 substitutes params with no leftover `{{...}}` tokens. Real project (3
 layers) restored intact at the end.
+
+## SPEC: batch-set-expression — IMPLEMENTED and verified 2026-07-29
+(branch `feature/batch-expression-setter`)
+
+Follow-up to the expression-suite block above, closing the
+batch-expression-setter gap noted there. Motivated by a real use case ("add
+a wiggle to all 8 text layers in one call" instead of N separate
+`setLayerExpression` round-trips). Scoped deliberately narrow: **one
+property name + one expression string applied to many layers** in the same
+comp, not a general per-item-different-expression batch tool - that's more
+flexibility than the motivating use case needs.
+
+**Resolution-family decision**: `setLayerExpression` (the single-layer tool
+this batches) uses the older raw-positional `LayerIdentifierSchema` +
+`_resolveCompAndLayerSimple` family. But this file's own "Known
+limitations" section says new tools should default to the comp-ordinal,
+`compName`-preferring `_resolveComp`/`_resolveLayer` family instead (the
+convention block #6 and `batch-set-layer-properties` already use), to avoid
+growing the unsafe-family list. `batch-set-expression` follows that
+guidance rather than matching `setLayerExpression`'s own family - it's a new
+bridge function built by combining three already-shared helpers
+(`_resolveComp`, `_resolveLayer`, `_resolveLayerProperty`), not new
+resolution logic. One side effect: `CompIdentifierSchema` (previously
+declared inline just before block #6's tools, ~line 3765) was moved up next
+to `LayerIdentifierSchema` (~line 937) so it's in scope for this tool's
+earlier position in the file - a pure relocation, no shape change.
+
+**Response shape decision**: modeled on `batch-set-layer-properties`'s
+`results[]` array of per-item `{layerIndex, layerName, status, message}`
+objects (top-level `status: "success"` even when individual items fail),
+not `copy-effects`'s flat `warnings[]` string list. This tool's items are
+independent per-layer pass/fail outcomes - exactly what `results[]` already
+models - whereas `warnings[]` is for accumulating non-fatal sub-issues
+within one logical operation, which doesn't fit here.
+
+**One tool added**: `batch-set-expression` - `compName`/`compIndex` (comp-
+ordinal) once, plus `propertyName`, `expressionString`, and a `targets`
+array of `{layerIndex}`/`{layerName}`. Empty-string `expressionString`
+removes the expression from every target, matching `setLayerExpression`'s
+existing convention.
+
+**Verified 2026-07-29** via `manual-tests/batch-expression-test.mjs` - all
+assertions passed on the first real run. Confirmed: expression applied to
+all 3 targets in one call and round-tripped via an independent
+`get-expression` read (not just the tool's own success message); a batch
+with one valid `layerName` and one nonexistent one reports
+`successCount: 1` of 2, with the bad target's per-item result
+`status: "error", message: "Layer not found"` while the valid target still
+succeeds (partial-failure isolation, top-level `status` stays "success");
+an invalid `propertyName` on an otherwise-valid layer reports a per-item
+"not found" error without aborting the batch; empty-string
+`expressionString` removed the expression, confirmed via `get-expression`
+returning `expression: ""`. Real project (3 layers) restored intact at the
+end.
 
 ## SPEC: keyframe-manipulation tools — IMPLEMENTED and verified 2026-07-29
 (branch `feature/keyframe-manipulation-tools`)
@@ -1072,7 +1130,7 @@ Use this table to know which counting rule applies before trusting a
   `set-work-area`), the 4 motion-graphics creators (`create-lower-third`,
   `create-title-card`, `create-transition`, `create-logo-reveal`),
   `localize-comp`, `create-camera`, `inspect-comp`, `inspect-layer`,
-  `animate-to-audio`/`animate-from-data`.
+  `animate-to-audio`/`animate-from-data`, `batch-set-expression`.
 - **Deliberately excluded from any future fix, vestigial**: `test-animation`
   (`src/index.ts` ~line 1436). Bypasses the bridge dispatcher entirely -
   writes a standalone `.jsx` temp file the user must manually run via

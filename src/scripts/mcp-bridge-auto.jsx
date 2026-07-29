@@ -1301,6 +1301,49 @@ function applyExpressionTemplate(args) {
     }
 }
 
+function batchSetExpression(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        var targets = args.targets;
+        if (!targets || !targets.length) {
+            return JSON.stringify({ status: "error", message: "No targets provided. Pass an array of {layerIndex or layerName}." });
+        }
+
+        var results = [];
+        var action = args.expressionString === "" ? "removed" : "set";
+        for (var i = 0; i < targets.length; i++) {
+            var t = targets[i];
+            var layer = _resolveLayer(comp, t);
+            if (!layer) {
+                results.push({ layerIndex: t.layerIndex, layerName: t.layerName, status: "error", message: "Layer not found" });
+                continue;
+            }
+            try {
+                var property = _resolveLayerProperty(layer, args.propertyName);
+                if (!property) {
+                    results.push({ layerIndex: layer.index, layerName: layer.name, status: "error", message: "Property '" + args.propertyName + "' not found." });
+                    continue;
+                }
+                if (!property.canSetExpression) {
+                    results.push({ layerIndex: layer.index, layerName: layer.name, status: "error", message: "Property '" + args.propertyName + "' does not support expressions." });
+                    continue;
+                }
+                property.expression = args.expressionString;
+                results.push({ layerIndex: layer.index, layerName: layer.name, status: "success", message: "Expression " + action + "." });
+            } catch (eLayer) {
+                results.push({ layerIndex: layer.index, layerName: layer.name, status: "error", message: eLayer.toString() });
+            }
+        }
+
+        var successCount = 0;
+        for (var r = 0; r < results.length; r++) { if (results[r].status === "success") successCount++; }
+        return JSON.stringify({ status: "success", propertyName: args.propertyName, successCount: successCount, count: results.length, results: results }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
 // ---- Keyframe-manipulation helpers ----
 // AE's scripting DOM has no setKeyTime() - keyTime is read-only - so moving,
 // scaling, or reversing keyframe times is forced to be a
@@ -5241,6 +5284,11 @@ function executeCommand(command, args) {
                 logToPanel("Calling applyExpressionTemplate function...");
                 result = applyExpressionTemplate(args);
                 logToPanel("Returned from applyExpressionTemplate.");
+                break;
+            case "batchSetExpression":
+                logToPanel("Calling batchSetExpression function...");
+                result = batchSetExpression(args);
+                logToPanel("Returned from batchSetExpression.");
                 break;
             case "getKeyframes":
                 logToPanel("Calling getKeyframes function...");

@@ -54,8 +54,9 @@ a valid result back, just for the wrong composition.
 `reorder-effects`, `copy-effects`, `delete-marker`, `set-work-area`,
 `create-lower-third`, `create-title-card`, `create-transition`,
 `create-logo-reveal`, `localize-comp`, `create-camera`, `inspect-comp`,
-`inspect-layer`, `animate-to-audio`, `animate-from-data`. For these, just
-pass `compName` and skip the problem entirely.
+`inspect-layer`, `animate-to-audio`, `animate-from-data`,
+`batch-set-expression`. For these, just pass `compName` and skip the
+problem entirely.
 
 **Not part of the maintained tool surface** - `test-animation` bypasses
 the bridge dispatcher and writes a manual-run `.jsx` temp file; don't rely
