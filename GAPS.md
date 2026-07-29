@@ -35,11 +35,43 @@ distinct AE subsystem from shape/mask paths.
 **Cost**: high — Puppet's scripting API is thin and mesh data is awkward to
 generate programmatically without visual placement.
 
-### 3. Layer styles (drop shadow, glow, stroke, bevel)
+### 3. Layer styles (drop shadow, glow, stroke, bevel) — INVESTIGATED, BLOCKED 2026-07-29
 Classic AE "Layer Styles" (right-click → Layer Styles) are a separate
 subsystem from Effects — not covered by any existing effects tooling
 (`add-any-effect`, `set-effect-property`, etc., which target the Effects
 stack, not styles).
+
+**Verified live (branch `feature/layer-styles-tool`, since deleted) that
+this cannot be built via AE's scripting API, on this AE build (2026,
+26.0x67)**: a read-only `list-layer-styles` tool worked fine (the group
+`layer.property("ADBE Layer Styles")` is statically populated with all 11
+children - Blending Options, the 9 real style types, plus Pattern Overlay -
+each with real values readable). But writing is blocked entirely:
+- `canSetEnabled` is `false` for the master `"ADBE Layer Styles"` group
+  **and every individual style child** (Drop Shadow, etc.) - confirmed on
+  text, solid, AND shape layers (not layer-type-specific).
+- Attempting to set a value on a style's own child property (e.g. Drop
+  Shadow's Opacity), even without touching `.enabled` at all, also fails:
+  `"Can not 'set value' with this property, because the property or a
+  parent property is hidden."`
+
+This is a real Adobe ExtendScript API restriction, not a bug in this
+codebase or a fixable resolution-logic problem: Layer Styles can only be
+toggled/configured through the After Effects UI, not scripted, at least on
+this build. The original cost estimate below (based on the shape looking
+similar to Effects tooling) turned out to be wrong precisely because of
+this - the shape is similar, but the write path is closed off entirely.
+
+**Not pursued further**: applying a pre-saved `.ffx` animation preset with
+a style baked in (via `layer.applyPreset()`, mirroring `apply-effect`'s
+`presetPath` option) might be a workaround, but wasn't investigated - it
+would require shipping/creating preset assets rather than fully
+programmatic control, a different shape of tool than planned, and the
+underlying "hidden property" restriction might still block reading back or
+adjusting values afterward. Revisit only if this becomes worth the
+research time - not blocking anything else.
+
+Original assessment (kept for reference):
 **Value**: medium — common for text/lower-third polish (drop shadow, glow)
 that's currently only reachable via effects-stack equivalents.
 **Cost**: low-medium — Layer Styles are exposed via `layer.property("ADBE
@@ -96,19 +128,21 @@ the comp's own `frameRate`, right before calling the existing
 
 ## Recommendation
 
-Ranked by value-for-effort, most promising first:
+Ranked by value-for-effort, most promising first. Updated 2026-07-29 after
+item #3 (layer styles) turned out to be blocked by AE's scripting API, not
+just a moderate-cost build:
 
-1. **Time remapping / speed ramps** (#4) — real motion-design demand, and
-   the implementation is likely cheaper than it looks since it can reuse
-   the existing property/keyframe helpers once `timeRemapEnabled` is set.
-2. **Layer styles** (#3) — common polish need, moderate cost, same shape as
-   existing effect-property code.
-3. **Frame-index convenience param** (#5) — trivial to add, low but real
-   value; a good "while we're in there" addition alongside #1 or #3 rather
-   than its own block.
-4. **Shape layer path authoring** (#1) — higher value if you have a
-   concrete shape-animation use case in mind; higher cost, so worth
-   confirming the use case first (same discipline used before building
-   `batch-set-expression`).
+1. ~~**Time remapping / speed ramps** (#4)~~ — **done**, see
+   `set-time-remap` in `CONTEXT.md`.
+2. ~~**Layer styles** (#3)~~ — **investigated, blocked**: AE's scripting
+   API doesn't support enabling/configuring Layer Styles at all
+   (`canSetEnabled: false` everywhere, confirmed live). Not buildable as a
+   write tool; see the corrected assessment above.
+3. **Shape layer path authoring** (#1) — next-highest real value; higher
+   cost, so worth confirming a concrete use case first (same discipline
+   used before building `batch-set-expression`).
+4. **Frame-index convenience param** (#5) — trivial to add, low but real
+   value; a good "while we're in there" addition alongside a larger block
+   rather than its own.
 5. **Puppet pin / mesh** (#2) — lowest recommended priority: niche use
    case, high implementation cost, thin scripting API to build against.

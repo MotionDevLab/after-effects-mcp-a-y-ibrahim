@@ -1258,14 +1258,22 @@ frames rather than erroring.
 
 ## Next planned step
 
-All 6 planned tool blocks are implemented and verified (project lifecycle,
-asset management, expression suite, keyframe manipulation, motion-graphics
-templates, layer/composition management), plus a docs-only block adding
-`.claude/skills/ae-mcp-compindex-safety/SKILL.md` and `AGENTS.md` to
-mitigate the `compIndex` inconsistency without a full refactor (see "Known
-limitations" above). Remaining candidates if a future block is wanted:
-ishu86's batch-expression-setter/template-introspection tools, built but
-never wired up on their side (deferred in the expression-suite spec above);
-or the full `compIndex` semantic standardization, deliberately deferred
-until it causes a real observed incident rather than staying a
-documented/mitigated risk.
+All 6 originally-planned tool blocks are implemented and verified (project
+lifecycle, asset management, expression suite, keyframe manipulation,
+motion-graphics templates, layer/composition management), plus follow-up
+blocks: the `compIndex` docs mitigation, `batch-set-expression`, and
+`set-time-remap`. `GAPS.md` (written 2026-07-29) tracks further candidates
+found by comparing against sibling repos and general AE capability, ranked
+by value-for-effort - check there before starting new work.
+
+**Layer styles were investigated and found blocked**, not implemented:
+AE's scripting API does not support enabling or configuring Layer Styles
+at all (`canSetEnabled: false` for the master group and every individual
+style, confirmed live on text/solid/shape layers) - see `GAPS.md` item #3
+for the full finding. This is a platform limitation, not something to
+revisit without a genuinely new angle (e.g. an `.ffx` preset-based
+workaround, not yet investigated).
+
+The full `compIndex` semantic standardization remains deliberately
+deferred until it causes a real observed incident rather than staying a
+documented/mitigated risk (see "Known limitations" above).
