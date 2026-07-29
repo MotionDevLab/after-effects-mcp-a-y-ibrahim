@@ -1295,3 +1295,135 @@ Verified via `manual-tests/frame-index-param-test.mjs` against the real
 project's "Comp 1" (29.97 fps): `times` alone, `frameNumbers` alone (single
 number and array form), and both combined in one call all returned the
 expected image counts.
+
+## SPEC: set-shape-path / get-shape-path — IMPLEMENTED and verified 2026-07-29
+(branch `feature/shape-path-authoring`)
+
+Closes `GAPS.md` item #1: nothing could author a freeform bezier path on a
+shape layer. `createShapeLayer` only builds parametric shapes (Rect/Ellipse/
+Star); `set-layer-mask`'s `new Shape()` never touched `inTangents`/
+`outTangents` and hardcoded `closed = true`.
+
+### Live feasibility probe (Phase 0, before any code was written)
+
+Per `GAPS.md`'s own warning ("worth confirming a concrete use case first",
+the same discipline that caught the layer-styles block), every design
+assumption below was verified live against AE 26.0x67 with
+`manual-tests/shape-path-probe.mjs`, using only the existing `execute-script`
+tool (no bridge changes needed to probe). Findings, in the order they change
+the design:
+
+- **P1 - writable at all**: `"ADBE Vector Shape - Group"` is addable inside a
+  vector group's Contents, and exposes `"ADBE Vector Shape"` as a real
+  `PropertyValueType.SHAPE`, `canVaryOverTime: true` property. Not blocked
+  like Layer Styles.
+- **P2/P3 - tangents round-trip, and are RELATIVE to their own vertex**:
+  written verbatim, read back exact (shape-layer paths are full float
+  precision). A vertex far from the origin with a tangent of `[50,0]` reads
+  back as exactly `[50,0]`, not translated into absolute coordinates.
+- **P4 - AE does NOT validate array lengths**: a `Shape` with 3 vertices and
+  2 `inTangents` is accepted silently, zero-filling the missing entry. This
+  is the reason `src/lib/shape-path.ts` exists at all - validation has to
+  happen before the data reaches AE, because AE will not catch it.
+- **P5 - keyframing works, but reference invalidation is real**: `Shape`
+  properties are keyframable via `setValueAtTime`. AE also accepts
+  *mismatched vertex counts across keyframes* without error - it just
+  interpolates the in-betweens into a torn, garbage shape - so
+  `assertMorphCompatible` rejects this client-side instead. Separately (and
+  initially crashed the probe): a property reference obtained from a group
+  **is invalidated by any later `addProperty` on that same group**
+  (`ReferenceError: Object is invalid`). The bridge handler works around
+  this by doing every `addProperty` (group, path, fill, stroke) first, then
+  resolving the Path property fresh at the end - see the comment above
+  `setShapePath`'s fill/stroke block.
+- **P6 - coordinate space**: a shape layer's default anchor point is
+  `[0,0,0]`, default position is the comp centre. Path vertex `[0,0]`
+  therefore renders at the comp's centre, not its top-left, and not the
+  origin of comp space. Confirmed visually (a square with vertex `[0,0]` at
+  its top-left corner rendered dead-centre in a 640x360 comp). Y is positive
+  downward, matching AE's general convention. This is stated explicitly in
+  the `set-shape-path` tool description because it's the failure mode most
+  likely to make a numerically-correct call look wrong.
+- **P7 - parametric shapes have no Path property**: `"ADBE Vector Shape -
+  Rect"`'s children are Shape Direction/Size/Position/Roundness - no
+  `"ADBE Vector Shape"` anywhere. There is no scripted conversion from
+  parametric to freeform; a bezier path always needs its own
+  `"ADBE Vector Shape - Group"`.
+- **P8/P9 - mask paths accept tangents and keyframes too**: `"ADBE Mask
+  Shape"` round-trips `inTangents`/`outTangents` and is keyframable via
+  `setValueAtTime`, same as shape-layer paths. One real difference: mask
+  paths round-trip at *lower precision* (a written `40` reads back as
+  `39.9999847412109`, ~3e-5 drift) where shape-layer paths are exact. Masks
+  also accept `closed: false` (an open path), which `set-layer-mask` had
+  never exposed.
+- **P10 - a bare path with no Fill and no Stroke renders literally nothing**.
+  Confirmed visually: an identical path/frame combination rendered an empty
+  white frame with no fill, then a visible green rectangle after adding one.
+  `setShapePath` therefore adds a default white Fill when the caller
+  supplies neither `fillColor` nor `strokeColor`, and reports this in
+  `notes` so it's never a silent surprise.
+
+### Design
+
+- **Property chain**: `ShapeLayer` -> `"ADBE Root Vectors Group"` (Contents)
+  -> `"ADBE Vector Group"` (one per shape; `groupIndex` selects/creates) ->
+  `"ADBE Vectors Group"` (that group's Contents) -> `"ADBE Vector Shape -
+  Group"` (`pathIndex` selects/creates) -> `"ADBE Vector Shape"` (the
+  writable Path). Omitting `groupIndex`/`pathIndex` appends a new group/path;
+  supplying both overwrites an existing one (read the indices back first
+  with `get-shape-path`).
+- **Two tools**: `set-shape-path` (write; can create the layer via
+  `createLayer: true`) and `get-shape-path` (read-only, in
+  `READ_ONLY_COMMANDS`; enumerates every group/path plus their non-path
+  siblings - fills, strokes, parametric shapes - when indices are omitted,
+  so structure is discoverable rather than assumed).
+- **Input shape**: either explicit `vertices` (+ optional `inTangents`/
+  `outTangents`/`closed`) or a `generator` spec - never both. Generators
+  (`roundedRect`, `ellipse`, `polygon`, `star`) run server-side in
+  `src/lib/shape-path.ts`, not in ExtendScript, so the JSX handler stays one
+  code path and the generator math gets real vitest coverage (34 tests) -
+  the only automated coverage this whole feature has, since `tests/` never
+  reaches `index.ts` or the `.jsx`.
+- **Validation happens in TypeScript, before the bridge**: `normalizePath`
+  enforces vertex/tangent array agreement (P4), `assertMorphCompatible`
+  enforces equal vertex counts across morph keyframes (P5) - both are things
+  AE itself silently gets wrong rather than errors on.
+- **`set-layer-mask` retrofit**: added `maskInTangents`/`maskOutTangents`
+  (curved masks), `maskClosed` (open paths, was hardcoded `true`), and `time`
+  (writes a keyframe via `setValueAtTime` instead of a static value).
+  Omitting all four reproduces the exact prior behaviour - verified by
+  re-running the original raw-`maskPath` call shape unchanged.
+- **Bridge version bumped** `1.10.0-mcp-enhanced` -> `1.11.0-mcp-enhanced`
+  (both `mcp-bridge-auto.jsx`'s `BRIDGE_VERSION` and `index.ts`'s
+  `EXPECTED_BRIDGE_VERSION`), the first version bump since the initial
+  commit - the three tool blocks immediately before this one had skipped it.
+
+### Verification
+
+`tests/shape-path.test.ts` (34 tests): `normalizePath` validation/defaults,
+`assertMorphCompatible`, and geometric assertions on all four generators
+(vertex counts, kappa handle scaling, radius clamping, rotation, closed
+flags). `npm run typecheck && npm test && npm run lint` all clean (the only
+lint errors anywhere in the repo are pre-existing `no-undef`/`no-empty`
+findings in older `manual-tests/*.mjs` files, confirmed unrelated by running
+`npx eslint src tests` alone).
+
+`manual-tests/shape-path-test.mjs` against live AE (43 assertions, all
+passing), following the mandated save -> close -> scratch project -> mutate
+-> close -> reopen original -> assert-unchanged discipline: raw vertex/tangent
+round-trip through `get-shape-path`; all four generators produce the right
+vertex counts and genuinely curved output (not polygons); a 3-keyframe morph
+with matching vertex counts (a 10-gon animating outward into a 5-point star,
+both 10 vertices) succeeds and reads back correctly; a mismatched-vertex-count
+morph and a tangent/vertex length mismatch are both rejected client-side with
+messages naming the exact problem; overwriting an existing path via
+`groupIndex`/`pathIndex` works; targeting a Fill's index as if it were a path
+returns a clean error; calling `set-shape-path` on a text layer is refused and
+points at `set-layer-mask`; the default-fill fallback fires and is reported;
+`set-layer-mask` gained curved masks, open masks, and a keyframed mask path
+while its original raw-`maskPath` call shape still works unchanged. Visual
+confirmation via `see-frame` (not just numeric round-trips) for the
+coordinate-space finding (P6), the curve genuinely curving (P3), and the
+fill-required finding (P10) - screenshots inspected directly during
+development. Real project ("Comp 1", 3 layers) reopened and confirmed
+unchanged at the end of both the probe and the full test run.

@@ -3564,7 +3564,7 @@ var currentCommandId = "";
 // command under concurrent/rapid tool dispatch). The server matches results purely
 // by _commandId, so AE never needs to write the command file at all.
 var lastProcessedCommandId = "";
-var BRIDGE_VERSION = "1.10.0-mcp-enhanced";
+var BRIDGE_VERSION = "1.11.0-mcp-enhanced";
 // Pure read-only commands: they never mutate the project, so we skip the undo
 // group for them (no empty "MCP: ping" entries cluttering Edit > Undo History).
 var READ_ONLY_COMMANDS = {
@@ -3580,7 +3580,8 @@ var READ_ONLY_COMMANDS = {
     "getLayerAudioInfo": true,
     "findMissingFootage": true,
     "getExpression": true,
-    "getKeyframes": true
+    "getKeyframes": true,
+    "getShapePath": true
 };
 // MUST mirror getAETempDir() on the Node server side. On Windows we use
 // LOCALAPPDATA (never redirected by OneDrive) so both processes resolve to the
@@ -4291,9 +4292,18 @@ function setLayerMask(args) {
             throw new Error("Must provide either maskRect or maskPath with at least 3 points");
         }
 
+        // Tangents and open paths are both supported by AE's mask shapes -
+        // verified live (probe P8): "ADBE Mask Shape" round-trips inTangents/
+        // outTangents (to within ~3e-5; mask paths store at lower precision than
+        // shape-layer paths, which are exact) and accepts closed:false. This used
+        // to hardcode closed = true and never set tangents at all, so every mask
+        // it produced was a straight-segment polygon. Omitting the new args
+        // reproduces exactly the old behaviour.
         var myShape = new Shape();
         myShape.vertices = shapePoints;
-        myShape.closed = true;
+        if (args.maskInTangents !== undefined && args.maskInTangents !== null) { myShape.inTangents = args.maskInTangents; }
+        if (args.maskOutTangents !== undefined && args.maskOutTangents !== null) { myShape.outTangents = args.maskOutTangents; }
+        myShape.closed = (args.maskClosed === false) ? false : true;
 
         var masksGroup = _safeProp(layer, "ADBE Mask Parade", "Masks");
         if (!masksGroup) { throw new Error("This layer type cannot have masks."); }
@@ -4309,7 +4319,16 @@ function setLayerMask(args) {
             changed.push("newMask");
         }
         var pathProp = _safeProp(mask, "ADBE Mask Shape", "Mask Path");
-        if (pathProp) { pathProp.setValue(myShape); }
+        if (pathProp) {
+            // Mask paths are keyframable (probe P9), so an explicit time turns
+            // this into a mask-shape keyframe instead of a static value.
+            if (args.time !== undefined && args.time !== null) {
+                pathProp.setValueAtTime(args.time, myShape);
+                changed.push("maskPathKeyframe");
+            } else {
+                pathProp.setValue(myShape);
+            }
+        }
 
         var modes = { "none": MaskMode.NONE, "add": MaskMode.ADD, "subtract": MaskMode.SUBTRACT, "intersect": MaskMode.INTERSECT, "lighten": MaskMode.LIGHTEN, "darken": MaskMode.DARKEN, "difference": MaskMode.DIFFERENCE };
         if (modes[maskMode] !== undefined) { mask.maskMode = modes[maskMode]; changed.push("maskMode"); }
@@ -4319,6 +4338,278 @@ function setLayerMask(args) {
         if (args.maskName) { mask.name = args.maskName; changed.push("maskName"); }
 
         return JSON.stringify({ status: "success", message: "Mask set successfully", layer: { name: layer.name, index: layer.index }, mask: { name: mask.name, index: mask.propertyIndex, mode: maskMode, changedProperties: changed } }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// --- Shape-layer bezier path authoring ---------------------------------------
+//
+// Property chain for a freeform path (all matchNames verified live, AE 26.0x67):
+//   ShapeLayer
+//     -> "ADBE Root Vectors Group"   (Contents)
+//       -> "ADBE Vector Group"        (a group; add one per shape)
+//         -> "ADBE Vectors Group"     (that group's Contents)
+//           -> "ADBE Vector Shape - Group"  (Path 1 - the freeform path group)
+//             -> "ADBE Vector Shape"        (the writable Shape-valued Path property)
+//
+// A parametric shape ("ADBE Vector Shape - Rect"/"- Ellipse"/"- Star", what
+// createShapeLayer builds) has NO "ADBE Vector Shape" child - its children are
+// Shape Direction/Size/Position/Roundness (probe P7). There is no scripted
+// conversion from parametric to freeform, so a bezier path always needs its own
+// "ADBE Vector Shape - Group".
+
+// Turn an AE Shape into a plain JSON-serializable object.
+function _shapeToObj(sh) {
+    if (!sh) return null;
+    return {
+        vertices: sh.vertices,
+        inTangents: sh.inTangents,
+        outTangents: sh.outTangents,
+        closed: sh.closed,
+        numVertices: sh.vertices ? sh.vertices.length : 0
+    };
+}
+
+// Build an AE Shape from the normalized path data the server sends. The server
+// (src/lib/shape-path.ts) has already guaranteed the three arrays agree in
+// length - AE itself will not complain if they don't, it just zero-fills the
+// missing tangents silently (probe P4).
+function _objToShape(p) {
+    var sh = new Shape();
+    sh.vertices = p.vertices;
+    if (p.inTangents) { sh.inTangents = p.inTangents; }
+    if (p.outTangents) { sh.outTangents = p.outTangents; }
+    sh.closed = (p.closed === false) ? false : true;
+    return sh;
+}
+
+// Find the "ADBE Vector Shape" property inside a path group, or null if this
+// isn't a freeform path group at all (e.g. the caller's pathIndex points at a
+// Fill, a Stroke, or a parametric shape).
+function _vectorShapeProp(pathGroup) {
+    if (!pathGroup) return null;
+    var sh = null;
+    try { sh = pathGroup.property("ADBE Vector Shape"); } catch (e) { sh = null; }
+    if (!sh) { try { sh = pathGroup.property("Path"); } catch (e2) { sh = null; } }
+    return sh;
+}
+
+function setShapePath(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found. Provide compName or compIndex, or open a comp." });
+
+        var notes = [];
+        var layer = _resolveLayer(comp, args);
+        var createdLayer = false;
+        if (!layer) {
+            if (args.createLayer) {
+                layer = comp.layers.addShape();
+                if (args.layerName) { layer.name = args.layerName; }
+                createdLayer = true;
+            } else {
+                return JSON.stringify({ status: "error", message: "Layer not found. Provide layerIndex or layerName, or pass createLayer: true to add a new shape layer." });
+            }
+        }
+        if (!(layer instanceof ShapeLayer)) {
+            return JSON.stringify({ status: "error", message: "Layer '" + layer.name + "' is not a shape layer. Bezier paths on other layer types are masks - use set-layer-mask instead." });
+        }
+
+        var contents = _safeProp(layer, "ADBE Root Vectors Group", "Contents");
+        if (!contents) { throw new Error("Could not access the shape layer's Contents group."); }
+
+        // ---- Resolve (or create) the vector group -------------------------
+        var group, groupIndex, createdGroup = false;
+        if (args.groupIndex !== undefined && args.groupIndex !== null) {
+            if (args.groupIndex < 1 || args.groupIndex > contents.numProperties) {
+                throw new Error("groupIndex out of bounds: " + args.groupIndex + " (layer has " + contents.numProperties + " group(s)).");
+            }
+            groupIndex = args.groupIndex;
+            group = contents.property(groupIndex);
+        } else {
+            group = contents.addProperty("ADBE Vector Group");
+            groupIndex = group.propertyIndex;
+            createdGroup = true;
+        }
+        var gc = _safeProp(group, "ADBE Vectors Group", "Contents");
+        if (!gc) { throw new Error("Could not access the contents of group " + groupIndex + "."); }
+
+        // ---- Resolve (or create) the path group ---------------------------
+        var pathIndex, createdPath = false;
+        if (args.pathIndex !== undefined && args.pathIndex !== null) {
+            if (args.pathIndex < 1 || args.pathIndex > gc.numProperties) {
+                throw new Error("pathIndex out of bounds: " + args.pathIndex + " (group " + groupIndex + " has " + gc.numProperties + " item(s)).");
+            }
+            pathIndex = args.pathIndex;
+            if (!_vectorShapeProp(gc.property(pathIndex))) {
+                throw new Error("Item " + pathIndex + " in group " + groupIndex + " ('" + gc.property(pathIndex).name + "') is not a freeform path. Parametric shapes (Rect/Ellipse/Star), Fills and Strokes have no editable Path property; omit pathIndex to append a new path.");
+            }
+        } else {
+            pathIndex = gc.addProperty("ADBE Vector Shape - Group").propertyIndex;
+            createdPath = true;
+        }
+
+        // ---- Fill / stroke ------------------------------------------------
+        // Deliberately done BEFORE the Path property is resolved: adding any
+        // sibling to a group INVALIDATES property references obtained from it
+        // earlier ("ReferenceError: Object is invalid" - probe P5). Every
+        // addProperty on `gc` therefore happens first, and the Path is looked up
+        // fresh afterwards.
+        var hasFill = false, hasStroke = false;
+        for (var ci = 1; ci <= gc.numProperties; ci++) {
+            var mn = gc.property(ci).matchName;
+            if (mn === "ADBE Vector Graphic - Fill") hasFill = true;
+            if (mn === "ADBE Vector Graphic - Stroke") hasStroke = true;
+        }
+        if (args.fillColor !== undefined && args.fillColor !== null) {
+            var fillProp = hasFill ? null : gc.addProperty("ADBE Vector Graphic - Fill");
+            if (!fillProp) { for (var fi = 1; fi <= gc.numProperties; fi++) { if (gc.property(fi).matchName === "ADBE Vector Graphic - Fill") { fillProp = gc.property(fi); break; } } }
+            var fc = _safeProp(fillProp, "ADBE Vector Fill Color", "Color"); if (fc) fc.setValue(args.fillColor);
+            var fo = _safeProp(fillProp, "ADBE Vector Fill Opacity", "Opacity"); if (fo) fo.setValue(100);
+            hasFill = true;
+        }
+        if (args.strokeColor !== undefined && args.strokeColor !== null) {
+            var strokeProp = hasStroke ? null : gc.addProperty("ADBE Vector Graphic - Stroke");
+            if (!strokeProp) { for (var si = 1; si <= gc.numProperties; si++) { if (gc.property(si).matchName === "ADBE Vector Graphic - Stroke") { strokeProp = gc.property(si); break; } } }
+            var sc = _safeProp(strokeProp, "ADBE Vector Stroke Color", "Color"); if (sc) sc.setValue(args.strokeColor);
+            var sw = _safeProp(strokeProp, "ADBE Vector Stroke Width", "Stroke Width"); if (sw) sw.setValue(args.strokeWidth === undefined || args.strokeWidth === null ? 2 : args.strokeWidth);
+            var so = _safeProp(strokeProp, "ADBE Vector Stroke Opacity", "Opacity"); if (so) so.setValue(100);
+            hasStroke = true;
+        } else if (args.strokeWidth !== undefined && args.strokeWidth !== null && hasStroke) {
+            for (var swi = 1; swi <= gc.numProperties; swi++) {
+                if (gc.property(swi).matchName === "ADBE Vector Graphic - Stroke") {
+                    var swp = _safeProp(gc.property(swi), "ADBE Vector Stroke Width", "Stroke Width"); if (swp) swp.setValue(args.strokeWidth);
+                    break;
+                }
+            }
+        }
+
+        // A path group with neither a Fill nor a Stroke renders literally
+        // nothing (probe P10: the frame comes back empty). Rather than hand back
+        // a "success" the caller can't see, add a default white fill and say so.
+        var addedDefaultFill = false;
+        if (!hasFill && !hasStroke) {
+            var defFill = gc.addProperty("ADBE Vector Graphic - Fill");
+            var dfc = _safeProp(defFill, "ADBE Vector Fill Color", "Color"); if (dfc) dfc.setValue([1, 1, 1]);
+            var dfo = _safeProp(defFill, "ADBE Vector Fill Opacity", "Opacity"); if (dfo) dfo.setValue(100);
+            addedDefaultFill = true;
+            notes.push("Added a default white Fill: a path with no Fill and no Stroke renders nothing. Pass fillColor or strokeColor to control this.");
+        }
+
+        // ---- Now resolve the Path property, after every addProperty --------
+        var pathProp = _vectorShapeProp(gc.property(pathIndex));
+        if (!pathProp) { throw new Error("Could not access the Path property of item " + pathIndex + " in group " + groupIndex + "."); }
+
+        // ---- Write the path ------------------------------------------------
+        var keyframeResults = null;
+        if (args.keyframes && args.keyframes.length) {
+            keyframeResults = [];
+            for (var k = 0; k < args.keyframes.length; k++) {
+                var kf = args.keyframes[k];
+                try {
+                    pathProp.setValueAtTime(kf.time, _objToShape(kf));
+                    keyframeResults.push({ time: kf.time, numVertices: kf.vertices.length, status: "success" });
+                } catch (eKf) {
+                    keyframeResults.push({ time: kf.time, status: "error", message: eKf.toString() });
+                }
+            }
+        } else {
+            if (args.time !== undefined && args.time !== null) {
+                pathProp.setValueAtTime(args.time, _objToShape(args));
+            } else {
+                pathProp.setValue(_objToShape(args));
+            }
+        }
+
+        var current = null;
+        try { current = _shapeToObj(pathProp.value); } catch (eRead) { current = null; }
+
+        return JSON.stringify({
+            status: "success",
+            message: "Shape path set successfully",
+            layer: { name: layer.name, index: layer.index, created: createdLayer },
+            groupIndex: groupIndex,
+            pathIndex: pathIndex,
+            createdGroup: createdGroup,
+            createdPath: createdPath,
+            addedDefaultFill: addedDefaultFill,
+            numKeys: pathProp.numKeys,
+            isTimeVarying: pathProp.isTimeVarying,
+            keyframeResults: keyframeResults,
+            path: current,
+            notes: notes
+        }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+function getShapePath(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found. Provide compName or compIndex, or open a comp." });
+        var layer = _resolveLayer(comp, args);
+        if (!layer) return JSON.stringify({ status: "error", message: "Layer not found. Provide layerIndex or layerName." });
+        if (!(layer instanceof ShapeLayer)) {
+            return JSON.stringify({ status: "error", message: "Layer '" + layer.name + "' is not a shape layer." });
+        }
+        var contents = _safeProp(layer, "ADBE Root Vectors Group", "Contents");
+        if (!contents) { throw new Error("Could not access the shape layer's Contents group."); }
+
+        function readPath(shapeProp) {
+            var info = {
+                isTimeVarying: shapeProp.isTimeVarying,
+                numKeys: shapeProp.numKeys
+            };
+            if (shapeProp.numKeys > 0) {
+                info.keys = [];
+                for (var k = 1; k <= shapeProp.numKeys; k++) {
+                    var entry = _shapeToObj(shapeProp.keyValue(k));
+                    entry.time = shapeProp.keyTime(k);
+                    info.keys.push(entry);
+                }
+            }
+            info.value = _shapeToObj(shapeProp.value);
+            return info;
+        }
+
+        var wantGroup = (args.groupIndex !== undefined && args.groupIndex !== null) ? args.groupIndex : null;
+        var wantPath = (args.pathIndex !== undefined && args.pathIndex !== null) ? args.pathIndex : null;
+
+        var groups = [];
+        for (var gi = 1; gi <= contents.numProperties; gi++) {
+            if (wantGroup !== null && gi !== wantGroup) continue;
+            var g = contents.property(gi);
+            var entryG = { index: gi, name: g.name, matchName: g.matchName, paths: [], items: [] };
+            var gc = _safeProp(g, "ADBE Vectors Group", "Contents");
+            if (gc) {
+                for (var pi = 1; pi <= gc.numProperties; pi++) {
+                    var item = gc.property(pi);
+                    entryG.items.push({ index: pi, name: item.name, matchName: item.matchName });
+                    if (wantPath !== null && pi !== wantPath) continue;
+                    var sp = _vectorShapeProp(item);
+                    if (sp) {
+                        var p = readPath(sp);
+                        p.index = pi;
+                        p.name = item.name;
+                        entryG.paths.push(p);
+                    }
+                }
+            }
+            groups.push(entryG);
+        }
+
+        if (wantGroup !== null && groups.length === 0) {
+            return JSON.stringify({ status: "error", message: "groupIndex out of bounds: " + wantGroup + " (layer has " + contents.numProperties + " group(s))." }, null, 2);
+        }
+
+        return JSON.stringify({
+            status: "success",
+            layer: { name: layer.name, index: layer.index },
+            numGroups: contents.numProperties,
+            groups: groups
+        }, null, 2);
     } catch (error) {
         return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
     }
@@ -5587,6 +5878,16 @@ function executeCommand(command, args) {
                 logToPanel("Calling setLayerMask function...");
                 result = setLayerMask(args);
                 logToPanel("Returned from setLayerMask.");
+                break;
+            case "setShapePath":
+                logToPanel("Calling setShapePath function...");
+                result = setShapePath(args);
+                logToPanel("Returned from setShapePath.");
+                break;
+            case "getShapePath":
+                logToPanel("Calling getShapePath function...");
+                result = getShapePath(args);
+                logToPanel("Returned from getShapePath.");
                 break;
             case "batchSetLayerProperties":
                 logToPanel("Calling batchSetLayerProperties function...");

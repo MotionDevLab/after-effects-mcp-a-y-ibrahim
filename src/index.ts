@@ -22,6 +22,7 @@ import {
   POLL_START_MS,
 } from "./lib/bridge-core.js";
 import { collectPresetFiles } from "./lib/preset-scan.js";
+import { resolvePathInput, assertMorphCompatible } from "./lib/shape-path.js";
 import { analyzeWavBuffer, WavAnalysis } from "./lib/wav.js";
 import { buildFrameContent, type FrameFile, type ContentBlock } from "./lib/see-frame.js";
 import {
@@ -340,6 +341,8 @@ server.tool(
       "setWorkArea",
       "batchSetExpression",
       "setTimeRemap",
+      "setShapePath",
+      "getShapePath",
     ];
 
     if (!allowedScripts.includes(script)) {
@@ -957,6 +960,67 @@ const CompIdentifierSchema = {
     .positive()
     .optional()
     .describe("1-based index among compositions only (the Nth comp in the project), if compName is omitted."),
+};
+
+/**
+ * A 2D point or bezier handle. Tuple-typed rather than z.array(z.number()) so a
+ * malformed [x, y, z] is rejected at the schema instead of reaching After
+ * Effects, which accepts malformed path data silently (see lib/shape-path.ts).
+ */
+const Vec2Schema = z.tuple([z.number(), z.number()]);
+
+const PathGeneratorSchema = z
+  .discriminatedUnion("type", [
+    z.object({
+      type: z.literal("roundedRect"),
+      width: z.number().positive(),
+      height: z.number().positive(),
+      radius: z.number().min(0).optional().describe("Corner radius; clamped to half the shorter side."),
+      center: Vec2Schema.optional(),
+    }),
+    z.object({
+      type: z.literal("ellipse"),
+      width: z.number().positive(),
+      height: z.number().positive(),
+      center: Vec2Schema.optional(),
+    }),
+    z.object({
+      type: z.literal("polygon"),
+      points: z.number().int().min(3).describe("Number of sides."),
+      radius: z.number().positive(),
+      center: Vec2Schema.optional(),
+      rotation: z.number().optional().describe("Clockwise degrees; 0 puts the first vertex straight up."),
+    }),
+    z.object({
+      type: z.literal("star"),
+      points: z.number().int().min(3).describe("Number of star points; the path gets twice this many vertices."),
+      outerRadius: z.number().positive(),
+      innerRadius: z.number().positive(),
+      center: Vec2Schema.optional(),
+      rotation: z.number().optional().describe("Clockwise degrees; 0 puts the first outer point straight up."),
+    }),
+  ])
+  .describe("Build the path from a shape generator instead of explicit vertices.");
+
+const PathShapeSchema = {
+  vertices: z
+    .array(Vec2Schema)
+    .min(2)
+    .optional()
+    .describe("Path vertices as [x,y] pairs, in LAYER space (origin = the layer's anchor point), y positive DOWN."),
+  inTangents: z
+    .array(Vec2Schema)
+    .optional()
+    .describe(
+      "Bezier in-handles, one per vertex, RELATIVE to their own vertex. Must match the vertex count exactly. Omit for straight segments.",
+    ),
+  outTangents: z
+    .array(Vec2Schema)
+    .optional()
+    .describe(
+      "Bezier out-handles, one per vertex, RELATIVE to their own vertex. Must match the vertex count exactly. Omit for straight segments.",
+    ),
+  closed: z.boolean().optional().describe("Whether the path is closed (default: true)."),
 };
 
 const KeyframeValueSchema = z
@@ -3364,7 +3428,7 @@ server.tool(
 
 // Bump this whenever the bridge .jsx protocol changes, and keep it in sync with
 // BRIDGE_VERSION in src/scripts/mcp-bridge-auto.jsx. check-bridge warns on mismatch.
-const EXPECTED_BRIDGE_VERSION = "1.10.0-mcp-enhanced";
+const EXPECTED_BRIDGE_VERSION = "1.11.0-mcp-enhanced";
 
 server.tool(
   "check-bridge",
@@ -3739,6 +3803,28 @@ server.tool(
     maskOpacity: z.number().optional().describe("Mask opacity 0-100."),
     maskExpansion: z.number().optional().describe("Mask expansion in pixels."),
     maskName: z.string().optional().describe("Optional mask name."),
+    maskInTangents: z
+      .array(Vec2Schema)
+      .optional()
+      .describe(
+        "Optional bezier in-handles, one [x,y] per vertex, RELATIVE to their own vertex. Must have exactly as many entries as the path has vertices. Omit for straight segments.",
+      ),
+    maskOutTangents: z
+      .array(Vec2Schema)
+      .optional()
+      .describe(
+        "Optional bezier out-handles, one [x,y] per vertex, RELATIVE to their own vertex. Must have exactly as many entries as the path has vertices. Omit for straight segments.",
+      ),
+    maskClosed: z
+      .boolean()
+      .optional()
+      .describe("Whether the mask path is closed (default: true). Set false for an open path."),
+    time: z
+      .number()
+      .optional()
+      .describe(
+        "Comp time in seconds. When provided, the mask shape is written as a KEYFRAME at that time (animating the mask) instead of a static value. Call repeatedly with different times to build a mask morph.",
+      ),
   },
   async (parameters) => {
     try {
@@ -3747,6 +3833,120 @@ server.tool(
     } catch (error) {
       return {
         content: [{ type: "text", text: `Error setting layer mask: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "set-shape-path",
+  [
+    "Draw or reshape a freeform bezier PATH on a shape layer (vertices + in/out tangents), the thing parametric rectangles/ellipses/stars cannot express: traced logos, custom curves, line art, and animated path morphs.",
+    "Supply the path either as explicit `vertices` (with optional `inTangents`/`outTangents`) or as a `generator` spec (roundedRect / ellipse / polygon / star), never both.",
+    "COORDINATES: vertices are in LAYER space - the origin is the layer's anchor point, NOT the comp's top-left and NOT the comp centre. A layer created by this tool sits at the comp centre with anchor [0,0], so vertex [0,0] renders at the middle of the frame. Y is positive DOWNWARD. Tangents are RELATIVE offsets from their own vertex.",
+    "ANIMATION: pass `keyframes` (each with its own vertices/tangents and a time) to morph a path over time. Every keyframe must have the SAME vertex count - After Effects accepts differing counts without complaint but interpolates them into a torn shape, so this tool rejects them instead.",
+    "VISIBILITY: a path with no Fill and no Stroke renders nothing. Pass fillColor and/or strokeColor; if you pass neither and the group has neither, a default white fill is added and reported back.",
+    "Omit groupIndex/pathIndex to append a new group and path; pass them to overwrite an existing one (read them with get-shape-path first). Parametric shapes cannot be converted to freeform paths.",
+  ].join(" "),
+  {
+    ...CompIdentifierSchema,
+    layerIndex: z.number().int().positive().optional().describe("1-based layer index."),
+    layerName: z
+      .string()
+      .optional()
+      .describe("Layer name (alternative to layerIndex). Also names the layer when createLayer is true."),
+    createLayer: z
+      .boolean()
+      .optional()
+      .describe("Create a new shape layer when no existing layer matches (default: false, which errors instead)."),
+    groupIndex: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("1-based index of an existing group in the layer's Contents. Omit to append a new group."),
+    pathIndex: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("1-based index of an existing path within the group. Omit to append a new path."),
+    ...PathShapeSchema,
+    generator: PathGeneratorSchema.optional(),
+    time: z
+      .number()
+      .optional()
+      .describe("Write the path as a single keyframe at this comp time instead of a static value."),
+    keyframes: z
+      .array(
+        z.object({
+          time: z.number().describe("Comp time in seconds."),
+          ...PathShapeSchema,
+          generator: PathGeneratorSchema.optional(),
+        }),
+      )
+      .optional()
+      .describe("Path morph: one entry per keyframe. All entries must resolve to the same vertex count."),
+    fillColor: z
+      .tuple([z.number(), z.number(), z.number()])
+      .optional()
+      .describe("Fill color as [r,g,b], each 0-1."),
+    strokeColor: z
+      .tuple([z.number(), z.number(), z.number()])
+      .optional()
+      .describe("Stroke color as [r,g,b], each 0-1."),
+    strokeWidth: z.number().optional().describe("Stroke width in pixels (default 2 when strokeColor is given)."),
+  },
+  async (parameters) => {
+    try {
+      // Resolve generators and validate array agreement HERE, before anything
+      // reaches After Effects: AE accepts a malformed Shape silently (zero-filling
+      // mismatched tangents, tearing mismatched morph keyframes), so this is the
+      // only place a caller can be told what is wrong.
+      const { generator, keyframes, ...rest } = parameters;
+      let payload: Record<string, unknown>;
+
+      if (keyframes && keyframes.length) {
+        const resolved = keyframes.map((kf) => ({
+          time: kf.time,
+          ...resolvePathInput(kf as Parameters<typeof resolvePathInput>[0]),
+        }));
+        assertMorphCompatible(resolved);
+        payload = { ...rest, keyframes: resolved };
+      } else {
+        const path = resolvePathInput({ ...rest, generator } as Parameters<typeof resolvePathInput>[0]);
+        payload = { ...rest, ...path };
+      }
+
+      const result = await sendBridgeCommand("setShapePath", payload, 10000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error setting shape path: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "get-shape-path",
+  "Read the bezier path data (vertices, in/out tangents, closed flag) off a shape layer, plus any path keyframes. Omit groupIndex/pathIndex to enumerate every group and path on the layer, which is how you discover the indices set-shape-path needs to overwrite an existing path. Each group also lists its non-path items (fills, strokes, parametric shapes) so you can see the full structure. Coordinates come back in LAYER space with y positive downward, and tangents relative to their own vertex - the same convention set-shape-path takes.",
+  {
+    ...CompIdentifierSchema,
+    layerIndex: z.number().int().positive().optional().describe("1-based layer index."),
+    layerName: z.string().optional().describe("Layer name (alternative to layerIndex)."),
+    groupIndex: z.number().int().positive().optional().describe("Restrict to this 1-based group index."),
+    pathIndex: z.number().int().positive().optional().describe("Restrict to this 1-based path index within the group."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("getShapePath", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error reading shape path: ${String(error)}` }],
         isError: true,
       };
     }

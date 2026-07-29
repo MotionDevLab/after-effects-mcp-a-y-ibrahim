@@ -15,14 +15,35 @@ completeness for its own sake.
 
 ## Candidates
 
-### 1. Shape layer path / bezier authoring
+### 1. Shape layer path / bezier authoring — IMPLEMENTED 2026-07-29
+Built as `set-shape-path` + `get-shape-path` (branch
+`feature/shape-path-authoring`), plus a `set-layer-mask` retrofit
+(`maskInTangents`/`maskOutTangents`/`maskClosed`/`time`). See `CONTEXT.md`'s
+"SPEC: set-shape-path / get-shape-path" section for the full design and the
+live P1-P10 feasibility findings.
+
+**Correction to the cost estimate below**: "fiddly but well-trodden ground"
+undersold two real traps that only showed up live, not in the AE scripting
+docs: (1) AE does not validate `Shape.vertices`/`inTangents`/`outTangents`
+array-length agreement - it silently zero-fills the mismatch instead of
+erroring, so validation had to move client-side (`src/lib/shape-path.ts`);
+(2) a property reference obtained from a vector group is invalidated by any
+later `addProperty` call on that same group (`ReferenceError: Object is
+invalid`), which crashed the first version of the feasibility probe before
+the bridge handler was written to resolve the Path property only after every
+`addProperty`. Neither is mentioned anywhere in Adobe's scripting guide.
+
+Confirmed *not* a repeat of the layer-styles block (item #3): `"ADBE Vector
+Shape - Group"` and mask paths are both fully writable, keyframable, and
+tangent-capable, verified live before any production code was written.
+
+Original assessment (kept for reference):
 No tool creates or edits a shape layer's vector path (vertices, in/out
 tangents) directly. Existing mask tools (`set-layer-mask`) can apply a mask,
 but nothing lets an agent draw or reshape a bezier path from data (e.g.
 "create a shape layer tracing these 6 points" or "add a rounded-corner rect
 path"). Relevant for logo reveals, custom shape animation, generative
 line-art.
-
 **Value**: high if shape-layer work is a real use case; otherwise unused.
 **Cost**: medium-high — bezier path authoring in ExtendScript (`Shape`
 object, `vertices`/`inTangents`/`outTangents` arrays) is fiddly but
@@ -143,8 +164,7 @@ the comp's own `frameRate`, right before calling the existing
 ## Recommendation
 
 Ranked by value-for-effort, most promising first. Updated 2026-07-29 after
-item #3 (layer styles) turned out to be blocked by AE's scripting API, not
-just a moderate-cost build:
+item #1 (shape path authoring) was implemented and verified live:
 
 1. ~~**Time remapping / speed ramps** (#4)~~ — **done**, see
    `set-time-remap` in `CONTEXT.md`.
@@ -154,8 +174,10 @@ just a moderate-cost build:
    write tool; see the corrected assessment above.
 3. ~~**Frame-index convenience param** (#5)~~ — **done**, see
    `see-frame`'s `frameNumbers` param above.
-4. **Shape layer path authoring** (#1) — next up; higher cost, so worth
-   confirming a concrete use case first (same discipline used before
-   building `batch-set-expression`).
-5. **Puppet pin / mesh** (#2) — lowest recommended priority: niche use
-   case, high implementation cost, thin scripting API to build against.
+4. ~~**Shape layer path authoring** (#1)~~ — **done**, see
+   `set-shape-path`/`get-shape-path` in `CONTEXT.md`.
+5. **Puppet pin / mesh** (#2) — the only remaining candidate, and still
+   the lowest recommended priority: niche use case, high implementation
+   cost, thin scripting API to build against. Nothing else is currently
+   tracked here; new gaps should be added as they're found rather than
+   forcing work against this one for completeness.
