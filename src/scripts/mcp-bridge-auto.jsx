@@ -4254,6 +4254,195 @@ function setCompositionProperties(args) {
     }
 }
 
+// --- Layer/composition management (block #6) ---------------------------------
+
+function duplicateComposition(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        var newComp = comp.duplicate();
+        if (args.newName) { newComp.name = args.newName; }
+        return JSON.stringify({
+            status: "success",
+            message: "Composition duplicated successfully",
+            original: { name: comp.name, id: comp.id },
+            duplicate: { id: newComp.id, name: newComp.name, width: newComp.width, height: newComp.height, frameRate: newComp.frameRate, duration: newComp.duration }
+        }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+function deleteComposition(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        var deletedName = comp.name, deletedId = comp.id;
+        comp.remove();
+        return JSON.stringify({ status: "success", message: "Composition deleted successfully", deleted: { name: deletedName, id: deletedId } }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+function addLightLayer(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        var name = args.name || "Light";
+        var lightTypeMap = { "PARALLEL": LightType.PARALLEL, "SPOT": LightType.SPOT, "POINT": LightType.POINT, "AMBIENT": LightType.AMBIENT };
+        var lightType = lightTypeMap[args.type] || LightType.POINT;
+        var layer = comp.layers.addLight(name, [comp.width / 2, comp.height / 2]);
+        layer.lightType = lightType;
+        var lightOptions = layer.property("ADBE Light Options Group");
+        if (args.color && lightOptions) {
+            var colorProp = _safeProp(lightOptions, "ADBE Light Color", "Color");
+            if (colorProp) { colorProp.setValue(args.color); }
+        }
+        if (args.intensity !== undefined && args.intensity !== null && lightOptions) {
+            var intensityProp = _safeProp(lightOptions, "ADBE Light Intensity", "Intensity");
+            if (intensityProp) { intensityProp.setValue(args.intensity); }
+        }
+        return JSON.stringify({ status: "success", message: "Light layer added successfully", layer: { index: layer.index, name: layer.name, type: args.type || "POINT" } }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+function precomposeLayers(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        var layerIndices = args.layerIndices;
+        if (!layerIndices || !layerIndices.length) return JSON.stringify({ status: "error", message: "layerIndices (non-empty array) is required." });
+        if (!args.name) return JSON.stringify({ status: "error", message: "name is required." });
+        var moveAttributes = args.moveAttributes !== false;
+        // precompose() returns the new CompItem, NOT the replacement layer
+        // (confirmed live - reading .index/.source off the return value throws
+        // "TypeError: undefined is not an object", since CompItem has neither).
+        // The replacement layer is placed at the lowest index among the
+        // originally-selected layerIndices.
+        var newComp = comp.layers.precompose(layerIndices, args.name, moveAttributes);
+        var minIndex = Math.min.apply(null, layerIndices);
+        var precompLayer = comp.layer(minIndex);
+        return JSON.stringify({
+            status: "success",
+            message: "Layers precomposed successfully",
+            precomposedLayer: { index: precompLayer.index, name: precompLayer.name, sourceCompId: newComp.id, sourceCompName: newComp.name }
+        }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+function reorderEffects(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        var layer = _resolveLayer(comp, args);
+        if (!layer) return JSON.stringify({ status: "error", message: "Layer not found. Provide layerIndex or layerName." });
+        var effect = resolveEffectOnLayer(layer, args);
+        if (args.newIndex === undefined || args.newIndex === null) return JSON.stringify({ status: "error", message: "newIndex is required." });
+        // Capture the name before moveTo() - the `effect` reference is invalid
+        // to read from afterward (confirmed live: reading effect.name/.propertyIndex
+        // post-move throws "ReferenceError: Object is invalid").
+        var effectName = effect.name;
+        effect.moveTo(args.newIndex);
+        return JSON.stringify({ status: "success", message: "Effect reordered successfully", effect: { name: effectName, newIndex: args.newIndex } }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+function copyEffects(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        var sourceLayer = _resolveLayer(comp, { layerIndex: args.sourceLayerIndex, layerName: args.sourceLayerName });
+        if (!sourceLayer) return JSON.stringify({ status: "error", message: "Source layer not found. Provide sourceLayerIndex or sourceLayerName." });
+        var targetLayer = _resolveLayer(comp, { layerIndex: args.targetLayerIndex, layerName: args.targetLayerName });
+        if (!targetLayer) return JSON.stringify({ status: "error", message: "Target layer not found. Provide targetLayerIndex or targetLayerName." });
+
+        var sourceEffects = sourceLayer.property("ADBE Effect Parade");
+        var targetEffects = targetLayer.property("ADBE Effect Parade");
+        var copiedEffects = [];
+        var warnings = [];
+
+        var indices = (args.effectIndices && args.effectIndices.length) ? args.effectIndices : null;
+        var count = indices ? indices.length : (sourceEffects ? sourceEffects.numProperties : 0);
+
+        for (var i = 0; i < count; i++) {
+            var srcIndex = indices ? indices[i] : (i + 1);
+            var srcEffect = sourceEffects.property(srcIndex);
+            if (!srcEffect) { warnings.push("Source effect not found at index " + srcIndex); continue; }
+            var newEffect = targetEffects.addProperty(srcEffect.matchName);
+            if (!newEffect) { warnings.push("Could not add effect '" + srcEffect.name + "' to target layer"); continue; }
+            newEffect.name = srcEffect.name;
+            for (var p = 1; p <= srcEffect.numProperties; p++) {
+                try {
+                    var srcProp = srcEffect.property(p);
+                    if (srcProp.numKeys > 0 || srcProp.expressionEnabled) {
+                        warnings.push("Effect '" + srcEffect.name + "' property '" + srcProp.name + "' is keyframed/expression-driven - only its current static value was copied.");
+                    }
+                    var tgtProp = newEffect.property(srcProp.name);
+                    if (tgtProp && srcProp.canSetValue) { tgtProp.setValue(srcProp.value); }
+                } catch (eProp) {
+                    warnings.push("Effect '" + srcEffect.name + "' property at index " + p + " could not be copied: " + eProp.toString());
+                }
+            }
+            copiedEffects.push(newEffect.name);
+        }
+
+        return JSON.stringify({ status: "success", message: "Effects copied successfully", copiedEffects: copiedEffects, count: copiedEffects.length, warnings: warnings }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+function deleteMarker(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        var markerIndex = args.markerIndex;
+        if (markerIndex === undefined || markerIndex === null) return JSON.stringify({ status: "error", message: "markerIndex is required." });
+
+        var isLayerMarker = args.layerIndex !== undefined && args.layerIndex !== null || (args.layerName !== undefined && args.layerName !== null);
+        var markerProp, source, layer;
+        if (isLayerMarker) {
+            layer = _resolveLayer(comp, args);
+            if (!layer) return JSON.stringify({ status: "error", message: "Layer not found. Provide layerIndex or layerName." });
+            markerProp = layer.property("ADBE Marker");
+            source = "layer";
+        } else {
+            markerProp = comp.markerProperty;
+            source = "composition";
+        }
+
+        if (markerIndex < 1 || markerIndex > markerProp.numKeys) return JSON.stringify({ status: "error", message: "Marker index out of range." });
+        markerProp.removeKey(markerIndex);
+
+        var result = { status: "success", message: "Marker deleted successfully", source: source, deletedIndex: markerIndex };
+        if (layer) { result.layer = { name: layer.name, index: layer.index }; }
+        return JSON.stringify(result, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+function setWorkArea(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        if (args.start === undefined || args.start === null) return JSON.stringify({ status: "error", message: "start is required." });
+        if (args.duration === undefined || args.duration === null) return JSON.stringify({ status: "error", message: "duration is required." });
+        comp.workAreaStart = args.start;
+        comp.workAreaDuration = args.duration;
+        return JSON.stringify({ status: "success", message: "Work area set successfully", workAreaStart: comp.workAreaStart, workAreaDuration: comp.workAreaDuration }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
 // Resolve an AE enum value to its name (e.g. BlendingMode -> "NORMAL").
 function enumName(enumObj, val) {
     try { for (var k in enumObj) { if (enumObj[k] === val) return k; } } catch (e) {}
@@ -5258,6 +5447,46 @@ function executeCommand(command, args) {
                 logToPanel("Calling setCompositionProperties function...");
                 result = setCompositionProperties(args);
                 logToPanel("Returned from setCompositionProperties.");
+                break;
+            case "duplicateComposition":
+                logToPanel("Calling duplicateComposition function...");
+                result = duplicateComposition(args);
+                logToPanel("Returned from duplicateComposition.");
+                break;
+            case "deleteComposition":
+                logToPanel("Calling deleteComposition function...");
+                result = deleteComposition(args);
+                logToPanel("Returned from deleteComposition.");
+                break;
+            case "addLightLayer":
+                logToPanel("Calling addLightLayer function...");
+                result = addLightLayer(args);
+                logToPanel("Returned from addLightLayer.");
+                break;
+            case "precomposeLayers":
+                logToPanel("Calling precomposeLayers function...");
+                result = precomposeLayers(args);
+                logToPanel("Returned from precomposeLayers.");
+                break;
+            case "reorderEffects":
+                logToPanel("Calling reorderEffects function...");
+                result = reorderEffects(args);
+                logToPanel("Returned from reorderEffects.");
+                break;
+            case "copyEffects":
+                logToPanel("Calling copyEffects function...");
+                result = copyEffects(args);
+                logToPanel("Returned from copyEffects.");
+                break;
+            case "deleteMarker":
+                logToPanel("Calling deleteMarker function...");
+                result = deleteMarker(args);
+                logToPanel("Returned from deleteMarker.");
+                break;
+            case "setWorkArea":
+                logToPanel("Calling setWorkArea function...");
+                result = setWorkArea(args);
+                logToPanel("Returned from setWorkArea.");
                 break;
             case "addToRenderQueue":
                 logToPanel("Calling addToRenderQueue function...");

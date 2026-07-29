@@ -225,18 +225,21 @@ useful source of feature ideas. Neither server dominates.
 - **Asset management**: `import_footage`, `import_folder`, `replace_footage`,
   `find_missing_footage`, `collect_files`, `reduce_project`,
   `organize_project_items`.
-- **Keyframe timeline manipulation**: `offset_keyframes`,
+- ~~**Keyframe timeline manipulation**: `offset_keyframes`,
   `scale_keyframe_timing`, `reverse_keyframes`, `copy_keyframes`,
-  `apply_easy_ease`, `get_keyframes`. (This fork has rich *creation* options
-  incl. graph/easing control via `set-effect-keyframe`, but cannot transform
-  existing keyframes.)
-- **Expression suite**: `get_expression`, `remove_expression`,
+  `apply_easy_ease`, `get_keyframes`.~~ **Implemented 2026-07-29.**
+- ~~**Expression suite**: `get_expression`, `remove_expression`,
   `enable_expression`, `add_expression_control`, `apply_expression_template`,
-  `link_properties`. (This fork has only `setLayerExpression`.)
-- **Motion-graphics templates**: `create_lower_third`, `create_title_card`,
-  `create_transition`, `create_logo_reveal`, `create_text_animator`.
-- Misc: `precompose_layers`, `add_light_layer`, `duplicate_composition`,
-  `reorder_effects`, `copy_effects`, `set_work_area`, `delete_marker`.
+  `link_properties`.~~ **Implemented 2026-07-29.**
+- ~~**Motion-graphics templates**: `create_lower_third`, `create_title_card`,
+  `create_transition`, `create_logo_reveal`, `create_text_animator`.~~
+  **Implemented 2026-07-29.**
+- ~~Misc: `precompose_layers`, `add_light_layer`, `duplicate_composition`,
+  `reorder_effects`, `copy_effects`, `set_work_area`, `delete_marker`.~~
+  **Implemented 2026-07-29** (see block #6 spec below) - plus
+  `delete_composition`, which this list originally missed entirely (found
+  sitting next to `duplicate_composition` in ishu86's own schema file while
+  researching block #6).
 
 **In this fork, absent from ishu86** (i.e. reasons the base choice still holds):
 
@@ -774,6 +777,181 @@ second time, rather than after.
 Re-run `node manual-tests/motion-graphics-templates-test.mjs` (from the repo
 root) after any future change to these 5 tools.
 
+## SPEC: layer/composition management tools — IMPLEMENTED and verified 2026-07-29
+(branch `feature/layer-comp-management-tools`, off `feature/motion-graphics-templates`)
+
+Written 2026-07-29. Block #6, closing out the "Misc" bullet from the
+feature-comparison table above: `precompose_layers`, `add_light_layer`,
+`duplicate_composition`, `reorder_effects`, `copy_effects`, `set_work_area`,
+`delete_marker`. **Plus `delete_composition`**, found sitting right next to
+`DuplicateCompositionSchema` in ishu86's `schemas.ts` while researching this
+block - the feature-comparison table above never listed it as a gap (an
+oversight in that doc, not a deliberate omission), but it's absent from this
+fork too and belongs with the same block.
+
+ishu86's `compositionGenerators.ts`, `layerGenerators.ts`,
+`effectsGenerators.ts`, and `markerGenerators.ts` were read directly as ground
+truth. All 8 are thin wrappers around native AE calls
+(`comp.duplicate()`/`.remove()`, `comp.layers.addLight()`,
+`comp.layers.precompose()`, `effect.moveTo()`, `effectsGroup.addProperty(matchName)`,
+`markerProp.removeKey()`, `comp.workAreaStart`/`workAreaDuration`) - no
+CEP-specific surface, same conclusion as every previous block.
+
+**Key design decision: which comp/layer resolution convention to use.**
+This fork already has *two different, undocumented* `compIndex` semantics
+coexisting (found while researching this block, not previously written down):
+- `_resolveCompAndLayerSimple`/`resolveCompAndLayer` (mcp-bridge-auto.jsx) -
+  `compIndex` = raw 1-based position in the whole Project-panel item list via
+  `app.project.item(compIndex)`. Used by `apply-effect`, `list-layer-effects`,
+  `add-marker`, every `LayerIdentifierSchema` tool. This is the instability
+  already documented below.
+- `_resolveComp`/`_resolveLayer` (mcp-bridge-auto.jsx) - `compIndex` = the
+  Nth *composition* specifically (a comp-only ordinal counter, comps found by
+  scanning and incrementing a counter only `instanceof CompItem`), with
+  `compName` checked first and active-comp as final fallback. Used by
+  `duplicate-layer`, `delete-layer`, `set-composition-properties`,
+  `set-layer-mask`, `batch-set-layer-properties`.
+- **The same composition can need a different numeric `compIndex` depending
+  on which tool you call** (a folder or non-comp item before it shifts the
+  raw-position count but not the comp-ordinal count). Not fixed (same
+  "sweeping change, out of scope for one block" reasoning as the original
+  finding) - added to "Known limitations" below since it's a real,
+  previously-undocumented gap, not new instability introduced by this block.
+- **Decision for all 8 new tools: use the `_resolveComp`/`_resolveLayer`
+  convention** (`compName` optional, `compIndex` optional as comp-ordinal
+  fallback, active-comp as final fallback; `layerIndex`/`layerName` optional
+  pair where a layer is needed) - matches `duplicate-layer`/`delete-layer`
+  exactly (the closest sibling tools - these are structural/destructive comp
+  and layer operations, not per-property animation edits), and is the
+  direction CONTEXT.md's existing limitations section already recommends
+  ("switching to `compName` everywhere"). No new resolution helpers needed -
+  `_resolveComp`/`_resolveLayer` are reused as-is for all 8.
+
+**Effect resolution reuses `resolveEffectOnLayer`** (mcp-bridge-auto.jsx,
+already backs `remove-effect`: accepts `effectIndex`/`effectName`/
+`effectMatchName`) for `reorder-effects` - a deliberate improvement over
+ishu86, whose `reorder_effects` is index-only with no name fallback at all.
+`copy-effects` needs a *list* of effects (or "all"), so it iterates
+`effectsGroup.property(i)` directly (ishu86's own approach) rather than
+calling `resolveEffectOnLayer` per index.
+
+**Bugs found in ishu86, not replicated:**
+1. `add_light_layer`'s `color` accepts an optional `a` (alpha) component
+   (`ColorSchema` is shared with every other color field) which
+   `colorToES3()` then emits as a 4-element array - passed straight into
+   `.setValue()` on a Light layer's Color property, which is a plain
+   3-component Color control. Fixed here by using this fork's own `[r,g,b]`
+   0-1 array convention (established in the motion-graphics-templates block,
+   no alpha field exists at all) - the bug class doesn't exist in this
+   fork's parameter shape to begin with.
+2. `copy_effects` copies each effect property's current static `.value` via
+   `setValue()`, wrapped in a bare `try {} catch (e) {}` that silently
+   swallows every failure (a keyframed or expression-driven source property
+   can't be copied via a static `setValue` - it just silently doesn't copy,
+   and the caller has no way to know). Fixed here: same no-silent-swallow
+   pattern as `offset-keyframes`/`scale-keyframe-timing` from the
+   keyframe-manipulation block - a `warnings` array in the result lists any
+   property that couldn't be copied and why (keyframed/expression-enabled
+   properties are detected and named explicitly, not lumped in with generic
+   failures).
+3. `delete_marker`/`get_markers`/`snap_to_marker` all use
+   `if (params.layerIndex || params.layerName)` - a falsy check, not
+   `!== undefined`. Same latent-not-triggerable class as `link_properties`/
+   `copy_keyframes` in earlier blocks (AE indices are 1-based, so a real
+   index 0 never occurs through normal use) - fixed for free/consistency.
+4. **`reorder_effects` reads `effect.name`/`effect.propertyIndex` off the
+   *same* effect reference immediately after calling `effect.moveTo()`.**
+   Confirmed live: After Effects invalidates that reference the instant the
+   move happens - re-reading it throws `ReferenceError: Object is invalid`,
+   so the tool would error out on every call despite the reorder itself
+   succeeding. ishu86's own generated code has the identical bug (reads
+   `effect.name` after `moveTo()` in the same script) - never caught on
+   their side because their CEP extension can't load on this AE install
+   (the persistent blocker noted earlier in this file), so it was never
+   actually run against live AE. Fixed here by capturing `effect.name`
+   *before* the move, and reporting the already-known `newIndex` from the
+   request instead of re-reading `.propertyIndex` afterward.
+5. **`precompose_layers` treats the return value of
+   `comp.layers.precompose()` as the new replacement layer.** Confirmed
+   live: `precompose()` actually returns the new **`CompItem`** (the nested
+   composition itself), not a layer - reading `.index` or `.source` off it
+   throws `TypeError: undefined is not an object` (neither property exists
+   on a `CompItem`). Same root cause as bug #4 - ishu86's own generated code
+   makes the identical assumption (`generateResultObject({ index:
+   'precompLayer.index', ..., sourceCompId: 'precompLayer.source.id' })`)
+   and was never live-tested for the same CEP-blocker reason. Fixed here:
+   the actual replacement layer is looked up afterward at the lowest index
+   among the originally-selected `layerIndices` (AE's own placement rule -
+   confirmed live), and the CompItem's `id`/`name` are reported as
+   `sourceCompId`/`sourceCompName` instead of trying to read them through a
+   nonexistent `.source` on the wrong object type.
+
+**Deliberate scope limits (documented, not fixed):**
+- `copy-effects` only copies each effect's current static property values,
+  never keyframes or expressions on those properties (matches ishu86's own
+  scope) - a caller who needs full keyframe fidelity on a copied effect
+  should follow up with this fork's own `copy-keyframes` tool (built last
+  block) for that specific property. Not extended to auto-chain into
+  `copy-keyframes` internally - keeps this tool's behavior simple and
+  predictable rather than surprising.
+- `delete-composition`/`delete-layer` do not check whether the target is
+  used elsewhere (nested as another comp's layer source, referenced in the
+  render queue) before removing it - matches ishu86 and matches this fork's
+  own pre-existing `delete-layer` precedent exactly; native AE behavior
+  applies (referencing layers become missing-source, same as manually
+  deleting in the UI).
+- `set-work-area` does not pre-validate `start`/`duration` against
+  `comp.duration` before calling AE's native setters - matches ishu86's
+  approach exactly. **Correction after live testing (2026-07-29)**: ishu86's
+  own writeup assumes AE clamps an out-of-range `workAreaDuration` silently;
+  live testing on this build shows AE actually **throws** ("Unable to set
+  'workAreaDuration'. Value 100 out of range 0.03 to 4.03.") rather than
+  clamping. Not a bug in this fork's implementation - the bridge function's
+  existing try/catch already surfaces this correctly as a `status:"error"`
+  result instead of a false "success", which is the right behavior; ishu86's
+  assumption about AE's own clamping behavior was simply wrong, and this
+  fork does not repeat it in its documentation or tests.
+
+**Tool-by-tool:**
+- `duplicate-composition` (bridge `duplicateComposition`) - `compName`/
+  `compIndex` optional pair, `newName` optional. `comp.duplicate()`.
+- `delete-composition` (bridge `deleteComposition`) - `compName`/`compIndex`
+  optional pair. Captures name before `.remove()`.
+- `add-light-layer` (bridge `addLightLayer`) - `compName`/`compIndex`
+  optional pair, `name`/`type` (`PARALLEL`/`SPOT`/`POINT`/`AMBIENT`, default
+  `POINT`)/`color` ([r,g,b] 0-1, optional)/`intensity` optional.
+  `comp.layers.addLight(name, [comp.width/2, comp.height/2])`.
+- `precompose-layers` (bridge `precomposeLayers`) - `compName`/`compIndex`
+  optional pair, `layerIndices` (required array of 1-based ints, matches
+  ishu86 - AE's own `precompose()` only accepts indices, no name-array
+  alternative exists to offer), `name` required, `moveAttributes` optional
+  (default `true`, matches AE's own UI default). `comp.layers.precompose(...)`.
+- `reorder-effects` (bridge `reorderEffects`) - `compName`/`compIndex` +
+  `layerIndex`/`layerName` optional pairs, `effectIndex`/`effectName`/
+  `effectMatchName` (via `resolveEffectOnLayer`, improvement over ishu86's
+  index-only), `newIndex` required. `effect.moveTo(newIndex)`.
+- `copy-effects` (bridge `copyEffects`) - `compName`/`compIndex` +
+  `sourceLayerIndex`/`sourceLayerName` + `targetLayerIndex`/`targetLayerName`
+  (all via `_resolveComp`/`_resolveLayer`), `effectIndices` optional array
+  (omit = copy all). Returns `copiedEffects`, `count`, and `warnings` (bug
+  fix #2 above).
+- `delete-marker` (bridge `deleteMarker`) - `compName`/`compIndex` +
+  `layerIndex`/`layerName` optional pair (present = layer marker, absent =
+  composition marker, matches ishu86's inference exactly but with
+  `!== undefined` checks), `markerIndex` required.
+  `markerProp.removeKey(markerIndex)`.
+- `set-work-area` (bridge `setWorkArea`) - `compName`/`compIndex` optional
+  pair, `start` required, `duration` required positive.
+
+All 8 added to `allowedScripts` in `src/index.ts`. None added to
+`READ_ONLY_COMMANDS` (all mutate) or `NO_UNDO_GROUP_COMMANDS` (plain,
+individually-undoable ops - the dispatcher's central
+`beginUndoGroup`/`endUndoGroup` wrap is correct as-is, same as every prior
+block's non-render/non-lifecycle tools).
+
+**Verified 2026-07-29** via `manual-tests/layer-comp-management-test.mjs`.
+Re-run after any future change to these 8 tools.
+
 ## Known limitations
 
 ### `compIndex`'s positional index can shift as a project grows (discovered 2026-07-29)
@@ -819,9 +997,47 @@ not `compIndex` - they were designed this way from the start, matching
 `createTextLayer`/`createSolidLayer`/`createShapeLayer`'s existing
 convention, and are unaffected by this limitation.
 
+### A second, different `compIndex` semantic also exists (discovered 2026-07-29, while researching block #6)
+
+The instability above describes one resolution helper. This codebase
+actually has **two, and they disagree with each other**:
+- `_resolveCompAndLayerSimple`/`resolveCompAndLayer` - `compIndex` = raw
+  1-based position in the whole Project-panel item list
+  (`app.project.item(compIndex)`). Backs `apply-effect`,
+  `list-layer-effects`, `add-marker`, every `LayerIdentifierSchema` tool.
+  This is the semantic described above.
+- `_resolveComp`/`_resolveLayer` - `compIndex` = the Nth *composition*
+  specifically (a counter incremented only when `instanceof CompItem`),
+  checked only if `compName` didn't resolve, falling back to the active
+  comp last. Backs `duplicate-layer`, `delete-layer`,
+  `set-composition-properties`, `set-layer-mask`,
+  `batch-set-layer-properties`, and (as of block #6) all 8 new
+  layer/comp-management tools.
+
+**Practical impact**: the same composition can require a *different*
+numeric `compIndex` depending on which tool you call, if any non-comp item
+(a folder, imported footage, a solid) sits before it in the Project panel -
+raw-position counting and comp-only counting diverge as soon as that
+happens. Neither semantic is "wrong" in isolation; the problem is that two
+different tool families silently disagree about what the same parameter
+name means.
+
+**Not fixed here** - same reasoning as above (standardizing on one semantic
+project-wide is a sweeping cross-cutting change, out of scope for a single
+block). Block #6 deliberately chose the `_resolveComp`/`_resolveLayer`
+(comp-ordinal, `compName`-preferring) semantic for all its new tools, since
+it's the direction this limitation already recommended moving toward - so
+new tools added going forward should default to that convention too, rather
+than perpetuating the raw-positional one.
+
 ## Next planned step
 
-Decide whether a 6th block is wanted. Remaining candidate noted along the
-way: ishu86's batch-expression-setter/template-introspection tools, built
-but never wired up on their side (deferred in the expression-suite spec
-above).
+All 6 planned blocks are now implemented and verified (project lifecycle,
+asset management, expression suite, keyframe manipulation, motion-graphics
+templates, layer/composition management). Decide whether a 7th block is
+wanted. Remaining candidates noted along the way: ishu86's
+batch-expression-setter/template-introspection tools, built but never wired
+up on their side (deferred in the expression-suite spec above); or a
+project-wide standardization on one `compIndex` semantic (see "Known
+limitations" above) if the two-semantics inconsistency ever causes a real
+bug rather than staying a documented risk.

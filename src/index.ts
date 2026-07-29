@@ -330,6 +330,14 @@ server.tool(
       "createTransition",
       "createLogoReveal",
       "createTextAnimator",
+      "duplicateComposition",
+      "deleteComposition",
+      "addLightLayer",
+      "precomposeLayers",
+      "reorderEffects",
+      "copyEffects",
+      "deleteMarker",
+      "setWorkArea",
     ];
 
     if (!allowedScripts.includes(script)) {
@@ -3748,6 +3756,209 @@ server.tool(
     } catch (error) {
       return {
         content: [{ type: "text", text: `Error setting composition properties: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+const CompIdentifierSchema = {
+  compName: z.string().optional().describe("Composition name (or active comp if omitted)."),
+  compIndex: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("1-based index among compositions only (the Nth comp in the project), if compName is omitted."),
+};
+
+server.tool(
+  "duplicate-composition",
+  "Duplicate a composition, optionally renaming the copy. Target the comp by compName or compIndex.",
+  {
+    ...CompIdentifierSchema,
+    newName: z.string().optional().describe("Optional new name for the duplicated composition."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("duplicateComposition", parameters, 10000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error duplicating composition: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "delete-composition",
+  "Delete a composition from the project. Layers elsewhere that use this comp as a source become missing-footage, same as deleting it manually in the Project panel.",
+  {
+    ...CompIdentifierSchema,
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("deleteComposition", parameters, 10000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error deleting composition: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "add-light-layer",
+  "Add a light layer to a composition.",
+  {
+    ...CompIdentifierSchema,
+    name: z.string().optional().describe("Optional name for the light layer (default 'Light')."),
+    type: z
+      .enum(["PARALLEL", "SPOT", "POINT", "AMBIENT"])
+      .optional()
+      .describe("Light type (default 'POINT')."),
+    color: z.array(z.number()).length(3).optional().describe("Light color as [r,g,b], each 0-1."),
+    intensity: z.number().optional().describe("Light intensity percentage."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("addLightLayer", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error adding light layer: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "precompose-layers",
+  "Precompose one or more layers into a new nested composition, replacing them in place with a single layer that references the new comp.",
+  {
+    ...CompIdentifierSchema,
+    layerIndices: z
+      .array(z.number().int().positive())
+      .min(1)
+      .describe("1-based indices of the layers to precompose."),
+    name: z.string().describe("Name for the new precomposition."),
+    moveAttributes: z
+      .boolean()
+      .optional()
+      .describe("Move all attributes (transform, effects, etc.) into the new comp (default true, matches AE's own UI default)."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("precomposeLayers", parameters, 10000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error precomposing layers: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "reorder-effects",
+  "Move an effect to a different position in a layer's effect stack. Target the effect by effectIndex, effectName, or effectMatchName.",
+  {
+    ...CompIdentifierSchema,
+    layerIndex: z.number().int().positive().optional().describe("1-based layer index."),
+    layerName: z.string().optional().describe("Layer name (alternative to layerIndex)."),
+    effectIndex: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("1-based effect index within the layer's Effects group."),
+    effectName: z.string().optional().describe("Display name of the effect to reorder."),
+    effectMatchName: z.string().optional().describe("Internal match name of the effect to reorder."),
+    newIndex: z.number().int().positive().describe("1-based target position in the effect stack."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("reorderEffects", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error reordering effects: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "copy-effects",
+  "Copy one or more effects (with their current static property values) from one layer to another. Omit effectIndices to copy every effect on the source layer. Does not copy keyframes or expressions on effect properties - use copy-keyframes afterward for a specific property if needed.",
+  {
+    ...CompIdentifierSchema,
+    sourceLayerIndex: z.number().int().positive().optional().describe("1-based source layer index."),
+    sourceLayerName: z.string().optional().describe("Source layer name (alternative to sourceLayerIndex)."),
+    targetLayerIndex: z.number().int().positive().optional().describe("1-based target layer index."),
+    targetLayerName: z.string().optional().describe("Target layer name (alternative to targetLayerIndex)."),
+    effectIndices: z
+      .array(z.number().int().positive())
+      .optional()
+      .describe("1-based indices of effects to copy (omit to copy all effects on the source layer)."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("copyEffects", parameters, 10000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error copying effects: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "delete-marker",
+  "Delete a marker from a composition or a layer. Provide layerIndex/layerName for a layer marker, or omit both for a composition marker.",
+  {
+    ...CompIdentifierSchema,
+    layerIndex: z.number().int().positive().optional().describe("1-based layer index (layer marker) - omit for a composition marker."),
+    layerName: z.string().optional().describe("Layer name (alternative to layerIndex, layer marker only)."),
+    markerIndex: z.number().int().positive().describe("1-based marker index (as returned by get-markers-equivalent tooling or add-marker)."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("deleteMarker", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error deleting marker: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "set-work-area",
+  "Set a composition's work area (start time and duration in seconds). AE clamps internally, so check the returned values against what you requested.",
+  {
+    ...CompIdentifierSchema,
+    start: z.number().describe("Work area start time in seconds."),
+    duration: z.number().positive().describe("Work area duration in seconds."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("setWorkArea", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error setting work area: ${String(error)}` }],
         isError: true,
       };
     }
