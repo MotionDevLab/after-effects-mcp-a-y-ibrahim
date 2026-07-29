@@ -339,6 +339,7 @@ server.tool(
       "deleteMarker",
       "setWorkArea",
       "batchSetExpression",
+      "setTimeRemap",
     ];
 
     if (!allowedScripts.includes(script)) {
@@ -1191,6 +1192,42 @@ server.tool(
     } catch (error) {
       return {
         content: [{ type: "text", text: `Error in batch set expression: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "set-time-remap",
+  "Enable/disable time remapping on a layer and set Time Remap keyframes (freeze frames and speed ramps). Each keyframe maps a comp-time (when) to a source-time (what frame of the layer's own content plays then). Equal values across two keyframes = freeze frame; differing values = speed ramp. Omit keyframes to just enable/inspect the current Time Remap state without changing existing keyframes.",
+  {
+    ...CompIdentifierSchema,
+    layerIndex: z.number().int().positive().optional().describe("1-based layer index."),
+    layerName: z.string().optional().describe("Layer name (alternative to layerIndex)."),
+    enabled: z
+      .boolean()
+      .optional()
+      .describe(
+        "Set false to disable time remapping (removes the Time Remap property and its keyframes). Default true - ensures it's enabled.",
+      ),
+    keyframes: z
+      .array(
+        z.object({
+          time: z.number().describe("Comp time in seconds."),
+          value: z.number().describe("Source time in seconds the layer should show at this comp time."),
+        }),
+      )
+      .optional()
+      .describe("Time Remap keyframes to add/overwrite at the given comp times. Omit to leave existing keyframes untouched."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("setTimeRemap", parameters, 10000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error setting time remap: ${String(error)}` }],
         isError: true,
       };
     }

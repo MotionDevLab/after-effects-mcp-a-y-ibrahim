@@ -1130,7 +1130,8 @@ Use this table to know which counting rule applies before trusting a
   `set-work-area`), the 4 motion-graphics creators (`create-lower-third`,
   `create-title-card`, `create-transition`, `create-logo-reveal`),
   `localize-comp`, `create-camera`, `inspect-comp`, `inspect-layer`,
-  `animate-to-audio`/`animate-from-data`, `batch-set-expression`.
+  `animate-to-audio`/`animate-from-data`, `batch-set-expression`,
+  `set-time-remap`.
 - **Deliberately excluded from any future fix, vestigial**: `test-animation`
   (`src/index.ts` ~line 1436). Bypasses the bridge dispatcher entirely -
   writes a standalone `.jsx` temp file the user must manually run via
@@ -1165,6 +1166,95 @@ different tool. If this bug class ever causes a real, observed
 wrong-target incident, that would be the trigger to revisit the full
 refactor with a concrete case to test against instead of a hypothetical
 one.
+
+## SPEC: set-time-remap — IMPLEMENTED and verified 2026-07-29
+(branch `feature/time-remap-tool`)
+
+Closes the highest value-for-effort item from `GAPS.md` (written the same
+day): AE's "Enable Time Remapping" feature - freeze frames and speed ramps
+on a layer's own playback - had no tool in this fork or in any sibling repo
+(repo A, repo B, ishu86).
+
+**Key finding, correcting `GAPS.md`'s own cost estimate**:
+`_resolveLayerProperty(layer, propertyName)` (`mcp-bridge-auto.jsx:1108`)
+only searches three fixed groups - `"ADBE Transform Group"`, `"ADBE Effect
+Parade"`, `"ADBE Text Properties"`. Time Remap (`"ADBE Time Remapping"`) is
+a top-level `AVLayer` property, a sibling of those groups, not nested under
+any of them - and it doesn't exist at all until `layer.timeRemapEnabled =
+true` is set. `GAPS.md` assumed the existing property-resolution helpers
+"can likely already handle" Time Remap once enabled; this turned out to be
+wrong. `setTimeRemap()` uses direct `layer.property("ADBE Time Remapping")`
+access instead (locale-safe match-name lookup, the standard ExtendScript
+pattern), not `_resolveLayerProperty`.
+
+**Resolution-family decision**: `_resolveComp`/`_resolveLayer`
+(comp-ordinal, `compName`-preferring), matching `batch-set-expression`'s
+decision and this file's standing guidance for all new tools.
+
+**One tool, two optional params, four behaviors** - deliberately not split
+into separate enable/disable/get/set tools:
+- `enabled: false` -> disable time remapping (removes the property and any
+  keyframes on it).
+- `enabled` omitted (default true) + `keyframes` omitted -> ensure time
+  remapping is on (AE auto-creates 2 default keyframes at the layer's
+  in/out points the first time it's enabled) and return the current state.
+  This same call also serves as the read/inspect path - no separate getter
+  needed.
+- `enabled` omitted (default true) + `keyframes` provided -> ensure it's
+  on, then `property.setValueAtTime(time, value)` for each `{time, value}`
+  pair (same mechanism `setLayerKeyframe` already uses elsewhere), adding
+  or overwriting a keyframe at that comp time. Equal `value`s across two
+  keyframes freeze the frame between them; differing `value`s create a
+  speed ramp (the slope of value-over-time is the effective playback
+  speed).
+
+**Per-keyframe error isolation**: each keyframe's `setValueAtTime` call is
+wrapped individually and collected into a `keyframeResults[]` array (same
+partial-failure-isolation pattern `batch-set-expression` established) - one
+bad keyframe doesn't abort the rest, and the response also always includes
+the full current `keys[]` state afterward.
+
+**Response shape**: the `keys[]` field reuses `getKeyframes`'s exact
+per-keyframe serialization (`time`, `value`, `inInterp`/`outInterp` via
+`enumName(KeyframeInterpolationType, ...)`, `inEase`/`outEase` as
+`{speed, influence}`) rather than inventing a new keyframe JSON shape.
+
+**Layer-type guard**: `layer instanceof AVLayer` is checked first (rules
+out camera/light layers, which aren't `AVLayer` at all), then
+`layer.timeRemapEnabled = true` is wrapped in its own try/catch, since AE
+throws for AV layers whose source isn't time-based (e.g. text/shape
+layers) - this surfaces as a clear per-call error rather than a crash.
+
+**Verified 2026-07-29** via `manual-tests/time-remap-test.mjs` - all
+assertions passed on the second run (see correction below). Time remap
+needs a layer with genuine time-varying source content, so the test builds
+one via `precompose-layers` (a text layer with a `wiggle` expression on
+Position, precomposed into a nested comp) and runs `set-time-remap` against
+the resulting precomp layer. Confirmed: default-enable creates AE's own 2
+default keyframes at the layer's in/out points (`numKeys: 2`); a
+freeze-frame pair (`{time:1,value:0.5}`/`{time:3,value:0.5}`) round-trips
+both keyframes at value 0.5; a speed-ramp pair (`{time:4,value:1}`/
+`{time:5,value:3}`) round-trips with distinct values; `enabled: false`
+disables time remapping, and a follow-up default call re-enables with a
+*fresh* default 2-keyframe state, confirming the prior custom keyframes
+were actually discarded (not just hidden); the real project's 3 layers
+were unchanged after restore.
+
+**Correction, found live (not assumed)**: the test's first run asserted
+that a negative `time` value would fail the per-keyframe try/catch, based
+on a comment elsewhere in this file's codebase (`_rebuildKeyframesAtNewTimes`,
+which deliberately *skips* negative `newTime` as its own design choice, not
+because AE's API rejects it). That assumption was wrong - AE's Time Remap
+`setValueAtTime` accepted `time: -5` without throwing, inserting a
+keyframe before the layer's nominal start. The test was corrected to assert
+the real (permissive) behavior. The per-keyframe try/catch itself is
+unchanged and still defensively correct (matches `batch-set-expression`'s
+proven pattern) - this run just didn't find a live input that exercises the
+catch branch. Worth knowing for anyone building on top of this tool:
+Time Remap keyframing is very permissive about `time`/`value` ranges: a
+caller can produce values before the layer's start or in ranges that don't
+correspond to real source content, which will read back as black/held
+frames rather than erroring.
 
 ## Next planned step
 

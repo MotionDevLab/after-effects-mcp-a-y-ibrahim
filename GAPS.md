@@ -46,7 +46,20 @@ that's currently only reachable via effects-stack equivalents.
 Layer Styles")` groups, similar shape to existing effect-property code
 already in the bridge.
 
-### 4. Time remapping / speed ramps on a layer
+### 4. Time remapping / speed ramps on a layer — IMPLEMENTED 2026-07-29
+Built as `set-time-remap` (branch `feature/time-remap-tool`). See
+`CONTEXT.md`'s "SPEC: set-time-remap" section for the full design writeup.
+
+**Correction to the cost estimate below**: this note originally assumed
+the existing `_resolveLayerProperty`/keyframe helpers "can likely already
+handle" Time Remap once enabled. That turned out to be wrong —
+`_resolveLayerProperty` only searches Transform Group/Effect Parade/Text
+Properties, and Time Remap (`"ADBE Time Remapping"`) is a top-level
+`AVLayer` property outside all three, requiring direct `layer.property(...)`
+access instead. Cost was still low-medium in practice, just not for the
+reason originally guessed.
+
+Original assessment (kept for reference):
 Distinct from the existing keyframe-manipulation suite (`offset-keyframes`,
 `scale-keyframe-timing`, etc.), which retime keyframes on a *named
 property* the caller already has. Nothing enables/animates a layer's own

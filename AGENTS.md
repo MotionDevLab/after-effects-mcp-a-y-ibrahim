@@ -52,7 +52,7 @@ before the call, using the counting rule for *that specific tool*.
 `create-lower-third`, `create-title-card`, `create-transition`,
 `create-logo-reveal`, `localize-comp`, `create-camera`, `inspect-comp`,
 `inspect-layer`, `animate-to-audio`, `animate-from-data`,
-`batch-set-expression`.
+`batch-set-expression`, `set-time-remap`.
 
 `test-animation` bypasses the bridge dispatcher entirely (writes a
 manual-run `.jsx` temp file) and isn't part of the maintained tool

@@ -1344,6 +1344,88 @@ function batchSetExpression(args) {
     }
 }
 
+// setTimeRemap() and _resolveLayerProperty() deliberately don't share a
+// lookup path: Time Remap ("ADBE Time Remapping") is a top-level AVLayer
+// property, a sibling of Transform Group/Effect Parade/Text Properties, not
+// nested under any of them - and it doesn't exist until timeRemapEnabled is
+// set true. Direct layer.property() access is required.
+function setTimeRemap(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        var layer = _resolveLayer(comp, args);
+        if (!layer) return JSON.stringify({ status: "error", message: "Layer not found." });
+        if (!(layer instanceof AVLayer)) {
+            return JSON.stringify({ status: "error", message: "Layer '" + layer.name + "' is not an AV layer; time remapping requires an AV layer with a time-based source." });
+        }
+
+        if (args.enabled === false) {
+            try {
+                layer.timeRemapEnabled = false;
+            } catch (eDisable) {
+                return JSON.stringify({ status: "error", message: "Failed to disable time remapping on layer '" + layer.name + "': " + eDisable.toString() });
+            }
+            return JSON.stringify({ status: "success", layerName: layer.name, timeRemapEnabled: false, message: "Time remapping disabled." });
+        }
+
+        if (!layer.timeRemapEnabled) {
+            try {
+                layer.timeRemapEnabled = true;
+            } catch (eEnable) {
+                return JSON.stringify({ status: "error", message: "Could not enable time remapping on layer '" + layer.name + "': " + eEnable.toString() + ". This layer type may not support time remapping (e.g. text, shape, camera, or light layers)." });
+            }
+        }
+
+        var property = layer.property("ADBE Time Remapping");
+        if (!property) {
+            return JSON.stringify({ status: "error", message: "Could not access Time Remap property after enabling it on layer '" + layer.name + "'." });
+        }
+
+        var keyframeResults = [];
+        if (args.keyframes && args.keyframes.length) {
+            for (var i = 0; i < args.keyframes.length; i++) {
+                var kf = args.keyframes[i];
+                try {
+                    property.setValueAtTime(kf.time, kf.value);
+                    keyframeResults.push({ time: kf.time, value: kf.value, status: "success" });
+                } catch (eKf) {
+                    keyframeResults.push({ time: kf.time, value: kf.value, status: "error", message: eKf.toString() });
+                }
+            }
+        }
+
+        var keys = [];
+        for (var k = 1; k <= property.numKeys; k++) {
+            var inEaseOut = null, outEaseOut = null;
+            try {
+                var inE = property.keyInTemporalEase(k);
+                var outE = property.keyOutTemporalEase(k);
+                inEaseOut = { speed: inE[0].speed, influence: inE[0].influence };
+                outEaseOut = { speed: outE[0].speed, influence: outE[0].influence };
+            } catch (e) {}
+            keys.push({
+                time: property.keyTime(k),
+                value: property.keyValue(k),
+                inInterp: enumName(KeyframeInterpolationType, property.keyInInterpolationType(k)),
+                outInterp: enumName(KeyframeInterpolationType, property.keyOutInterpolationType(k)),
+                inEase: inEaseOut,
+                outEase: outEaseOut
+            });
+        }
+
+        return JSON.stringify({
+            status: "success",
+            layerName: layer.name,
+            timeRemapEnabled: layer.timeRemapEnabled,
+            numKeys: property.numKeys,
+            keyframeResults: keyframeResults,
+            keys: keys
+        }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
 // ---- Keyframe-manipulation helpers ----
 // AE's scripting DOM has no setKeyTime() - keyTime is read-only - so moving,
 // scaling, or reversing keyframe times is forced to be a
@@ -5289,6 +5371,11 @@ function executeCommand(command, args) {
                 logToPanel("Calling batchSetExpression function...");
                 result = batchSetExpression(args);
                 logToPanel("Returned from batchSetExpression.");
+                break;
+            case "setTimeRemap":
+                logToPanel("Calling setTimeRemap function...");
+                result = setTimeRemap(args);
+                logToPanel("Returned from setTimeRemap.");
                 break;
             case "getKeyframes":
                 logToPanel("Calling getKeyframes function...");
