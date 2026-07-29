@@ -191,6 +191,10 @@ feature comparison below, so signing was not pursued.
 - `get-expression`, `enable-expression`, `add-expression-control`,
   `link-properties`, `apply-expression-template` (22-step test, see the
   expression-suite spec section above)
+- `get-keyframes`, `offset-keyframes`, `scale-keyframe-timing`,
+  `reverse-keyframes`, `copy-keyframes`, `apply-easy-ease` (25-step test,
+  found and fixed 2 real bugs during verification - see the
+  keyframe-manipulation spec section above)
 
 ## Not yet tested
 
@@ -547,18 +551,100 @@ produces a real cross-layer expression string; `apply-expression-template`
 substitutes params with no leftover `{{...}}` tokens. Real project (3
 layers) restored intact at the end.
 
+## SPEC: keyframe-manipulation tools — IMPLEMENTED and verified 2026-07-29
+(branch `feature/keyframe-manipulation-tools`)
+
+Written 2026-07-29, branched off `feature/expression-suite-tools`. Closes
+ishu86 gap #4 (final block on the current priority list):
+`offset_keyframes`, `scale_keyframe_timing`, `reverse_keyframes`,
+`copy_keyframes`, `apply_easy_ease`, `get_keyframes`.
+
+ishu86's `keyframeGenerators.ts` was read directly as ground truth. Key
+findings:
+- AE's scripting DOM has **no `setKeyTime()`** - `keyTime` is read-only, so
+  moving/scaling/reversing keyframe times is forced to be
+  destroy-all-keys + recompute + rebuild, a genuine API constraint, not a
+  shortcut.
+- `get-keyframes` is only partially redundant with this fork's existing
+  `inspect-layer`/`includeKeyframes` (`dumpLeaf()` in the jsx file) - that
+  only covers Transform-group properties, not effects, and neither source
+  returns temporal ease (speed/influence). Building it properly closes a
+  real gap rather than duplicating.
+- **Two real bugs found in ishu86, not replicated**: (1)
+  `offset_keyframes`/`scale_keyframe_timing` silently drop any keyframe
+  whose recomputed time goes negative during rebuild, yet still report the
+  *original* key count as moved/scaled - fixed here by reporting the actual
+  re-added count plus a `note` for drops. (2) `copy_keyframes`/
+  `apply_easy_ease` use a falsy check (`if (params.xIndex)`) instead of
+  `!== undefined` on indices - latent (AE indices are 1-based, index 0 never
+  real) but fixed for consistency, same class of fix as `link-properties` in
+  the previous block.
+- `reverse_keyframes` is correct in ishu86 (properly swaps in/out
+  interpolation and ease) - ported directly.
+- `apply_easy_ease`'s ease value is confirmed as AE's real default
+  (`speed=0, influence=33.33`), matching this fork's own `buildEaseArray()`
+  default exactly. **Deliberate improvement**: omitting `keyframeIndex`
+  applies Easy Ease to all keyframes on the property (not an error/no-op) -
+  matches how AE's own Easy Ease command behaves with multiple keyframes
+  selected, and is the more common real use case.
+
+**Reuse, not reinvention**: `_resolveLayerProperty` (added in the expression-
+suite block) handles all property resolution - Transform/Effects/Text, no
+new lookup logic. `findKeyIndexAtTime`, `getPropertyDimensionCount`,
+`buildEaseArray`, `buildEaseArrayFromSpec` (existing, power
+`set-effect-keyframe`) are reused directly by `apply-easy-ease`.
+`LayerIdentifierSchema` is the schema shape for every single-layer tool.
+
+Full schema/logic detail is in `src/index.ts` and
+`src/scripts/mcp-bridge-auto.jsx` - this section records the *why*.
+
+**Verified 2026-07-29** via `manual-tests/keyframe-manipulation-test.mjs` (25
+steps) - two real bugs were found and fixed during verification, neither
+present in ishu86 (they're specific to this fork's own implementation, found
+by actually testing rather than just porting):
+
+1. **`apply-easy-ease` crashed**: "Unable to call setTemporalEaseAtKey ...
+   Value array does not have 1 elements." It sized the ease array using
+   `getPropertyDimensionCount()` (based on the property's *value* shape - 3
+   for Position's `[x,y,z]`), but AE's temporal ease for a spatial property
+   is a single unified motion-path ease (length 1), not one value per axis -
+   value-dimensionality and ease-dimensionality are different concepts. Fixed
+   by reading the expected length from the key's own existing
+   `keyInTemporalEase(idx).length`/`keyOutTemporalEase(idx).length` instead
+   of guessing from the value shape.
+2. **Interpolation type was silently lost on every rebuild** (`offset-
+   keyframes`, `scale-keyframe-timing`, `reverse-keyframes`, `copy-
+   keyframes`): every rebuilt keyframe came back as `BEZIER`/`BEZIER`
+   regardless of its original type, with no error (each call was wrapped in
+   a silent `try/catch`, masking it). Root cause: `setTemporalEaseAtKey`
+   appears to force/promote a key to `BEZIER` interpolation as a side
+   effect, and the code called `setInterpolationTypeAtKey` *before*
+   `setTemporalEaseAtKey` - so the ease call clobbered the just-set
+   interpolation type. Fixed by reordering: ease first, interpolation type
+   last, in both `_rebuildKeyframesAtNewTimes` and `copyKeyframes`.
+
+Both were caught specifically because the test asserted on *interpolation
+type surviving the round-trip* (via an intentionally asymmetric HOLD-in/
+LINEAR-out keyframe) rather than only checking counts and times - a useful
+lesson for verifying future keyframe-touching tools. Also two test-script
+false alarms (not product bugs): the existing `setLayerKeyframe` tool
+deliberately seeds an extra keyframe at `comp.time` on its first call for a
+property, which briefly looked like a keyframe-count bug until traced to
+that existing, intentional behavior; and an early version of the test lost
+its own asymmetric-interpolation test keyframe to an earlier destructive
+offset step, which was a test design issue (fixed by isolating that check to
+its own untouched property) not a tool bug.
+
+Re-run `node manual-tests/keyframe-manipulation-test.mjs` (from the repo
+root) after any future change to these 6 tools.
+
 ## Next planned step
 
-Decide which remaining ishu86 capabilities are worth reimplementing here.
-Recommended priority order: ~~(1) project lifecycle~~ **done 2026-07-29**,
-~~(2) asset management~~ **done 2026-07-29, see spec above**,
-~~(3) expression suite~~ **done 2026-07-29, see spec above**, (4) keyframe
-timeline manipulation (offset/scale/reverse/copy existing keyframes - not yet
-started). All are plain ExtendScript domain
-work and do not depend on ishu86's CEP architecture, so they can be written
-directly against this fork's existing bridge dispatcher (`executeCommand()`
-in `src/scripts/mcp-bridge-auto.jsx` + a matching `server.tool()`
-registration in `src/index.ts`) — the project-lifecycle tools are a
-concrete, already-verified template for exactly this kind of addition (see
-the spec
-section above for the wiring checklist).
+All four blocks on the original priority list are now complete:
+~~(1) project lifecycle~~, ~~(2) asset management~~, ~~(3) expression
+suite~~, ~~(4) keyframe timeline manipulation~~ - all done 2026-07-29. No
+5th block is currently planned. If one is wanted later, candidates noted
+along the way: ishu86's motion-graphics templates (lower thirds, title
+cards, transitions, logo reveals - a real category this fork still lacks),
+or the batch-expression-setter/template-introspection tools ishu86 itself
+built but never wired up (deferred in the expression-suite spec above).

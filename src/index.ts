@@ -319,6 +319,12 @@ server.tool(
       "addExpressionControl",
       "linkProperties",
       "applyExpressionTemplate",
+      "getKeyframes",
+      "offsetKeyframes",
+      "scaleKeyframeTiming",
+      "reverseKeyframes",
+      "copyKeyframes",
+      "applyEasyEase",
     ];
 
     if (!allowedScripts.includes(script)) {
@@ -1124,6 +1130,145 @@ server.tool(
     } catch (error) {
       return {
         content: [{ type: "text", text: `Error applying expression template: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "get-keyframes",
+  "Read every keyframe on a property: time, value, in/out interpolation, and in/out " +
+    "temporal ease (speed/influence). Covers Transform, effect, and text properties.",
+  {
+    ...LayerIdentifierSchema,
+    propertyName: z.string().describe("Name of the property to read (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("getKeyframes", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error getting keyframes: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "offset-keyframes",
+  "Shift every keyframe on a property by a fixed number of seconds, preserving each " +
+    "keyframe's value, interpolation, and ease. Keyframes that would land at a negative " +
+    "time are dropped (After Effects does not allow negative keyframe times) and reported.",
+  {
+    ...LayerIdentifierSchema,
+    propertyName: z.string().describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+    offsetSeconds: z.number().describe("Seconds to add to every keyframe's time (negative to shift earlier)."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("offsetKeyframes", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error offsetting keyframes: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "scale-keyframe-timing",
+  "Scale the timing of every keyframe on a property around an anchor time, preserving " +
+    "value/interpolation/ease. Keyframes that would land at a negative time are dropped " +
+    "and reported.",
+  {
+    ...LayerIdentifierSchema,
+    propertyName: z.string().describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+    scale: z.number().describe("Scale factor for the time between each keyframe and the anchor (e.g. 2 = twice as slow, 0.5 = twice as fast)."),
+    anchorTime: z.number().optional().describe("Time (seconds) the scale pivots around. Defaults to the property's first keyframe time."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("scaleKeyframeTiming", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error scaling keyframe timing: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "reverse-keyframes",
+  "Reverse the order of every keyframe on a property in time, correctly swapping each " +
+    "keyframe's in/out interpolation and ease so the animation plays backwards correctly.",
+  {
+    ...LayerIdentifierSchema,
+    propertyName: z.string().describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("reverseKeyframes", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error reversing keyframes: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "copy-keyframes",
+  "Copy every keyframe from one layer's property to another layer's property (which may " +
+    "be the same layer, a different property), preserving value/interpolation/ease. " +
+    "Additive - does not clear existing keyframes on the target.",
+  {
+    compIndex: z.number().int().positive().describe("1-based index of the composition (both layers must be in this comp)."),
+    sourceLayerIndex: z.number().int().positive().describe("1-based index of the layer to copy keyframes from."),
+    sourceProperty: z.string().describe("Name of the property to copy from (e.g., 'Position')."),
+    targetLayerIndex: z.number().int().positive().describe("1-based index of the layer to copy keyframes to."),
+    targetProperty: z.string().describe("Name of the property to copy to."),
+    timeOffset: z.number().optional().describe("Seconds added to each copied keyframe's time (default 0)."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("copyKeyframes", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error copying keyframes: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "apply-easy-ease",
+  "Apply After Effects' Easy Ease to one keyframe or, if keyframeIndex is omitted, to " +
+    "every keyframe on the property - matching how AE's own Easy Ease command behaves " +
+    "when multiple keyframes are selected.",
+  {
+    ...LayerIdentifierSchema,
+    propertyName: z.string().describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+    keyframeIndex: z.number().int().positive().optional().describe("1-based keyframe index. Omit to apply to all keyframes on the property."),
+    type: z.enum(["in", "out", "both"]).optional().describe("Which side(s) of the keyframe(s) to ease (default 'both')."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("applyEasyEase", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error applying easy ease: ${String(error)}` }],
         isError: true,
       };
     }

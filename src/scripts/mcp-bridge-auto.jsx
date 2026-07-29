@@ -861,6 +861,269 @@ function applyExpressionTemplate(args) {
     }
 }
 
+// ---- Keyframe-manipulation helpers ----
+// AE's scripting DOM has no setKeyTime() - keyTime is read-only - so moving,
+// scaling, or reversing keyframe times is forced to be a
+// snapshot -> clear-all -> rebuild-at-new-times cycle, not a shortcut.
+
+function _snapshotKeyframes(property) {
+    var snapshot = [];
+    for (var i = 1; i <= property.numKeys; i++) {
+        snapshot.push({
+            time: property.keyTime(i),
+            value: property.keyValue(i),
+            inInterp: property.keyInInterpolationType(i),
+            outInterp: property.keyOutInterpolationType(i),
+            inEase: property.keyInTemporalEase(i),
+            outEase: property.keyOutTemporalEase(i)
+        });
+    }
+    return snapshot;
+}
+
+function _clearAllKeyframes(property) {
+    while (property.numKeys > 0) {
+        property.removeKey(1);
+    }
+}
+
+// Rebuild keyframes from a snapshot array where each entry additionally has a
+// computed `newTime`. Entries with newTime < 0 are skipped (AE keyframes
+// cannot have negative time) and reported in the returned `dropped` list -
+// unlike ishu86's equivalent, which silently drops these while still
+// reporting the original key count as the number moved/scaled.
+function _rebuildKeyframesAtNewTimes(property, snapshot) {
+    var addedCount = 0;
+    var dropped = [];
+    for (var i = 0; i < snapshot.length; i++) {
+        var k = snapshot[i];
+        if (k.newTime < 0) {
+            dropped.push(k.time);
+            continue;
+        }
+        property.setValueAtTime(k.newTime, k.value);
+        var newIndex = findKeyIndexAtTime(property, k.newTime);
+        if (newIndex > 0) {
+            // Ease is set BEFORE interpolation type: setTemporalEaseAtKey appears to
+            // force/promote a key to BEZIER interpolation as a side effect, which
+            // would silently clobber a HOLD/LINEAR type if applied afterward - the
+            // interpolation-type call must be last so it's the one that sticks.
+            try { property.setTemporalEaseAtKey(newIndex, k.inEase, k.outEase); } catch (e) {}
+            try { property.setInterpolationTypeAtKey(newIndex, k.inInterp, k.outInterp); } catch (e) {}
+        }
+        addedCount++;
+    }
+    return { addedCount: addedCount, dropped: dropped };
+}
+
+function getKeyframes(args) {
+    try {
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var property = _resolveLayerProperty(cl.layer, args.propertyName);
+        if (!property) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' not found on layer '" + cl.layer.name + "'." });
+        }
+        var keys = [];
+        for (var i = 1; i <= property.numKeys; i++) {
+            var inEaseOut = null, outEaseOut = null;
+            try {
+                var inE = property.keyInTemporalEase(i);
+                var outE = property.keyOutTemporalEase(i);
+                inEaseOut = { speed: inE[0].speed, influence: inE[0].influence };
+                outEaseOut = { speed: outE[0].speed, influence: outE[0].influence };
+            } catch (e) {}
+            keys.push({
+                time: property.keyTime(i),
+                value: safeValue(property.keyValue(i)),
+                inInterp: enumName(KeyframeInterpolationType, property.keyInInterpolationType(i)),
+                outInterp: enumName(KeyframeInterpolationType, property.keyOutInterpolationType(i)),
+                inEase: inEaseOut,
+                outEase: outEaseOut
+            });
+        }
+        return JSON.stringify({ status: "success", numKeys: property.numKeys, keys: keys });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function offsetKeyframes(args) {
+    try {
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var property = _resolveLayerProperty(cl.layer, args.propertyName);
+        if (!property) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' not found on layer '" + cl.layer.name + "'." });
+        }
+        var offsetSeconds = (args.offsetSeconds !== undefined && args.offsetSeconds !== null) ? Number(args.offsetSeconds) : 0;
+        var snapshot = _snapshotKeyframes(property);
+        for (var i = 0; i < snapshot.length; i++) snapshot[i].newTime = snapshot[i].time + offsetSeconds;
+
+        _clearAllKeyframes(property);
+        var rebuilt = _rebuildKeyframesAtNewTimes(property, snapshot);
+
+        var out = { status: "success", keyframesMoved: rebuilt.addedCount };
+        if (rebuilt.dropped.length) {
+            out.note = "Dropped " + rebuilt.dropped.length + " keyframe(s) whose offset time would be negative (original times: " + rebuilt.dropped.join(", ") + ").";
+        }
+        return JSON.stringify(out);
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function scaleKeyframeTiming(args) {
+    try {
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var property = _resolveLayerProperty(cl.layer, args.propertyName);
+        if (!property) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' not found on layer '" + cl.layer.name + "'." });
+        }
+        if (property.numKeys === 0) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' has no keyframes to scale." });
+        }
+        var scale = Number(args.scale);
+        var snapshot = _snapshotKeyframes(property);
+        var anchorTime = (args.anchorTime !== undefined && args.anchorTime !== null) ? Number(args.anchorTime) : snapshot[0].time;
+        for (var i = 0; i < snapshot.length; i++) snapshot[i].newTime = anchorTime + (snapshot[i].time - anchorTime) * scale;
+
+        _clearAllKeyframes(property);
+        var rebuilt = _rebuildKeyframesAtNewTimes(property, snapshot);
+
+        var out = { status: "success", keyframesScaled: rebuilt.addedCount, anchorTime: anchorTime };
+        if (rebuilt.dropped.length) {
+            out.note = "Dropped " + rebuilt.dropped.length + " keyframe(s) whose scaled time would be negative (original times: " + rebuilt.dropped.join(", ") + ").";
+        }
+        return JSON.stringify(out);
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function reverseKeyframes(args) {
+    try {
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var property = _resolveLayerProperty(cl.layer, args.propertyName);
+        if (!property) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' not found on layer '" + cl.layer.name + "'." });
+        }
+        if (property.numKeys === 0) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' has no keyframes to reverse." });
+        }
+        var snapshot = _snapshotKeyframes(property);
+        var firstTime = snapshot[0].time;
+        var lastTime = snapshot[snapshot.length - 1].time;
+        var reversed = [];
+        for (var i = snapshot.length - 1; i >= 0; i--) {
+            var k = snapshot[i];
+            reversed.push({
+                newTime: firstTime + (lastTime - k.time),
+                value: k.value,
+                // In/out interpolation and ease swap on reversal: what was
+                // incoming becomes outgoing and vice versa.
+                inInterp: k.outInterp,
+                outInterp: k.inInterp,
+                inEase: k.outEase,
+                outEase: k.inEase
+            });
+        }
+
+        _clearAllKeyframes(property);
+        var rebuilt = _rebuildKeyframesAtNewTimes(property, reversed);
+
+        return JSON.stringify({ status: "success", keyframesReversed: rebuilt.addedCount });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function copyKeyframes(args) {
+    try {
+        var comp = app.project.items[args.compIndex];
+        if (!comp || !(comp instanceof CompItem)) {
+            return JSON.stringify({ status: "error", error: "Composition not found at index " + args.compIndex });
+        }
+        var sourceLayer = (args.sourceLayerIndex !== undefined && args.sourceLayerIndex !== null) ? comp.layers[args.sourceLayerIndex] : null;
+        var targetLayer = (args.targetLayerIndex !== undefined && args.targetLayerIndex !== null) ? comp.layers[args.targetLayerIndex] : null;
+        if (!sourceLayer) return JSON.stringify({ status: "error", error: "Source layer not found at index " + args.sourceLayerIndex });
+        if (!targetLayer) return JSON.stringify({ status: "error", error: "Target layer not found at index " + args.targetLayerIndex });
+
+        var sourceProp = _resolveLayerProperty(sourceLayer, args.sourceProperty);
+        var targetProp = _resolveLayerProperty(targetLayer, args.targetProperty);
+        if (!sourceProp) return JSON.stringify({ status: "error", error: "Source property '" + args.sourceProperty + "' not found on layer '" + sourceLayer.name + "'." });
+        if (!targetProp) return JSON.stringify({ status: "error", error: "Target property '" + args.targetProperty + "' not found on layer '" + targetLayer.name + "'." });
+
+        var timeOffset = (args.timeOffset !== undefined && args.timeOffset !== null) ? Number(args.timeOffset) : 0;
+        var snapshot = _snapshotKeyframes(sourceProp);
+        var copiedCount = 0;
+        for (var i = 0; i < snapshot.length; i++) {
+            var k = snapshot[i];
+            var newTime = k.time + timeOffset;
+            if (newTime < 0) continue;
+            targetProp.setValueAtTime(newTime, k.value);
+            var newIndex = findKeyIndexAtTime(targetProp, newTime);
+            if (newIndex > 0) {
+                // Same ordering fix as _rebuildKeyframesAtNewTimes above: ease first,
+                // interpolation type last, since setTemporalEaseAtKey appears to force
+                // a promotion to BEZIER that would otherwise clobber HOLD/LINEAR.
+                try { targetProp.setTemporalEaseAtKey(newIndex, k.inEase, k.outEase); } catch (e) {}
+                try { targetProp.setInterpolationTypeAtKey(newIndex, k.inInterp, k.outInterp); } catch (e) {}
+            }
+            copiedCount++;
+        }
+
+        return JSON.stringify({ status: "success", keysCopied: copiedCount });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function applyEasyEase(args) {
+    try {
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var property = _resolveLayerProperty(cl.layer, args.propertyName);
+        if (!property) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' not found on layer '" + cl.layer.name + "'." });
+        }
+        if (property.numKeys === 0) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' has no keyframes." });
+        }
+
+        var type = args.type || "both";
+        var indices = [];
+        if (args.keyframeIndex !== undefined && args.keyframeIndex !== null) {
+            indices.push(args.keyframeIndex);
+        } else {
+            // Omitted keyframeIndex means "all keyframes" - matches how AE's
+            // own Easy Ease command behaves with multiple keys selected,
+            // and is the more common real use case than one key at a time.
+            for (var i = 1; i <= property.numKeys; i++) indices.push(i);
+        }
+
+        for (var j = 0; j < indices.length; j++) {
+            var idx = indices[j];
+            if (idx < 1 || idx > property.numKeys) continue;
+            var currentIn = property.keyInTemporalEase(idx);
+            var currentOut = property.keyOutTemporalEase(idx);
+            // Temporal ease array length is per-property, not per value dimension:
+            // spatial properties like Position use ONE ease value for the whole
+            // motion path (unless dimensions are separated), not one per axis, so
+            // getPropertyDimensionCount() (based on the property's VALUE shape,
+            // e.g. 3 for [x,y,z]) does not reliably match what setTemporalEaseAtKey
+            // expects here. Read the expected length from the key's own existing
+            // ease array instead - guaranteed to match since it's the same key.
+            var easedIn = buildEaseArray(currentIn.length, 0, 33.33);
+            var easedOut = buildEaseArray(currentOut.length, 0, 33.33);
+            var newIn = (type === "in" || type === "both") ? easedIn : currentIn;
+            var newOut = (type === "out" || type === "both") ? easedOut : currentOut;
+            property.setTemporalEaseAtKey(idx, newIn, newOut);
+        }
+
+        return JSON.stringify({ status: "success", keyframesEased: indices.length, type: type });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
 function tryAddEffect(layer, identifier, mode) {
     if (!identifier) {
         return null;
@@ -2751,7 +3014,8 @@ var READ_ONLY_COMMANDS = {
     "getLayerClipFrames": true,
     "getLayerAudioInfo": true,
     "findMissingFootage": true,
-    "getExpression": true
+    "getExpression": true,
+    "getKeyframes": true
 };
 // MUST mirror getAETempDir() on the Node server side. On Windows we use
 // LOCALAPPDATA (never redirected by OneDrive) so both processes resolve to the
@@ -4333,6 +4597,36 @@ function executeCommand(command, args) {
                 logToPanel("Calling applyExpressionTemplate function...");
                 result = applyExpressionTemplate(args);
                 logToPanel("Returned from applyExpressionTemplate.");
+                break;
+            case "getKeyframes":
+                logToPanel("Calling getKeyframes function...");
+                result = getKeyframes(args);
+                logToPanel("Returned from getKeyframes.");
+                break;
+            case "offsetKeyframes":
+                logToPanel("Calling offsetKeyframes function...");
+                result = offsetKeyframes(args);
+                logToPanel("Returned from offsetKeyframes.");
+                break;
+            case "scaleKeyframeTiming":
+                logToPanel("Calling scaleKeyframeTiming function...");
+                result = scaleKeyframeTiming(args);
+                logToPanel("Returned from scaleKeyframeTiming.");
+                break;
+            case "reverseKeyframes":
+                logToPanel("Calling reverseKeyframes function...");
+                result = reverseKeyframes(args);
+                logToPanel("Returned from reverseKeyframes.");
+                break;
+            case "copyKeyframes":
+                logToPanel("Calling copyKeyframes function...");
+                result = copyKeyframes(args);
+                logToPanel("Returned from copyKeyframes.");
+                break;
+            case "applyEasyEase":
+                logToPanel("Calling applyEasyEase function...");
+                result = applyEasyEase(args);
+                logToPanel("Returned from applyEasyEase.");
                 break;
             case "applyEffect":
                 logToPanel("Calling applyEffect function...");
