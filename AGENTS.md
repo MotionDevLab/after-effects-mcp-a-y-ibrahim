@@ -63,6 +63,20 @@ Full inventory, exact resolution code per tool family, and why this was
 mitigated with documentation rather than a full code refactor:
 `CONTEXT.md`, "Known limitations" section.
 
+## Known gotcha: Puppet pin selection by matchName picks the wrong pin
+
+Animating an existing puppet-pinned layer (pins already placed by hand via
+AE's Puppet Pin tool - there's no scripting API to create the mesh itself)
+works through the existing `list-layer-effects`/`set-effect-property`
+tools, no dedicated puppet tool needed. But every pin's property group
+shares the **same matchName** (`"ADBE FreePin3 PosPin Atom"`) - unlike
+effects, where matchName is this codebase's usual recommended selector,
+matchName alone silently resolves to the wrong pin here. Select the
+specific pin by its **display name** (`"Puppet Pin 1"`, `"Puppet Pin 2"`,
+...) as one segment of `propertyPath`; every other segment in the path can
+safely use matchName. Full working example and verification details:
+`.claude/skills/ae-mcp-puppet-pin-selection/SKILL.md` and `GAPS.md`.
+
 ## Working conventions in this repo
 
 - One git branch per feature/tools block, stacked sequentially off the
