@@ -5047,7 +5047,7 @@ server.tool(
 
 server.tool(
   "inspect-comp",
-  "Map a whole composition: its settings (size, fps, duration, work area) plus every layer with a useful summary - index, id, name, type, enabled/locked/shy/solo, 3D/adjustment/null flags, in/out/start, parent, blend mode, effect count, mask count, has-audio. Use this to navigate a comp and decide what to edit, then call inspect-layer for one layer's full detail. Select the comp by compName/compIndex, or leave both empty for the active comp.",
+  "Map a whole composition: its settings (size, fps, duration, work area) plus every layer with a useful summary - index, id, name, type, enabled/locked/shy/solo, 3D/adjustment/null flags, in/out/start, parent, blend mode, effect count, mask count, has-audio. Use this to navigate a comp and decide what to edit, then call inspect-layer for one layer's full detail. Select the comp by compName/compIndex, or leave both empty for the active comp. The response's `comp.id` is AE's internal item id - it is NOT a valid `compIndex` for any other tool. Use `comp.projectPanelIndex` as `compIndex` for compIndex/layerIndex-style tools (setLayerKeyframe, apply-easy-ease, expression-suite tools, keyframe-manipulation tools), and `comp.compOrdinalIndex` as `compIndex` for compName-preferring tools (duplicate-layer, delete-layer, set-composition-properties, and others) - these two tool families use different, non-interchangeable `compIndex` numbering.",
   {
     compName: z
       .string()

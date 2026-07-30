@@ -5299,6 +5299,28 @@ function getCompFull(args) {
             id: comp.id, name: comp.name, width: comp.width, height: comp.height,
             duration: comp.duration, frameRate: comp.frameRate, numLayers: comp.numLayers
         };
+        // `id` above is AE's internal item id - NOT usable as any tool's `compIndex`
+        // argument (confirmed gotcha, see CONTEXT.md "Open issues"). This codebase has
+        // two different compIndex semantics (see CONTEXT.md "Known limitations"), so
+        // both resolvable indices are surfaced here to remove the guesswork:
+        // `Item.index` is not a real AE scripting property (there is no such
+        // field on Item/CompItem) - confirmed live, it silently no-opped inside
+        // this try/catch and the field never appeared. Computed by scan instead,
+        // same technique as the ordinal counter just below.
+        try {
+            for (var _pp = 1; _pp <= app.project.numItems; _pp++) {
+                if (app.project.item(_pp) === comp) { c.projectPanelIndex = _pp; break; }
+            }
+        } catch (e) {}
+        try {
+            var _ord = 0;
+            for (var _pi = 1; _pi <= app.project.numItems; _pi++) {
+                if (app.project.item(_pi) instanceof CompItem) {
+                    _ord++;
+                    if (app.project.item(_pi) === comp) { c.compOrdinalIndex = _ord; break; }
+                }
+            }
+        } catch (e) {}
         try { c.pixelAspect = comp.pixelAspect; } catch (e) {}
         try { c.workAreaStart = comp.workAreaStart; c.workAreaDuration = comp.workAreaDuration; } catch (e) {}
         try { c.bgColor = comp.bgColor; } catch (e) {}

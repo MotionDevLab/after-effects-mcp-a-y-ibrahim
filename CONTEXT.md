@@ -137,6 +137,65 @@ reload).
 - None currently open in this fork. (Update this section as new issues are
   found — don't let it silently go stale.)
 
+### `inspect-comp`'s `id` field invited a `compIndex` mix-up — FIXED 2026-07-31
+
+**Symptom** (found smoke-testing the socket transport): `inspect-comp`
+returns the comp's internal AE `id` (e.g. `id: 14`), but
+`setLayerKeyframe`/`apply-easy-ease` and the rest of the
+`LayerIdentifierSchema` family want `compIndex` — the comp's positional
+index (per whichever of the two resolution families the tool uses, see
+"Known limitations" below), a completely different number (e.g. `2` for the
+same comp in a 2-comp project). Passing the `id` value as `compIndex` didn't
+error clearly on its own terms — it threw AE's raw `"Value 14 out of range 1
+to 2"`, correct but easy to misread as an off-by-something bug rather than
+"wrong field entirely." `inspect-comp` didn't surface the project-panel or
+comp-ordinal index at all, only the internal `id`, so there was no field in
+its output a caller could correctly use for `compIndex`.
+
+**Fix (Option B of two considered — see below)**: `getCompFull()`
+(`src/scripts/mcp-bridge-auto.jsx`) now also returns `projectPanelIndex`
+(raw 1-based position via a scan for `app.project.item(i) === comp` — matches
+the `_resolveCompAndLayerSimple` family: `setLayerKeyframe`, `apply-easy-ease`,
+every expression-suite/keyframe-manipulation tool) and `compOrdinalIndex`
+(Nth `CompItem` specifically — matches the `_resolveComp` family:
+`duplicate-layer`, `delete-layer`, `set-composition-properties`, etc). The
+`inspect-comp` tool description in `src/index.ts` now explains both fields
+and which family each feeds. Deliberately scoped narrow: **did not** touch
+`_resolveCompAndLayerSimple` itself or add `compName` support to the tools
+that lack it (that's the other option considered, rejected as riskier —
+`_resolveCompAndLayerSimple` alone backs ~10 already-verified tools, so
+changing its resolution logic needs its own spec + branch + test script, not
+an inline patch alongside a doc-only task). Recorded as its own item since
+that broader fix is still open, just not attempted here.
+
+**One real bug found and fixed while implementing this**: the first attempt
+used `comp.index` for `projectPanelIndex`, assuming `Item` exposes its own
+positional index as a property. It does not — there is no such field on
+`Item`/`CompItem` in the AE scripting DOM. It silently no-opped inside the
+surrounding `try/catch` and the field never appeared in the response at all
+(caught by testing the actual output, not by inspecting the code). Fixed by
+computing it the same way as `compOrdinalIndex` — a scan for
+`app.project.item(i) === comp` — just without the `CompItem` filter.
+
+**Verified 2026-07-31** live against the running bridge (no dedicated
+`manual-tests/*.mjs` script for this one — small, additive, doc-adjacent
+fix): confirmed the coincidental case first (`projectPanelIndex ===
+compOrdinalIndex === 2` in a simple 2-comp project, not yet proof of
+correctness on its own), then deliberately forced true divergence by adding
+a solid (triggering AE's auto-created "Solids" folder) and a folder via
+`execute-script` positioned *before* the target comp — confirmed
+`projectPanelIndex: 4` vs `compOrdinalIndex: 3` for the same comp. Cross-
+checked each field against a real call in its actual tool family: `compIndex:
+4` (the `projectPanelIndex` value) succeeded on `setLayerKeyframe` (raw-
+positional family); `compIndex: 3` (the `compOrdinalIndex` value) succeeded
+on `set-composition-properties` (comp-ordinal family) and changed the
+correct comp's frameRate. Also incidentally reconfirmed AE's own instability
+noted in "Known limitations" below: a newly created comp is inserted right
+after the currently *active* item in the Project panel, not appended at the
+end — observed live while setting up the divergence case.
+
+**Files touched**: `src/scripts/mcp-bridge-auto.jsx`, `src/index.ts`
+
 ### External blocker: ishu86 CEP extension will not load (AE 2026)
 
 Not a bug in this fork, but recorded here since it shapes the comparison work.
