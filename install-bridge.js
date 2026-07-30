@@ -193,6 +193,31 @@ try {
   console.log('3. Enable "Allow Scripts to Write Files and Access Network"');
   console.log("4. Restart After Effects");
   console.log("5. Open the bridge panel: Window > mcp-bridge-auto.jsx");
+
+  // The panel's socket transport binds ALL interfaces (0.0.0.0 / [::]), not
+  // just loopback, because ExtendScript's Socket.listen() has no interface
+  // argument to restrict it. This script never touches firewall settings
+  // itself; it only prints the rule so the choice stays yours. See
+  // SECURITY.md for what the bridge's token does and does not protect
+  // against, which is why this rule is the real boundary.
+  console.log(
+    "\nOptional but recommended: the bridge's socket transport listens on ports " +
+      "47800-47815 on ALL network interfaces, not only this machine. Block inbound " +
+      "connections to that range from anything but yourself:",
+  );
+  if (isWindows) {
+    console.log(
+      '  New-NetFirewallRule -DisplayName "AE MCP Bridge (loopback only)" `\n' +
+        "    -Direction Inbound -Protocol TCP -LocalPort 47800-47815 -Action Block `\n" +
+        "    -RemoteAddress Internet,Intranet -Profile Any",
+    );
+  } else {
+    console.log(
+      "  Use the macOS Application Firewall, or pf, to block inbound TCP on " +
+        "47800-47815 from anything except 127.0.0.1.",
+    );
+  }
+  console.log("See SECURITY.md for the full explanation.");
 } catch (error) {
   console.error(`Error installing script: ${error.message}`);
   console.error("\nPlease try manual installation:");

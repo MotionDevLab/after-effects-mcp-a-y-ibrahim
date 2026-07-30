@@ -67,7 +67,11 @@ claude mcp add AfterEffectsMCP node /المسار/المطلق/إلى/after-effe
 ```
 
 **أول اختبار:** اطلب من العميل _«check the After Effects bridge»_. يجب أن يرد بـ
-`bridgeVersion: 1.10.0-mcp-enhanced` و`versionMatch: true`.
+`bridgeVersion: 1.12.0-mcp-socket` و`versionMatch: true`. إن ورد أيضا
+`socket.problem: null`، فهذا يعني أن اللوحة فتحت منفذ TCP حقيقيا وأن الأوامر
+تعمل عبره بدل النقل الاحتياطي الأبطأ القائم على الملفات - راجع
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) لشرح آلية النقلين، و
+[`SECURITY.md`](SECURITY.md) لما يكشفه المقبس (socket) وما لا يكشفه.
 
 > 💡 إن عدلت الخادم، أعد `npm run build` ثم أعد تشغيل عميل MCP.
 > إن عدلت الجسر، أعد أيضا `npm run install-bridge` وأعد تشغيل After Effects.

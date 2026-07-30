@@ -19,9 +19,27 @@ import {
   buildFfmpegConvertArgs,
   tail,
   nextPollDelay,
+  bridgeTimeoutResult,
   POLL_START_MS,
 } from "./lib/bridge-core.js";
+import {
+  parseRendezvous,
+  parseRendezvousFileName,
+  rendezvousFileName,
+  isSupportedRendezvous,
+  isStaleRendezvous,
+  selectRendezvous,
+  readTransportMode,
+  readPinnedPort,
+  shouldRediscover,
+  PROTOCOL_VERSION,
+  SOCKET_PORT_BASE,
+  SOCKET_PORT_TRIES,
+  type Rendezvous,
+} from "./lib/bridge-socket.js";
+import { sendOverSocket, canFallbackFrom, type SendPhase } from "./lib/bridge-socket-client.js";
 import { collectPresetFiles } from "./lib/preset-scan.js";
+import { resolvePathInput, assertMorphCompatible } from "./lib/shape-path.js";
 import { analyzeWavBuffer, WavAnalysis } from "./lib/wav.js";
 import { buildFrameContent, type FrameFile, type ContentBlock } from "./lib/see-frame.js";
 import {
@@ -61,6 +79,211 @@ function getAETempDir(): string {
     fs.mkdirSync(bridgeDir, { recursive: true });
   }
   return bridgeDir;
+}
+
+// ---------------------------------------------------------------------------
+// Transport selection
+//
+// The AE panel serves BOTH transports. This server prefers the socket and falls
+// back to files, so a panel older than 1.12 (which publishes no rendezvous file)
+// keeps working unchanged, and so does a new panel whose listener failed to bind
+// because the network permission is off. Policy lives in src/lib/bridge-socket.ts;
+// only the I/O is here.
+// ---------------------------------------------------------------------------
+
+const transportState = {
+  /** auto (default) | socket (never fall back, for CI) | file (kill switch). */
+  mode: readTransportMode(process.env),
+  /** AE_MCP_BRIDGE_PORT means "connect HERE only" on this side. */
+  pinnedPort: readPinnedPort(process.env),
+  rendezvous: null as Rendezvous | null,
+  lastDiscoveryAt: null as number | null,
+};
+
+/** The most recent successful bridge result, for the `get-results` tool. */
+let lastBridgeResult: { raw: string; transport: "socket" | "file"; at: number } | null = null;
+
+/**
+ * Every listener currently advertising itself in the bridge folder. Never
+ * throws: a half-written or hand-mangled file is simply not a listener, which
+ * the caller already has to tolerate because the panel can die between
+ * publishing the file and binding the port.
+ *
+ * Files whose protocol version we do NOT speak are returned too, rather than
+ * being dropped here. Selection filters them out (see discoverNow), but
+ * check-bridge has to be able to say "a newer panel is listening on 47800 and
+ * this server is too old for it" instead of the flatly wrong "no listener
+ * found", which would send the user off reinstalling a panel that is fine.
+ */
+function readAllRendezvous(): Rendezvous[] {
+  const found: Rendezvous[] = [];
+  let dir: string;
+  let names: string[];
+  try {
+    dir = getAETempDir();
+    names = fs.readdirSync(dir);
+  } catch {
+    return found;
+  }
+  for (const name of names) {
+    const port = parseRendezvousFileName(name);
+    if (port === null) continue;
+    try {
+      const parsed = parseRendezvous(fs.readFileSync(path.join(dir, name), "utf8"), port);
+      if (parsed) found.push(parsed);
+    } catch {
+      /* unreadable or mid-write: skip it, discovery runs again in REDISCOVER_MS */
+    }
+  }
+  return found;
+}
+
+/**
+ * Re-read the bridge folder right now and refresh the cache, returning both the
+ * full listener list and the one we would talk to. check-bridge needs the list
+ * and must never report a selection up to REDISCOVER_MS out of date; every other
+ * caller goes through maybeDiscover and gets the cached answer.
+ */
+function discoverNow(): { listeners: Rendezvous[]; selected: Rendezvous | null } {
+  const listeners = readAllRendezvous();
+  const selected = selectRendezvous(
+    listeners.filter(isSupportedRendezvous),
+    transportState.pinnedPort,
+  );
+  transportState.lastDiscoveryAt = Date.now();
+  transportState.rendezvous = selected;
+  return { listeners, selected };
+}
+
+/**
+ * The listener to talk to, cached for REDISCOVER_MS. The cache is what keeps a
+ * closed panel cheap: it costs one wasted connection refusal every 5 seconds
+ * rather than a directory scan plus a refusal on every single command.
+ */
+function maybeDiscover(): Rendezvous | null {
+  if (!shouldRediscover(transportState.lastDiscoveryAt, Date.now())) {
+    return transportState.rendezvous;
+  }
+  return discoverNow().selected;
+}
+
+/**
+ * A socket attempt failed. Drop the cached target so the next command
+ * rediscovers rather than retrying a listener we just proved is not there.
+ *
+ * Only a `connect` failure proves the port is dead, and only then is deleting
+ * the rendezvous file justified, and only once it is old enough that no live
+ * panel could still own it. Deleting on any other phase would race a working
+ * panel that merely hit one bad command.
+ */
+function noteSocketFailure(target: Rendezvous, phase: SendPhase): void {
+  transportState.rendezvous = null;
+  transportState.lastDiscoveryAt = null;
+  if (phase !== "connect") return;
+  if (!isStaleRendezvous(target, Date.now())) return;
+  try {
+    fs.unlinkSync(path.join(getAETempDir(), rendezvousFileName(target.port)));
+    console.error(`Removed stale bridge rendezvous file for port ${target.port}.`);
+  } catch {
+    /* already gone, or not ours to remove */
+  }
+}
+
+/**
+ * Why the socket transport is not usable, as check-bridge reports it.
+ *
+ * The plan sketched six states; these eleven are what the SendPhase/reason pairs
+ * actually distinguish, and each one has a DIFFERENT fix. Collapsing them would
+ * throw away the entire point of the socket transport's diagnostics: today all
+ * of "panel not open", "wrong AE instance", "AE busy" and "permission off"
+ * arrive as one indistinguishable timeout.
+ *
+ * `null` means, and must only mean, that the tools really would use the socket.
+ */
+type SocketProblem =
+  | null
+  /** AE_MCP_BRIDGE_TRANSPORT=file. The kill switch is on; we never even look. */
+  | "transport-disabled"
+  /** The panel says Allow Scripts to Write Files and Access Network is off. */
+  | "permission-disabled"
+  /** Nothing published a rendezvous file: no panel open, or a panel older than 1.12. */
+  | "no-rendezvous"
+  /** AE_MCP_BRIDGE_PORT names a port no listener published. */
+  | "pinned-port-not-found"
+  /** The listener speaks a protocol version this server does not. */
+  | "protocol-mismatch"
+  /** The published port refuses: the panel that wrote the file is gone. */
+  | "connection-refused"
+  /** Could not connect for some other reason, e.g. a firewall dropping the SYN. */
+  | "connect-failed"
+  /** The panel refused our token, so the rendezvous file we read is not its own. */
+  | "token-rejected"
+  /** Connected, but nothing identified itself as the bridge: AE busy, or a foreign process. */
+  | "no-acknowledgement"
+  /** Our bridge ACKed and then did not answer: After Effects is busy. */
+  | "acknowledged-no-result";
+
+/**
+ * Turn a failed socket attempt into the problem check-bridge reports.
+ *
+ * This has to agree with sendBridgeCommand's view of the SAME phase, or
+ * check-bridge would describe a bridge in a state the tools do not actually see.
+ * The mapping is deliberately conservative: anything that proves the peer is our
+ * panel (it ACKed) is reported as a busy panel, and anything that does not is
+ * reported as "we could not identify what is on that port".
+ */
+function classifySocketFailure(phase: SendPhase, reason: string): SocketProblem {
+  switch (phase) {
+    case "connect":
+      // ECONNREFUSED (and an immediate close) means the port is simply closed,
+      // which is the ordinary "panel was shut down" case and needs no firewall
+      // advice. Anything else did not get a clean refusal, so something is
+      // swallowing the connection.
+      return reason === "ECONNREFUSED" || reason === "closed"
+        ? "connection-refused"
+        : "connect-failed";
+    case "auth":
+      if (reason === "unauthorized") return "token-rejected";
+      if (reason === "protocol-mismatch") return "protocol-mismatch";
+      return "no-acknowledgement";
+    case "ack":
+      return "no-acknowledgement";
+    default:
+      // io / deadline. Both happen only AFTER a valid ACK, so the peer IS our
+      // panel and the same reasoning that forbids a fallback retry applies here.
+      return "acknowledged-no-result";
+  }
+}
+
+/** What to actually do about a SocketProblem. One concrete next step each. */
+function socketProblemHint(
+  problem: SocketProblem,
+  ctx: { port?: number; pinnedPort: number | null },
+): string | null {
+  switch (problem) {
+    case null:
+      return null;
+    case "transport-disabled":
+      return "AE_MCP_BRIDGE_TRANSPORT=file is set, so this server uses the slower file transport only. Unset it (or set it to 'auto') and restart the MCP client to use the socket.";
+    case "permission-disabled":
+      return "In After Effects, enable Edit > Preferences > Scripting & Expressions > Allow Scripts to Write Files and Access Network, then FULLY restart After Effects. Commands still work over the file transport meanwhile, just slower.";
+    case "no-rendezvous":
+      return "No panel published a listener. Open Window > mcp-bridge-auto.jsx, check that its Socket checkbox is ticked, and confirm the panel's Transport section shows LISTENING. A panel older than 1.12 has no socket at all: run `npm run install-bridge` and reopen it. Commands still work over the file transport meanwhile.";
+    case "pinned-port-not-found":
+      return `AE_MCP_BRIDGE_PORT=${ctx.pinnedPort} pins this server to one port and no panel is listening there. Set the panel's Port field to ${ctx.pinnedPort} and press Apply, or unset the variable to use the lowest listening port automatically.`;
+    case "protocol-mismatch":
+      return "The panel speaks a newer bridge protocol than this server. Update the MCP server package (this is the reverse of the usual mismatch: the panel is ahead, not behind).";
+    case "connection-refused":
+      return `Nothing is listening on port ${ctx.port}; the panel that published it is gone. Reopen Window > mcp-bridge-auto.jsx, or press Restart listener in the panel. The stale rendezvous file is cleaned up automatically once it is a day old.`;
+    case "connect-failed":
+      return `Port ${ctx.port} neither answered nor refused, which usually means a firewall is dropping the connection. Allow loopback TCP on ports ${SOCKET_PORT_BASE}-${SOCKET_PORT_BASE + SOCKET_PORT_TRIES - 1} for After Effects, or set AE_MCP_BRIDGE_TRANSPORT=file to stay on the file transport.`;
+    case "token-rejected":
+      return `The process on port ${ctx.port} rejected the token in the rendezvous file, so the two do not belong together. Press Restart listener in the panel to republish, or delete ae_bridge_port_${ctx.port}.json from the bridge folder if another program owns that port.`;
+    case "no-acknowledgement":
+      return `Something is listening on port ${ctx.port} but did not identify itself as the bridge. Either After Effects is busy (rendering, or a modal dialog is open, which also blocks the panel's timer) or another program has taken that port. Check After Effects first, then press Restart listener to move to a free port.`;
+    case "acknowledged-no-result":
+      return "The panel acknowledged the health check and then did not answer, which means After Effects is busy: a render, a long script, or a modal dialog waiting for a click. Nothing is broken; wait for it to finish.";
+  }
 }
 
 function readResultsFromTempFile(): string {
@@ -164,15 +387,20 @@ async function waitForBridgeResult(
     await new Promise((r) => setTimeout(r, delay));
     delay = nextPollDelay(delay, pollMs);
   }
-  return JSON.stringify({
-    error: `Timed out waiting for bridge result${expectedCommand ? ` for command '${expectedCommand}'` : ""}.`,
-  });
+  return bridgeTimeoutResult(expectedCommand);
 }
 
-function writeCommandFile(command: string, args: Record<string, any> = {}): string {
+// `existingId` lets the caller mint the id ONCE and share it across both
+// transports, so a socket attempt and its file-transport retry carry the same
+// _commandId and the panel's own dedup can recognize them as one command.
+function writeCommandFile(
+  command: string,
+  args: Record<string, any> = {},
+  existingId?: string,
+): string {
   try {
     const commandFile = path.join(getAETempDir(), "ae_command.json");
-    const commandId = nextCommandId();
+    const commandId = existingId || nextCommandId();
     lastCommandId = commandId;
     const commandData = {
       command,
@@ -222,11 +450,29 @@ function bridgeMutex<T>(fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
-// One-stop bridge call used by every tool: atomically (under the mutex) clear the
-// result file, write the command with a unique id, and wait for the matching
-// result. Returns the raw result string, or a synthetic {status:"error"} JSON if
-// the command file could not be written (permission / OneDrive), so callers never
-// silently fall back to a previous command's id.
+// One-stop bridge call used by every tool. Tries the TCP socket first and falls
+// back to the file transport, all under the mutex so each bridge interaction
+// stays atomic with respect to the others.
+//
+// The signature and contract are UNCHANGED from the file-only version: returns
+// the raw result string, returns a synthetic {"error":"Timed out..."} on timeout,
+// returns a {status:"error"} envelope if the command could not be delivered at
+// all, and never throws. All 83 call sites and the bridgeToolResult wiring are
+// untouched. `pollMs` is kept because it still governs the file fallback.
+//
+// WHEN IS FALLING BACK SAFE? Only from a state that proves nothing executed.
+// The panel writes its ACK BEFORE dispatching to executeCommand, which is what
+// makes that provable:
+//
+//   phase "connect"  -> FALL BACK. Zero bytes reached a socket.
+//   phase "ack"      -> FALL BACK. No valid ACK, so the panel never dispatched.
+//   phase "auth"     -> FALL BACK. The panel refused before dispatching.
+//   phase "io"       -> DO NOT. Failed AFTER a valid ACK; the command may have run.
+//   phase "deadline" -> DO NOT. Same, and this reproduces today's exact behavior.
+//
+// Retrying a command that already ran would double-execute it, and deleteLayer
+// is not idempotent. That is the entire argument; canFallbackFrom() in
+// src/lib/bridge-socket-client.ts is where it is encoded.
 async function sendBridgeCommand(
   command: string,
   args: Record<string, any> = {},
@@ -234,15 +480,90 @@ async function sendBridgeCommand(
   pollMs: number = 250,
 ): Promise<string> {
   return bridgeMutex(async () => {
+    // Minted once and shared by both transports, so a fallback retry carries the
+    // same id the socket attempt used.
+    const id = nextCommandId();
+
+    if (transportState.mode !== "file") {
+      const target = maybeDiscover();
+
+      if (!target) {
+        if (transportState.mode === "socket") {
+          return JSON.stringify({
+            status: "error",
+            error: `No After Effects bridge listener found in ${getAETempDir()}. AE_MCP_BRIDGE_TRANSPORT=socket forbids the file fallback. Open the MCP Bridge Auto panel, or unset the variable to allow files.`,
+          });
+        }
+        // No listener published: an older panel, or one whose bind failed. The
+        // file transport is exactly right here, so this is not even a warning.
+      } else {
+        const sent = await sendOverSocket({
+          port: target.port,
+          token: target.token,
+          commandId: id,
+          command,
+          args,
+          timeoutMs,
+        });
+
+        if (sent.ok) {
+          lastCommandId = id;
+          lastBridgeResult = { raw: sent.raw, transport: "socket", at: Date.now() };
+          return sent.raw;
+        }
+
+        noteSocketFailure(target, sent.phase);
+
+        if (!sent.canFallback) {
+          // The command may already be running inside AE. Retrying it over the
+          // file transport could execute it a second time, so we report instead.
+          if (sent.phase === "deadline") {
+            // Byte for byte what the file transport returns on a timeout, so a
+            // slow command looks the same to every caller on either transport.
+            return bridgeTimeoutResult(command);
+          }
+          return JSON.stringify({
+            status: "error",
+            error: `The After Effects bridge connection failed after the command was acknowledged (${sent.reason}). The command may have already run, so it was NOT retried. Check the panel's log before running it again.`,
+            _commandId: id,
+            _transport: "socket",
+          });
+        }
+
+        if (transportState.mode === "socket") {
+          return JSON.stringify({
+            status: "error",
+            error: `The socket transport failed (${sent.phase}: ${sent.error}). AE_MCP_BRIDGE_TRANSPORT=socket forbids the file fallback.`,
+            _commandId: id,
+            _transport: "socket",
+          });
+        }
+
+        console.error(
+          `Socket transport unavailable for '${command}' (${sent.phase}: ${sent.reason}); falling back to the file transport.`,
+        );
+      }
+    }
+
+    // File transport: unchanged from before the socket existed.
     clearResultsFile();
-    const id = writeCommandFile(command, args);
-    if (!id) {
+    const written = writeCommandFile(command, args, id);
+    if (!written) {
       return JSON.stringify({
         status: "error",
         error: `Failed to write the '${command}' command to the bridge folder. Check folder permissions / that it is not a OneDrive-redirected path.`,
       });
     }
-    return waitForBridgeResult(command, timeoutMs, pollMs, id);
+    const raw = await waitForBridgeResult(command, timeoutMs, pollMs, id);
+    // Cache only what After Effects actually returned. waitForBridgeResult
+    // synthesizes bridgeTimeoutResult() when nothing answered, and caching that
+    // would make get-results report a timeout as "the last result" while
+    // discarding the last real one, which is precisely the result a user runs
+    // get-results to recover after a command appeared to hang.
+    if (raw !== bridgeTimeoutResult(command)) {
+      lastBridgeResult = { raw, transport: "file", at: Date.now() };
+    }
+    return raw;
   });
 }
 
@@ -303,6 +624,45 @@ server.tool(
       "getLayerFull",
       "getCompFull",
       "bridgeTestEffects",
+      "createProject",
+      "openProject",
+      "saveProject",
+      "closeProject",
+      "importFootage",
+      "importFolder",
+      "replaceFootage",
+      "findMissingFootage",
+      "collectFiles",
+      "reduceProject",
+      "organizeProjectItems",
+      "getExpression",
+      "enableExpression",
+      "addExpressionControl",
+      "linkProperties",
+      "applyExpressionTemplate",
+      "getKeyframes",
+      "offsetKeyframes",
+      "scaleKeyframeTiming",
+      "reverseKeyframes",
+      "copyKeyframes",
+      "applyEasyEase",
+      "createLowerThird",
+      "createTitleCard",
+      "createTransition",
+      "createLogoReveal",
+      "createTextAnimator",
+      "duplicateComposition",
+      "deleteComposition",
+      "addLightLayer",
+      "precomposeLayers",
+      "reorderEffects",
+      "copyEffects",
+      "deleteMarker",
+      "setWorkArea",
+      "batchSetExpression",
+      "setTimeRemap",
+      "setShapePath",
+      "getShapePath",
     ];
 
     if (!allowedScripts.includes(script)) {
@@ -335,12 +695,61 @@ server.tool(
   },
 );
 
+/** How old an in-memory result may be before get-results says so. */
+const RESULT_FRESH_MS = 30 * 1000;
+
+/**
+ * Stamp the cached result with where it came from and how old it is.
+ *
+ * The annotation is additive and never overwrites a field the panel already
+ * set: the panel stamps its own `_transport` on every result, and on the socket
+ * transport that stamp is the more authoritative of the two. A non-JSON result
+ * is passed through byte for byte, exactly as the file path has always done.
+ */
+function annotateCachedResult(
+  cached: { raw: string; transport: "socket" | "file"; at: number },
+  now: number,
+): string {
+  const ageMs = now - cached.at;
+  let parsed: any;
+  try {
+    parsed = JSON.parse(cached.raw);
+  } catch {
+    return cached.raw;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return cached.raw;
+
+  parsed._source = "server-memory";
+  parsed._ageMs = ageMs;
+  if (parsed._transport === undefined) parsed._transport = cached.transport;
+  if (ageMs > RESULT_FRESH_MS) {
+    // Deliberately NOT phrased as a malfunction. On the file transport a result
+    // older than 30s meant the panel had probably stopped writing; a cached
+    // result older than 30s just means no command has run recently, which is
+    // the normal state of an idle session.
+    parsed._note = `This is the result of the last command, which finished ${Math.round(ageMs / 1000)}s ago. Nothing has run since.`;
+  }
+  return JSON.stringify(parsed, null, 2);
+}
+
 server.tool(
   "get-results",
-  "Get results from the last script executed in After Effects",
+  "Get the result of the last command this server sent to After Effects. Works on both transports: the socket returns results in-band, so there is no result file to read.",
   {},
   async () => {
     try {
+      // The socket transport hands the result straight back over the connection
+      // and never writes ae_mcp_result.json, so reading that file would return
+      // whatever the last FILE-transport command left behind, which on a healthy
+      // socket session can be hours stale or absent entirely. The in-memory
+      // cache is the only correct source once the socket is in use.
+      //
+      // The file read is still the right fallback rather than dead code: a
+      // freshly started server that attaches to a session someone else's server
+      // already ran has an empty cache but a perfectly good result file.
+      if (lastBridgeResult) {
+        return bridgeToolResult(annotateCachedResult(lastBridgeResult, Date.now()));
+      }
       const result = readResultsFromTempFile();
       return bridgeToolResult(result);
     } catch (error) {
@@ -427,13 +836,14 @@ To use this integration with After Effects, follow these steps:
    - The panel will automatically check for commands every few seconds
 
 4. **Run scripts through MCP**
-   - Use the \`run-script\` tool to queue a command
-   - The Auto panel will detect and run the command automatically
-   - Results will be saved to a temp file
+   - Use the \`run-script\` tool to run a command
+   - The panel picks it up and runs it automatically
+   - The tool waits for the command and returns its result directly
 
-5. **Get results through MCP**
-   - After a command is executed, use the \`get-results\` tool
-   - This will retrieve the results from After Effects
+5. **Get results again through MCP**
+   - \`get-results\` re-reads the result of the last command
+   - You do not need it in normal use, since every tool already returns its
+     own result; it is for recovering a result you lost track of
 
 Available scripts:
 - getProjectInfo: Information about the current project
@@ -478,6 +888,304 @@ Note: The auto-running panel can be left open in After Effects to continuously l
     ],
   };
 });
+
+const SAVE_FIRST_DESCRIPTION =
+  "Required, no default. If true, save the current/outgoing project first " +
+  "(if it has unsaved changes) - errors instead of proceeding if it has never " +
+  "been saved to a file path. If false, any unsaved changes in the " +
+  "current/outgoing project are discarded. This tool never relies on After " +
+  "Effects' own 'save changes?' prompt (dialogs are suppressed for all bridge " +
+  "commands), so you must decide explicitly.";
+
+server.tool(
+  "create-project",
+  "Create a new, empty After Effects project, replacing the currently open one. " +
+    "Because this can discard unsaved work, saveFirst is required with no default.",
+  {
+    saveFirst: z.boolean().describe(SAVE_FIRST_DESCRIPTION),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("createProject", params, 15000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error creating project: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "open-project",
+  "Open an After Effects project (.aep) file, replacing the currently open one. " +
+    "Because this can discard unsaved work, saveFirst is required with no default.",
+  {
+    filePath: z.string().describe("Absolute path to the .aep project file to open."),
+    saveFirst: z.boolean().describe(SAVE_FIRST_DESCRIPTION),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("openProject", params, 20000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error opening project: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "save-project",
+  "Save the current After Effects project. Omit filePath to save to the " +
+    "project's existing file path (errors if it has never been saved); " +
+    "provide filePath to save-as.",
+  {
+    filePath: z
+      .string()
+      .optional()
+      .describe(
+        "Absolute path to save to (save-as). Omit to save to the project's existing file path.",
+      ),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("saveProject", params, 20000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error saving project: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "close-project",
+  "Close the current After Effects project. Because this can discard unsaved " +
+    "work, saveFirst is required with no default. After closing, After Effects " +
+    "typically opens a new blank untitled project automatically.",
+  {
+    saveFirst: z.boolean().describe(SAVE_FIRST_DESCRIPTION),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("closeProject", params, 15000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error closing project: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "import-footage",
+  "Import a file into the After Effects project as footage.",
+  {
+    filePath: z.string().describe("Absolute path to the file to import."),
+    name: z
+      .string()
+      .optional()
+      .describe("Optional name to give the imported item (defaults to the file name)."),
+    sequence: z
+      .boolean()
+      .optional()
+      .describe("Import as an image sequence (treats the file as the first frame of a sequence)."),
+    forceAlphabetical: z
+      .boolean()
+      .optional()
+      .describe("When importing a sequence, force alphabetical ordering of frames."),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("importFootage", params, 15000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error importing footage: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "import-folder",
+  "Import every supported file in a folder into the project, optionally recursing into " +
+    "subfolders (creating a matching project-panel folder structure). Files that fail to " +
+    "import are skipped and reported individually rather than silently dropped.",
+  {
+    folderPath: z.string().describe("Absolute path to the folder to import."),
+    recursive: z
+      .boolean()
+      .optional()
+      .describe("Recurse into subfolders, creating a matching project-panel folder for each."),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("importFolder", params, 30000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error importing folder: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "replace-footage",
+  "Replace a project item's source file with a different file, keeping the same item " +
+    "(and all its usages in compositions) in place. Target the item by itemId or itemName.",
+  {
+    itemId: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("Project item id (from getProjectInfo/inspect-comp)."),
+    itemName: z.string().optional().describe("Project item name (alternative to itemId)."),
+    newPath: z.string().describe("Absolute path to the replacement file."),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("replaceFootage", params, 15000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error replacing footage: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "find-missing-footage",
+  "List every footage item in the project whose source file is currently missing/offline.",
+  {},
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("findMissingFootage", params, 10000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error finding missing footage: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "collect-files",
+  "Copy the project's footage files and the project file itself into an output folder, " +
+    "for archiving or sharing a self-contained copy. The currently open project's own file " +
+    "path is never changed by this - it copies the existing saved .aep file rather than " +
+    "saving a new one, so requires the project to already be saved.",
+  {
+    outputPath: z
+      .string()
+      .describe("Absolute path to the output folder (created if it doesn't exist)."),
+    includeFootage: z
+      .boolean()
+      .optional()
+      .describe("Copy referenced footage files into an output/footage subfolder (default true)."),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("collectFiles", params, 60000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error collecting files: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "reduce-project",
+  "Permanently delete every project item not used by the given composition(s), keeping " +
+    "only what those comps depend on. This is a native After Effects operation and is not " +
+    "reliably undoable. Requires confirm:true (no default) and at least one compName - " +
+    "there is no fallback to the active composition, to avoid silently reducing based on " +
+    "whatever happens to be active.",
+  {
+    compNames: z
+      .array(z.string())
+      .min(1)
+      .describe("Names of the composition(s) whose dependencies should be kept."),
+    confirm: z
+      .boolean()
+      .describe(
+        "Required, no default. Must be true to proceed - this permanently deletes unused project items.",
+      ),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("reduceProject", params, 30000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error reducing project: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "organize-project-items",
+  "Organize top-level project panel items into folders. structure:'type' groups by " +
+    "Compositions/Footage/Solids; 'usage' groups by Used/Unused (referenced in any comp or " +
+    "not); 'custom' creates the folders you specify in customFolders and moves the named " +
+    "items into them.",
+  {
+    structure: z
+      .enum(["type", "usage", "custom"])
+      .optional()
+      .describe("Organization scheme to apply (default 'type')."),
+    customFolders: z
+      .array(
+        z.object({
+          folderName: z.string().describe("Name of the folder to create."),
+          itemNames: z
+            .array(z.string())
+            .optional()
+            .describe("Project item names to move into this folder."),
+          itemIds: z
+            .array(z.number().int())
+            .optional()
+            .describe(
+              "Project item ids to move into this folder (alternative/addition to itemNames).",
+            ),
+        }),
+      )
+      .optional()
+      .describe("Required when structure is 'custom'. One entry per folder to create."),
+  },
+  async (params) => {
+    try {
+      const result = await sendBridgeCommand("organizeProjectItems", params, 20000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error organizing project items: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
 
 server.tool(
   "create-composition",
@@ -634,6 +1342,95 @@ const LayerIdentifierSchema = {
     .describe("1-based index of the target layer within the composition."),
 };
 
+const CompIdentifierSchema = {
+  compName: z.string().optional().describe("Composition name (or active comp if omitted)."),
+  compIndex: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe(
+      "1-based index among compositions only (the Nth comp in the project), if compName is omitted.",
+    ),
+};
+
+/**
+ * A 2D point or bezier handle. Tuple-typed rather than z.array(z.number()) so a
+ * malformed [x, y, z] is rejected at the schema instead of reaching After
+ * Effects, which accepts malformed path data silently (see lib/shape-path.ts).
+ */
+const Vec2Schema = z.tuple([z.number(), z.number()]);
+
+const PathGeneratorSchema = z
+  .discriminatedUnion("type", [
+    z.object({
+      type: z.literal("roundedRect"),
+      width: z.number().positive(),
+      height: z.number().positive(),
+      radius: z
+        .number()
+        .min(0)
+        .optional()
+        .describe("Corner radius; clamped to half the shorter side."),
+      center: Vec2Schema.optional(),
+    }),
+    z.object({
+      type: z.literal("ellipse"),
+      width: z.number().positive(),
+      height: z.number().positive(),
+      center: Vec2Schema.optional(),
+    }),
+    z.object({
+      type: z.literal("polygon"),
+      points: z.number().int().min(3).describe("Number of sides."),
+      radius: z.number().positive(),
+      center: Vec2Schema.optional(),
+      rotation: z
+        .number()
+        .optional()
+        .describe("Clockwise degrees; 0 puts the first vertex straight up."),
+    }),
+    z.object({
+      type: z.literal("star"),
+      points: z
+        .number()
+        .int()
+        .min(3)
+        .describe("Number of star points; the path gets twice this many vertices."),
+      outerRadius: z.number().positive(),
+      innerRadius: z.number().positive(),
+      center: Vec2Schema.optional(),
+      rotation: z
+        .number()
+        .optional()
+        .describe("Clockwise degrees; 0 puts the first outer point straight up."),
+    }),
+  ])
+  .describe("Build the path from a shape generator instead of explicit vertices.");
+
+const PathShapeSchema = {
+  vertices: z
+    .array(Vec2Schema)
+    .min(2)
+    .optional()
+    .describe(
+      "Path vertices as [x,y] pairs, in LAYER space (origin = the layer's anchor point), y positive DOWN.",
+    ),
+  inTangents: z
+    .array(Vec2Schema)
+    .optional()
+    .describe(
+      "Bezier in-handles, one per vertex, RELATIVE to their own vertex. Must match the vertex count exactly. Omit for straight segments.",
+    ),
+  outTangents: z
+    .array(Vec2Schema)
+    .optional()
+    .describe(
+      "Bezier out-handles, one per vertex, RELATIVE to their own vertex. Must match the vertex count exactly. Omit for straight segments.",
+    ),
+  closed: z.boolean().optional().describe("Whether the path is closed (default: true)."),
+};
+
 const KeyframeValueSchema = z
   .any()
   .describe(
@@ -701,6 +1498,646 @@ server.tool(
             text: `Error queuing setLayerExpression command: ${String(error)}`,
           },
         ],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "get-expression",
+  "Read a property's current expression, whether it's enabled, and any expression error.",
+  {
+    ...LayerIdentifierSchema,
+    propertyName: z
+      .string()
+      .describe("Name of the property to read (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("getExpression", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error getting expression: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "enable-expression",
+  "Toggle a property's expression on/off without changing the expression string itself " +
+    "(unlike setLayerExpression, which requires supplying or clearing the actual text).",
+  {
+    ...LayerIdentifierSchema,
+    propertyName: z
+      .string()
+      .describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+    enabled: z.boolean().describe("Whether the expression should be enabled."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("enableExpression", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error toggling expression: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "add-expression-control",
+  "Add an expression control effect (Slider/Color/Point/Checkbox/Dropdown/Angle/Layer " +
+    "Control) to a layer, for driving expressions on other properties from a single " +
+    "user-adjustable value. Note: Dropdown Control's default value cannot be set via " +
+    "scripting - the control is created but defaultValue is ignored for that type.",
+  {
+    ...LayerIdentifierSchema,
+    controlType: z
+      .enum(["slider", "color", "point", "checkbox", "dropdown", "angle", "layer"])
+      .describe("Type of control effect to add."),
+    controlName: z.string().describe("Name to give the new effect."),
+    defaultValue: z
+      .any()
+      .optional()
+      .describe("Initial value for the control (ignored for dropdown - see note above)."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("addExpressionControl", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error adding expression control: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "link-properties",
+  "Make one property follow another property's live value via a one-way expression " +
+    "(e.g. 'Position tracks another layer's Position'). This is NOT After Effects parenting - " +
+    "it's a hand-written expression, same-comp only, and breaks if the target layer/property " +
+    "is later renamed or deleted.",
+  {
+    compIndex: z
+      .number()
+      .int()
+      .positive()
+      .describe("1-based index of the composition (both layers must be in this comp)."),
+    sourceLayerIndex: z
+      .number()
+      .int()
+      .positive()
+      .describe("1-based index of the layer whose property will follow the target."),
+    sourceProperty: z
+      .string()
+      .describe("Name of the property to set the expression on (e.g., 'Position')."),
+    targetLayerIndex: z.number().int().positive().describe("1-based index of the layer to follow."),
+    targetProperty: z.string().describe("Name of the property to follow on the target layer."),
+    offset: z
+      .union([z.number(), z.array(z.number())])
+      .optional()
+      .describe(
+        "Optional value added to the target's value (a single number or an array matching the property's dimensions).",
+      ),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("linkProperties", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error linking properties: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "apply-expression-template",
+  "Apply a well-known parameterized expression template to a property: wiggle, loop " +
+    "(loopOut), time (time remapping/speed), bounce, inertia, or overshoot.",
+  {
+    ...LayerIdentifierSchema,
+    propertyName: z
+      .string()
+      .describe("Name of the property to apply the expression to (e.g., 'Position', 'Rotation')."),
+    template: z
+      .enum(["wiggle", "loop", "time", "bounce", "inertia", "overshoot"])
+      .describe("Which template to apply."),
+    params: z
+      .record(z.union([z.string(), z.number()]))
+      .optional()
+      .describe(
+        "Template parameters (all optional, sensible defaults used otherwise). wiggle: freq, amp. " +
+          "loop: type ('cycle'|'pingpong'|'offset'|'continue'). time: speed. bounce: amp, freq, decay. " +
+          "inertia: amp, decay. overshoot: freq, decay.",
+      ),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("applyExpressionTemplate", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error applying expression template: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "batch-set-expression",
+  "Apply the same expression string to one property across MANY layers in one call (e.g. add a wiggle to all text layers). Each target layer is identified by layerIndex or layerName; the property name and expression are shared across all targets.",
+  {
+    ...CompIdentifierSchema,
+    propertyName: z
+      .string()
+      .describe(
+        "Name of the property to set the expression on (e.g. 'Position', 'Opacity'), applied identically to every target layer.",
+      ),
+    expressionString: z
+      .string()
+      .describe(
+        'The JavaScript expression string. Provide an empty string ("") to remove the expression from every target layer.',
+      ),
+    targets: z
+      .array(
+        z.object({
+          layerIndex: z.number().int().positive().optional().describe("1-based layer index."),
+          layerName: z.string().optional().describe("Layer name (alternative to layerIndex)."),
+        }),
+      )
+      .describe("Layers to apply the expression to."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("batchSetExpression", parameters, 12000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error in batch set expression: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "set-time-remap",
+  "Enable/disable time remapping on a layer and set Time Remap keyframes (freeze frames and speed ramps). Each keyframe maps a comp-time (when) to a source-time (what frame of the layer's own content plays then). Equal values across two keyframes = freeze frame; differing values = speed ramp. Omit keyframes to just enable/inspect the current Time Remap state without changing existing keyframes.",
+  {
+    ...CompIdentifierSchema,
+    layerIndex: z.number().int().positive().optional().describe("1-based layer index."),
+    layerName: z.string().optional().describe("Layer name (alternative to layerIndex)."),
+    enabled: z
+      .boolean()
+      .optional()
+      .describe(
+        "Set false to disable time remapping (removes the Time Remap property and its keyframes). Default true - ensures it's enabled.",
+      ),
+    keyframes: z
+      .array(
+        z.object({
+          time: z.number().describe("Comp time in seconds."),
+          value: z
+            .number()
+            .describe("Source time in seconds the layer should show at this comp time."),
+        }),
+      )
+      .optional()
+      .describe(
+        "Time Remap keyframes to add/overwrite at the given comp times. Omit to leave existing keyframes untouched.",
+      ),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("setTimeRemap", parameters, 10000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error setting time remap: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "get-keyframes",
+  "Read every keyframe on a property: time, value, in/out interpolation, and in/out " +
+    "temporal ease (speed/influence). Covers Transform, effect, and text properties.",
+  {
+    ...LayerIdentifierSchema,
+    propertyName: z
+      .string()
+      .describe("Name of the property to read (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("getKeyframes", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error getting keyframes: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "offset-keyframes",
+  "Shift every keyframe on a property by a fixed number of seconds, preserving each " +
+    "keyframe's value, interpolation, and ease. Keyframes that would land at a negative " +
+    "time are dropped (After Effects does not allow negative keyframe times) and reported.",
+  {
+    ...LayerIdentifierSchema,
+    propertyName: z
+      .string()
+      .describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+    offsetSeconds: z
+      .number()
+      .describe("Seconds to add to every keyframe's time (negative to shift earlier)."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("offsetKeyframes", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error offsetting keyframes: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "scale-keyframe-timing",
+  "Scale the timing of every keyframe on a property around an anchor time, preserving " +
+    "value/interpolation/ease. Keyframes that would land at a negative time are dropped " +
+    "and reported.",
+  {
+    ...LayerIdentifierSchema,
+    propertyName: z
+      .string()
+      .describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+    scale: z
+      .number()
+      .describe(
+        "Scale factor for the time between each keyframe and the anchor (e.g. 2 = twice as slow, 0.5 = twice as fast).",
+      ),
+    anchorTime: z
+      .number()
+      .optional()
+      .describe(
+        "Time (seconds) the scale pivots around. Defaults to the property's first keyframe time.",
+      ),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("scaleKeyframeTiming", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error scaling keyframe timing: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "reverse-keyframes",
+  "Reverse the order of every keyframe on a property in time, correctly swapping each " +
+    "keyframe's in/out interpolation and ease so the animation plays backwards correctly.",
+  {
+    ...LayerIdentifierSchema,
+    propertyName: z
+      .string()
+      .describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("reverseKeyframes", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error reversing keyframes: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "copy-keyframes",
+  "Copy every keyframe from one layer's property to another layer's property (which may " +
+    "be the same layer, a different property), preserving value/interpolation/ease. " +
+    "Additive - does not clear existing keyframes on the target.",
+  {
+    compIndex: z
+      .number()
+      .int()
+      .positive()
+      .describe("1-based index of the composition (both layers must be in this comp)."),
+    sourceLayerIndex: z
+      .number()
+      .int()
+      .positive()
+      .describe("1-based index of the layer to copy keyframes from."),
+    sourceProperty: z.string().describe("Name of the property to copy from (e.g., 'Position')."),
+    targetLayerIndex: z
+      .number()
+      .int()
+      .positive()
+      .describe("1-based index of the layer to copy keyframes to."),
+    targetProperty: z.string().describe("Name of the property to copy to."),
+    timeOffset: z
+      .number()
+      .optional()
+      .describe("Seconds added to each copied keyframe's time (default 0)."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("copyKeyframes", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error copying keyframes: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "apply-easy-ease",
+  "Apply After Effects' Easy Ease to one keyframe or, if keyframeIndex is omitted, to " +
+    "every keyframe on the property - matching how AE's own Easy Ease command behaves " +
+    "when multiple keyframes are selected.",
+  {
+    ...LayerIdentifierSchema,
+    propertyName: z
+      .string()
+      .describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+    keyframeIndex: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("1-based keyframe index. Omit to apply to all keyframes on the property."),
+    type: z
+      .enum(["in", "out", "both"])
+      .optional()
+      .describe("Which side(s) of the keyframe(s) to ease (default 'both')."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("applyEasyEase", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error applying easy ease: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "create-lower-third",
+  "Build a complete animated lower-third graphic (precomp with an accent stripe, main " +
+    "bar, title, and optional subtitle) and add it to a composition. Style controls bar " +
+    "height, text size, default font, and animation timing.",
+  {
+    compName: z
+      .string()
+      .optional()
+      .describe("Composition to add the lower third to (defaults to the active comp)."),
+    title: z.string().describe("Main title text."),
+    subtitle: z.string().optional().describe("Optional subtitle text below the title."),
+    style: z
+      .enum(["modern", "corporate", "news", "minimal", "social"])
+      .optional()
+      .describe("Visual style preset (default 'modern')."),
+    primaryColor: z
+      .array(z.number())
+      .length(3)
+      .optional()
+      .describe("Main bar color as [r,g,b], each 0-1 (default a blue)."),
+    secondaryColor: z
+      .array(z.number())
+      .length(3)
+      .optional()
+      .describe("Accent stripe color as [r,g,b], each 0-1 (defaults to primaryColor)."),
+    textColor: z
+      .array(z.number())
+      .length(3)
+      .optional()
+      .describe("Text color as [r,g,b], each 0-1 (default white)."),
+    fontFamily: z.string().optional().describe("Font override (defaults to a per-style font)."),
+    position: z
+      .enum(["bottomLeft", "bottomRight", "bottomCenter"])
+      .optional()
+      .describe("Where to place it in the target comp (default 'bottomLeft')."),
+    startTime: z.number().optional().describe("Start time in seconds (default 0)."),
+    duration: z.number().optional().describe("Total duration in seconds (default 5)."),
+    animateIn: z.boolean().optional().describe("Fade in at the start (default true)."),
+    animateOut: z.boolean().optional().describe("Fade out at the end (default true)."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("createLowerThird", parameters, 15000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error creating lower third: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "create-title-card",
+  "Add a title (and optional subtitle, and optional full-frame background) to a " +
+    "composition, animated per style: cinematic (scale+fade), documentary (fade only), " +
+    "social (bounce in), or minimal (simple fade).",
+  {
+    compName: z
+      .string()
+      .optional()
+      .describe("Composition to add the title card to (defaults to the active comp)."),
+    title: z.string().describe("Title text."),
+    subtitle: z.string().optional().describe("Optional subtitle text below the title."),
+    style: z
+      .enum(["cinematic", "documentary", "social", "minimal"])
+      .optional()
+      .describe("Animation style (default 'minimal')."),
+    backgroundColor: z
+      .array(z.number())
+      .length(3)
+      .optional()
+      .describe("Full-frame background color as [r,g,b], each 0-1. Omit for no background layer."),
+    fontFamily: z.string().optional().describe("Font for the title (default 'Arial-BoldMT')."),
+    fontSize: z.number().optional().describe("Title font size (default 64)."),
+    textColor: z
+      .array(z.number())
+      .length(3)
+      .optional()
+      .describe("Text color as [r,g,b], each 0-1 (default white)."),
+    startTime: z.number().optional().describe("Start time in seconds (default 0)."),
+    duration: z.number().optional().describe("Duration in seconds (default 4)."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("createTitleCard", parameters, 15000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error creating title card: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "create-transition",
+  "Add a full-frame transition layer to a composition: a wipe (via the Linear Wipe " +
+    "effect), dissolve, push, slide, or zoom. easing controls the keyframe interpolation " +
+    "and is genuinely applied (linear = literal linear motion, easeIn/easeOut/easeInOut = " +
+    "eased bezier motion).",
+  {
+    compName: z
+      .string()
+      .optional()
+      .describe("Composition to add the transition to (defaults to the active comp)."),
+    type: z
+      .enum([
+        "wipe_left",
+        "wipe_right",
+        "wipe_up",
+        "wipe_down",
+        "dissolve",
+        "push",
+        "slide",
+        "zoom",
+      ])
+      .describe("Transition type."),
+    color: z
+      .array(z.number())
+      .length(3)
+      .optional()
+      .describe("Transition layer color as [r,g,b], each 0-1 (default black)."),
+    startTime: z.number().optional().describe("Start time in seconds (default 0)."),
+    duration: z.number().optional().describe("Duration in seconds (default 1)."),
+    easing: z
+      .enum(["linear", "easeIn", "easeOut", "easeInOut"])
+      .optional()
+      .describe("Keyframe easing (default 'linear')."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("createTransition", parameters, 15000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error creating transition: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "create-logo-reveal",
+  "Add an existing project item (logo) to a composition with an animated reveal: fade, " +
+    "scale, slide, spin, or glitch (a wiggle expression + opacity flicker). Requires " +
+    "logoItemId or logoItemName.",
+  {
+    compName: z
+      .string()
+      .optional()
+      .describe("Composition to add the logo to (defaults to the active comp)."),
+    logoItemId: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        "Project item id of the logo footage (from getProjectInfo). Provide this or logoItemName.",
+      ),
+    logoItemName: z
+      .string()
+      .optional()
+      .describe("Project item name of the logo footage. Provide this or logoItemId."),
+    style: z.enum(["fade", "scale", "slide", "spin", "glitch"]).describe("Reveal style."),
+    backgroundColor: z
+      .array(z.number())
+      .length(3)
+      .optional()
+      .describe("Full-frame background color as [r,g,b], each 0-1. Omit for no background layer."),
+    startTime: z.number().optional().describe("Start time in seconds (default 0)."),
+    duration: z.number().optional().describe("Duration in seconds (default 3)."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("createLogoReveal", parameters, 15000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error creating logo reveal: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "create-text-animator",
+  "Add a per-character text animator to an existing text layer: typewriter, " +
+    "fadeInChars, scaleInChars, slideInChars, randomize, or wave (a real per-character " +
+    "oscillating expression, not a shared scrolling band). delay staggers the animation " +
+    "across characters.",
+  {
+    ...LayerIdentifierSchema,
+    animatorType: z
+      .enum(["typewriter", "fadeInChars", "scaleInChars", "slideInChars", "randomize", "wave"])
+      .describe("Animator type."),
+    startTime: z.number().optional().describe("Start time in seconds (default 0)."),
+    duration: z
+      .number()
+      .optional()
+      .describe("Duration of the character reveal in seconds (default 2)."),
+    delay: z.number().optional().describe("Per-character stagger in seconds (default 0.05)."),
+    waveAmplitude: z
+      .number()
+      .optional()
+      .describe("For the 'wave' type: oscillation amplitude in pixels (default 20)."),
+    waveSpeed: z
+      .number()
+      .optional()
+      .describe("For the 'wave' type: oscillation speed (default 4)."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("createTextAnimator", parameters, 15000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error creating text animator: ${String(error)}` }],
         isError: true,
       };
     }
@@ -1669,34 +3106,25 @@ To apply the "cinematic-look" template:
 
 server.tool(
   "run-bridge-test",
-  "Run the bridge test effects script to verify communication and apply test effects",
+  "Run the bridge test effects script to verify communication and apply test effects. Returns the test result directly.",
   {},
   async () => {
     try {
-      // Fire-and-forget queue (results fetched later via get-results); still run
-      // it through the mutex so it can't clobber a concurrent command's slot.
-      await bridgeMutex(async () => {
-        clearResultsFile();
-        writeCommandFile("bridgeTestEffects", {});
-      });
-
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              `Bridge test effects command has been queued.\n` +
-              `Please ensure the "MCP Bridge Auto" panel is open in After Effects.\n` +
-              `Use the "get-results" tool after a few seconds to check for the test results.`,
-          },
-        ],
-      };
+      // This used to queue the command and tell the caller to fetch the result
+      // later with get-results. That shape was a workaround for file-transport
+      // latency, and it cost the tool every safety property the normal path has:
+      // no id correlation, no timeout synthesis, no isError classification, and
+      // a silent failure whenever the panel was not open. It was also the only
+      // caller that reached around sendBridgeCommand into bridgeMutex directly.
+      // 30s because the test applies real effects, which is slower than a query.
+      const result = await sendBridgeCommand("bridgeTestEffects", {}, 30000, 250);
+      return bridgeToolResult(result);
     } catch (error) {
       return {
         content: [
           {
             type: "text",
-            text: `Error queuing bridge test command: ${String(error)}`,
+            text: `Error running the bridge test command: ${String(error)}`,
           },
         ],
         isError: true,
@@ -2553,21 +3981,203 @@ server.tool(
 
 // Bump this whenever the bridge .jsx protocol changes, and keep it in sync with
 // BRIDGE_VERSION in src/scripts/mcp-bridge-auto.jsx. check-bridge warns on mismatch.
-const EXPECTED_BRIDGE_VERSION = "1.10.0-mcp-enhanced";
+const EXPECTED_BRIDGE_VERSION = "1.12.0-mcp-socket";
+
+/**
+ * Deadline for one listener probe. It must comfortably exceed ACK_TIMEOUT_MS
+ * (1500ms), otherwise the total deadline fires first and every unresponsive port
+ * would be misreported as a deadline rather than as the missing ACK it is.
+ */
+const SOCKET_PROBE_TIMEOUT_MS = 2500;
+
+/** One rendezvous file, and what actually happened when we talked to its port. */
+interface ListenerReport {
+  port: number;
+  /** True for the listener this server would send commands to. */
+  selected: boolean;
+  protocolVersion: number;
+  bridgeVersion: string;
+  aeVersion: string;
+  project: string;
+  boundAt: string;
+  /** null when the port was deliberately not probed. */
+  reachable: boolean | null;
+  problem: SocketProblem;
+  detail: string | null;
+  /**
+   * Whether a real command failing this way would be retried over the file
+   * transport. Read from canFallbackFrom, the same function sendBridgeCommand
+   * uses, so this report cannot drift from the behavior it describes.
+   */
+  wouldFallBackToFile: boolean;
+}
+
+/**
+ * Send a real `ping` to one listener. Probing rather than merely reading the
+ * rendezvous file is the point: the file only proves a panel once bound that
+ * port, not that anything is still there, and a dead port is exactly the case
+ * users hit after closing a panel.
+ *
+ * `ping` is read-only and cheap, so probing every listener (not just the
+ * selected one) is safe even with two After Effects instances open.
+ */
+async function probeListener(
+  r: Rendezvous,
+  isSelected: boolean,
+  probe: boolean,
+): Promise<ListenerReport> {
+  const base = {
+    port: r.port,
+    selected: isSelected,
+    protocolVersion: r.v,
+    bridgeVersion: r.bridgeVersion,
+    aeVersion: r.aeVersion,
+    project: r.project,
+    boundAt: r.boundAt,
+  };
+
+  if (!isSupportedRendezvous(r)) {
+    return {
+      ...base,
+      reachable: null,
+      problem: "protocol-mismatch",
+      detail: `The rendezvous file declares protocol v${r.v}; this server speaks v${PROTOCOL_VERSION}. Not contacted.`,
+      wouldFallBackToFile: true,
+    };
+  }
+  if (!probe) {
+    return {
+      ...base,
+      reachable: null,
+      problem: "transport-disabled",
+      detail: "AE_MCP_BRIDGE_TRANSPORT=file, so no socket was opened.",
+      wouldFallBackToFile: true,
+    };
+  }
+
+  const sent = await sendOverSocket({
+    port: r.port,
+    token: r.token,
+    commandId: nextCommandId(),
+    command: "ping",
+    args: {},
+    timeoutMs: SOCKET_PROBE_TIMEOUT_MS,
+  });
+
+  if (sent.ok) {
+    // Prefer what the panel says NOW over what its rendezvous file recorded when
+    // it bound. The file is a snapshot taken once, so a user who has opened a
+    // different project since then would be shown the wrong one, and telling two
+    // After Effects instances apart is the entire reason this field is reported.
+    let live: any = null;
+    try {
+      live = JSON.parse(sent.raw);
+    } catch {
+      /* opaque result: keep the rendezvous file's values */
+    }
+    const str = (v: unknown, fallback: string): string =>
+      typeof v === "string" && v.length > 0 ? v : fallback;
+    return {
+      ...base,
+      aeVersion: str(live?.aeVersion, base.aeVersion),
+      project: str(live?.project, base.project),
+      reachable: true,
+      problem: null,
+      detail: `Answered in ${sent.totalMs} ms.`,
+      wouldFallBackToFile: false,
+    };
+  }
+  return {
+    ...base,
+    reachable: false,
+    problem: classifySocketFailure(sent.phase, sent.reason),
+    detail: sent.error,
+    wouldFallBackToFile: canFallbackFrom(sent.phase),
+  };
+}
 
 server.tool(
   "check-bridge",
-  "Health check: verify the After Effects MCP Bridge panel is open and responding, report its version, the AE version, the shared bridge folder, and the open project/active comp. Run this FIRST when anything times out or behaves oddly. If it reports a version mismatch, re-run `npm run install-bridge` and restart After Effects.",
+  "Health check: verify the After Effects MCP Bridge panel is open and responding, report its version, the AE version, the shared bridge folder, the open project/active comp, and the state of the socket transport (every listening panel, which one is targeted, and exactly why the socket is unusable if it is). Run this FIRST when anything times out or behaves oddly. If it reports a version mismatch, re-run `npm run install-bridge` and restart After Effects.",
   {},
   async () => {
     try {
+      // Read the bridge folder fresh rather than through the 5s discovery cache:
+      // check-bridge exists to describe this instant, and a cached selection
+      // could name a panel the user closed four seconds ago.
+      const { listeners, selected } = discoverNow();
+      const socketEnabled = transportState.mode !== "file";
+
+      // Probe in parallel so N stale listeners cost one timeout, not N.
+      const allListeners = await Promise.all(
+        listeners.map((r) =>
+          probeListener(r, selected !== null && r.port === selected.port, socketEnabled),
+        ),
+      );
+      allListeners.sort((a, b) => a.port - b.port);
+      const selectedReport = allListeners.find((x) => x.selected) ?? null;
+
+      // Then go through the normal path, so what is reported below is what the
+      // other 80-odd tools would actually experience, not a parallel guess.
+      const pingStartedAt = Date.now();
       const raw = await sendBridgeCommand("ping", {}, 5000, 200);
+      const pingMs = Date.now() - pingStartedAt;
       let parsed: any = null;
       try {
         parsed = JSON.parse(raw);
       } catch {
         /* not JSON */
       }
+
+      // What the panel says about its own socket. Only a bridge >= 1.12 reports
+      // this; an older one leaves it null rather than pretending to know.
+      const panelSocket =
+        parsed && typeof parsed.socketStatus === "string"
+          ? {
+              listening: parsed.socketListening === true,
+              port: typeof parsed.socketPort === "number" ? parsed.socketPort : null,
+              status: parsed.socketStatus,
+              networkPermission: parsed.networkPermission === true,
+              fileTransportEnabled: parsed.fileTransportEnabled !== false,
+            }
+          : null;
+
+      const supported = listeners.filter(isSupportedRendezvous);
+      let socketProblem: SocketProblem;
+      if (!socketEnabled) {
+        socketProblem = "transport-disabled";
+      } else if (selectedReport) {
+        socketProblem = selectedReport.problem;
+      } else if (listeners.length > 0 && supported.length === 0) {
+        socketProblem = "protocol-mismatch";
+      } else if (supported.length > 0) {
+        // Listeners exist and are all usable, yet none was selected: the only
+        // way that happens is a pin naming a port none of them bound.
+        socketProblem = "pinned-port-not-found";
+      } else {
+        socketProblem = "no-rendezvous";
+      }
+      // The permission is the ROOT cause when it is off: no permission means no
+      // listener, which means no rendezvous file. Reporting the symptom would
+      // send the user to reinstall a panel that is working correctly.
+      if (socketProblem === "no-rendezvous" && panelSocket && !panelSocket.networkPermission) {
+        socketProblem = "permission-disabled";
+      }
+
+      const socket = {
+        mode: transportState.mode,
+        pinnedPort: transportState.pinnedPort,
+        /** null means, and only means, that commands really are using the socket. */
+        problem: socketProblem,
+        hint: socketProblemHint(socketProblem, {
+          port: selectedReport?.port ?? panelSocket?.port ?? undefined,
+          pinnedPort: transportState.pinnedPort,
+        }),
+        selectedPort: selected?.port ?? null,
+        /** Straight from the panel; null for a bridge older than 1.12. */
+        panelReported: panelSocket,
+        allListeners,
+      };
 
       if (!parsed || parsed.pong !== true) {
         // Capability probe (not just a version-string check): the id-matcher only
@@ -2607,6 +4217,11 @@ server.tool(
                     ? "Reload the current panel: run `npm run install-bridge`, then FULLY quit and reopen After Effects, reopen Window > mcp-bridge-auto.jsx, and restart the MCP client. (The version string alone is unreliable - a stale panel can still report the right version.)"
                     : "Open After Effects and open the panel via Window > mcp-bridge-auto.jsx (keep it open). Ensure 'Allow Scripts to Write Files and Access Network' is enabled. Also confirm the AE_MCP_BRIDGE_DIR env var (if set) matches on both sides.",
                   expectedBridgeVersion: EXPECTED_BRIDGE_VERSION,
+                  bridgeFolder: getAETempDir(),
+                  // Even with no panel answering, the socket report is the most
+                  // useful thing here: "connection-refused on 47800" names the
+                  // cause that the bare timeout above never could.
+                  socket,
                   raw,
                 },
                 null,
@@ -2636,6 +4251,11 @@ server.tool(
                 bridgeFolder: parsed.bridgeFolder,
                 project: parsed.project,
                 activeComp: parsed.activeComp,
+                // Which transport this very health check travelled over, stamped
+                // by the panel itself. null from a bridge older than 1.12.
+                transportInUse: typeof parsed._transport === "string" ? parsed._transport : null,
+                pingMs,
+                socket,
               },
               null,
               2,
@@ -2928,6 +4548,28 @@ server.tool(
     maskOpacity: z.number().optional().describe("Mask opacity 0-100."),
     maskExpansion: z.number().optional().describe("Mask expansion in pixels."),
     maskName: z.string().optional().describe("Optional mask name."),
+    maskInTangents: z
+      .array(Vec2Schema)
+      .optional()
+      .describe(
+        "Optional bezier in-handles, one [x,y] per vertex, RELATIVE to their own vertex. Must have exactly as many entries as the path has vertices. Omit for straight segments.",
+      ),
+    maskOutTangents: z
+      .array(Vec2Schema)
+      .optional()
+      .describe(
+        "Optional bezier out-handles, one [x,y] per vertex, RELATIVE to their own vertex. Must have exactly as many entries as the path has vertices. Omit for straight segments.",
+      ),
+    maskClosed: z
+      .boolean()
+      .optional()
+      .describe("Whether the mask path is closed (default: true). Set false for an open path."),
+    time: z
+      .number()
+      .optional()
+      .describe(
+        "Comp time in seconds. When provided, the mask shape is written as a KEYFRAME at that time (animating the mask) instead of a static value. Call repeatedly with different times to build a mask morph.",
+      ),
   },
   async (parameters) => {
     try {
@@ -2936,6 +4578,143 @@ server.tool(
     } catch (error) {
       return {
         content: [{ type: "text", text: `Error setting layer mask: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "set-shape-path",
+  [
+    "Draw or reshape a freeform bezier PATH on a shape layer (vertices + in/out tangents), the thing parametric rectangles/ellipses/stars cannot express: traced logos, custom curves, line art, and animated path morphs.",
+    "Supply the path either as explicit `vertices` (with optional `inTangents`/`outTangents`) or as a `generator` spec (roundedRect / ellipse / polygon / star), never both.",
+    "COORDINATES: vertices are in LAYER space - the origin is the layer's anchor point, NOT the comp's top-left and NOT the comp centre. A layer created by this tool sits at the comp centre with anchor [0,0], so vertex [0,0] renders at the middle of the frame. Y is positive DOWNWARD. Tangents are RELATIVE offsets from their own vertex.",
+    "ANIMATION: pass `keyframes` (each with its own vertices/tangents and a time) to morph a path over time. Every keyframe must have the SAME vertex count - After Effects accepts differing counts without complaint but interpolates them into a torn shape, so this tool rejects them instead.",
+    "VISIBILITY: a path with no Fill and no Stroke renders nothing. Pass fillColor and/or strokeColor; if you pass neither and the group has neither, a default white fill is added and reported back.",
+    "Omit groupIndex/pathIndex to append a new group and path; pass them to overwrite an existing one (read them with get-shape-path first). Parametric shapes cannot be converted to freeform paths.",
+  ].join(" "),
+  {
+    ...CompIdentifierSchema,
+    layerIndex: z.number().int().positive().optional().describe("1-based layer index."),
+    layerName: z
+      .string()
+      .optional()
+      .describe(
+        "Layer name (alternative to layerIndex). Also names the layer when createLayer is true.",
+      ),
+    createLayer: z
+      .boolean()
+      .optional()
+      .describe(
+        "Create a new shape layer when no existing layer matches (default: false, which errors instead).",
+      ),
+    groupIndex: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        "1-based index of an existing group in the layer's Contents. Omit to append a new group.",
+      ),
+    pathIndex: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("1-based index of an existing path within the group. Omit to append a new path."),
+    ...PathShapeSchema,
+    generator: PathGeneratorSchema.optional(),
+    time: z
+      .number()
+      .optional()
+      .describe("Write the path as a single keyframe at this comp time instead of a static value."),
+    keyframes: z
+      .array(
+        z.object({
+          time: z.number().describe("Comp time in seconds."),
+          ...PathShapeSchema,
+          generator: PathGeneratorSchema.optional(),
+        }),
+      )
+      .optional()
+      .describe(
+        "Path morph: one entry per keyframe. All entries must resolve to the same vertex count.",
+      ),
+    fillColor: z
+      .tuple([z.number(), z.number(), z.number()])
+      .optional()
+      .describe("Fill color as [r,g,b], each 0-1."),
+    strokeColor: z
+      .tuple([z.number(), z.number(), z.number()])
+      .optional()
+      .describe("Stroke color as [r,g,b], each 0-1."),
+    strokeWidth: z
+      .number()
+      .optional()
+      .describe("Stroke width in pixels (default 2 when strokeColor is given)."),
+  },
+  async (parameters) => {
+    try {
+      // Resolve generators and validate array agreement HERE, before anything
+      // reaches After Effects: AE accepts a malformed Shape silently (zero-filling
+      // mismatched tangents, tearing mismatched morph keyframes), so this is the
+      // only place a caller can be told what is wrong.
+      const { generator, keyframes, ...rest } = parameters;
+      let payload: Record<string, unknown>;
+
+      if (keyframes && keyframes.length) {
+        const resolved = keyframes.map((kf) => ({
+          time: kf.time,
+          ...resolvePathInput(kf as Parameters<typeof resolvePathInput>[0]),
+        }));
+        assertMorphCompatible(resolved);
+        payload = { ...rest, keyframes: resolved };
+      } else {
+        const path = resolvePathInput({ ...rest, generator } as Parameters<
+          typeof resolvePathInput
+        >[0]);
+        payload = { ...rest, ...path };
+      }
+
+      const result = await sendBridgeCommand("setShapePath", payload, 10000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error setting shape path: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "get-shape-path",
+  "Read the bezier path data (vertices, in/out tangents, closed flag) off a shape layer, plus any path keyframes. Omit groupIndex/pathIndex to enumerate every group and path on the layer, which is how you discover the indices set-shape-path needs to overwrite an existing path. Each group also lists its non-path items (fills, strokes, parametric shapes) so you can see the full structure. Coordinates come back in LAYER space with y positive downward, and tangents relative to their own vertex - the same convention set-shape-path takes.",
+  {
+    ...CompIdentifierSchema,
+    layerIndex: z.number().int().positive().optional().describe("1-based layer index."),
+    layerName: z.string().optional().describe("Layer name (alternative to layerIndex)."),
+    groupIndex: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("Restrict to this 1-based group index."),
+    pathIndex: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("Restrict to this 1-based path index within the group."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("getShapePath", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error reading shape path: ${String(error)}` }],
         isError: true,
       };
     }
@@ -3030,6 +4809,236 @@ server.tool(
     } catch (error) {
       return {
         content: [{ type: "text", text: `Error setting composition properties: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "duplicate-composition",
+  "Duplicate a composition, optionally renaming the copy. Target the comp by compName or compIndex.",
+  {
+    ...CompIdentifierSchema,
+    newName: z.string().optional().describe("Optional new name for the duplicated composition."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("duplicateComposition", parameters, 10000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error duplicating composition: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "delete-composition",
+  "Delete a composition from the project. Layers elsewhere that use this comp as a source become missing-footage, same as deleting it manually in the Project panel.",
+  {
+    ...CompIdentifierSchema,
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("deleteComposition", parameters, 10000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error deleting composition: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "add-light-layer",
+  "Add a light layer to a composition.",
+  {
+    ...CompIdentifierSchema,
+    name: z.string().optional().describe("Optional name for the light layer (default 'Light')."),
+    type: z
+      .enum(["PARALLEL", "SPOT", "POINT", "AMBIENT"])
+      .optional()
+      .describe("Light type (default 'POINT')."),
+    color: z.array(z.number()).length(3).optional().describe("Light color as [r,g,b], each 0-1."),
+    intensity: z.number().optional().describe("Light intensity percentage."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("addLightLayer", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error adding light layer: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "precompose-layers",
+  "Precompose one or more layers into a new nested composition, replacing them in place with a single layer that references the new comp.",
+  {
+    ...CompIdentifierSchema,
+    layerIndices: z
+      .array(z.number().int().positive())
+      .min(1)
+      .describe("1-based indices of the layers to precompose."),
+    name: z.string().describe("Name for the new precomposition."),
+    moveAttributes: z
+      .boolean()
+      .optional()
+      .describe(
+        "Move all attributes (transform, effects, etc.) into the new comp (default true, matches AE's own UI default).",
+      ),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("precomposeLayers", parameters, 10000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error precomposing layers: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "reorder-effects",
+  "Move an effect to a different position in a layer's effect stack. Target the effect by effectIndex, effectName, or effectMatchName.",
+  {
+    ...CompIdentifierSchema,
+    layerIndex: z.number().int().positive().optional().describe("1-based layer index."),
+    layerName: z.string().optional().describe("Layer name (alternative to layerIndex)."),
+    effectIndex: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("1-based effect index within the layer's Effects group."),
+    effectName: z.string().optional().describe("Display name of the effect to reorder."),
+    effectMatchName: z
+      .string()
+      .optional()
+      .describe("Internal match name of the effect to reorder."),
+    newIndex: z.number().int().positive().describe("1-based target position in the effect stack."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("reorderEffects", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error reordering effects: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "copy-effects",
+  "Copy one or more effects (with their current static property values) from one layer to another. Omit effectIndices to copy every effect on the source layer. Does not copy keyframes or expressions on effect properties - use copy-keyframes afterward for a specific property if needed.",
+  {
+    ...CompIdentifierSchema,
+    sourceLayerIndex: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("1-based source layer index."),
+    sourceLayerName: z
+      .string()
+      .optional()
+      .describe("Source layer name (alternative to sourceLayerIndex)."),
+    targetLayerIndex: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("1-based target layer index."),
+    targetLayerName: z
+      .string()
+      .optional()
+      .describe("Target layer name (alternative to targetLayerIndex)."),
+    effectIndices: z
+      .array(z.number().int().positive())
+      .optional()
+      .describe(
+        "1-based indices of effects to copy (omit to copy all effects on the source layer).",
+      ),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("copyEffects", parameters, 10000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error copying effects: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "delete-marker",
+  "Delete a marker from a composition or a layer. Provide layerIndex/layerName for a layer marker, or omit both for a composition marker.",
+  {
+    ...CompIdentifierSchema,
+    layerIndex: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("1-based layer index (layer marker) - omit for a composition marker."),
+    layerName: z
+      .string()
+      .optional()
+      .describe("Layer name (alternative to layerIndex, layer marker only)."),
+    markerIndex: z
+      .number()
+      .int()
+      .positive()
+      .describe(
+        "1-based marker index (as returned by get-markers-equivalent tooling or add-marker).",
+      ),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("deleteMarker", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error deleting marker: ${String(error)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "set-work-area",
+  "Set a composition's work area (start time and duration in seconds). AE clamps internally, so check the returned values against what you requested.",
+  {
+    ...CompIdentifierSchema,
+    start: z.number().describe("Work area start time in seconds."),
+    duration: z.number().positive().describe("Work area duration in seconds."),
+  },
+  async (parameters) => {
+    try {
+      const result = await sendBridgeCommand("setWorkArea", parameters, 8000, 250);
+      return bridgeToolResult(result);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error setting work area: ${String(error)}` }],
         isError: true,
       };
     }
@@ -3162,6 +5171,12 @@ server.tool(
       .describe(
         "Time(s) in seconds to capture. A single number or an array. Defaults to the comp midpoint. Out-of-range values are clamped.",
       ),
+    frameNumbers: z
+      .union([z.number(), z.array(z.number())])
+      .optional()
+      .describe(
+        "Frame number(s) to capture instead of seconds (converted using the comp's own frameRate) - use this on non-round frame rates (23.976, 29.97) to avoid manually computing frame / frameRate and risking an off-by-one-frame rounding error. Combinable with times; a single number or an array.",
+      ),
     maxWidth: z
       .number()
       .int()
@@ -3192,6 +5207,7 @@ server.tool(
   async ({
     comp,
     times,
+    frameNumbers,
     maxWidth = 512,
     includeState = false,
     motionBlur = false,
@@ -3205,6 +5221,12 @@ server.tool(
           compName: typeof comp === "string" ? comp : undefined,
           compIndex: typeof comp === "number" ? comp : undefined,
           times: times === undefined ? undefined : Array.isArray(times) ? times : [times],
+          frameNumbers:
+            frameNumbers === undefined
+              ? undefined
+              : Array.isArray(frameNumbers)
+                ? frameNumbers
+                : [frameNumbers],
           maxWidth,
           includeState,
           motionBlur,

@@ -13,6 +13,7 @@ import {
   buildFfmpegConvertArgs,
   tail,
   nextPollDelay,
+  bridgeTimeoutResult,
   POLL_START_MS,
 } from "../src/lib/bridge-core";
 
@@ -254,6 +255,28 @@ describe("buildFfmpegConvertArgs", () => {
     const args = buildFfmpegConvertArgs("http://evil.example/track.mp3", "C:\\temp\\out.wav");
     expect(args).toContain("http://evil.example/track.mp3");
     expect(args).toContain("C:\\temp\\out.wav");
+  });
+});
+
+describe("bridgeTimeoutResult", () => {
+  // Pinned literally. Both transports must synthesize this byte for byte: a
+  // socket command that blows its deadline has to be indistinguishable from a
+  // file command that was never answered, and 83 tools depend on the wording.
+  it("produces the exact timeout envelope, with the command name", () => {
+    expect(bridgeTimeoutResult("getCompFull")).toBe(
+      '{"error":"Timed out waiting for bridge result for command \'getCompFull\'."}',
+    );
+  });
+
+  it("omits the command clause when no command is given", () => {
+    expect(bridgeTimeoutResult()).toBe('{"error":"Timed out waiting for bridge result."}');
+    expect(bridgeTimeoutResult("")).toBe('{"error":"Timed out waiting for bridge result."}');
+  });
+
+  it("is valid JSON carrying an error field, so bridgeToolResult flags it", () => {
+    const raw = bridgeTimeoutResult("ping");
+    expect(JSON.parse(raw).error).toContain("Timed out");
+    expect(bridgeToolResult(raw).isError).toBe(true);
   });
 });
 

@@ -1,0 +1,1877 @@
+# CONTEXT.md
+
+Working notes for this fork (`MotionDevLab/after-effects-mcp-a-y-ibrahim`, forked from
+`a-y-ibrahim/after-effects-mcp`). Tracks why this fork exists, what's been fixed,
+and what's still open, so future sessions don't have to re-derive it.
+
+## Branch workflow (decided 2026-07-29)
+
+`main` tracks `upstream/main` (`a-y-ibrahim/after-effects-mcp`) directly and
+should stay clean/undiverged. **Each tools-block feature addition gets its own
+branch**, created off current `main`, merged back only once implemented and
+verified against real After Effects. Don't commit new feature work straight to
+`main`. The project-lifecycle tools (see below) are the first feature done
+this way, on `feature/project-lifecycle-tools`.
+
+## Why this fork exists
+
+We were comparing two other forks of the original `Dakkshin/after-effects-mcp`
+lineage (`MotionDevLab/after-effects-mcp` and `TheLlamainator/after-effects-mcp`,
+a.k.a. "repo A" and "repo B") to decide which to extend. Research (see
+`C:\Users\renat\After Effects research\ae-mcp-research.md`) found that
+`a-y-ibrahim/after-effects-mcp` already covers the functional union of both
+(A's layer ops + B's effects/keyframe/preset/audio engine), fixes a stale-result
+race condition present in both, and adds rendering + visual-feedback tools
+neither A nor B has at all. Decision: use this as the new base instead of
+merging A into B by hand.
+
+`ishu86/after-effects-mcp` was evaluated in parallel as a comparison target
+(different architecture — CEP extension, not a ScriptUI bridge panel — so not a
+merge candidate, but worth cross-checking for features worth porting). See its
+own notes once that evaluation starts (`after-effects-mcp-ishu86` is local-only,
+not forked, per the user's choice).
+
+## Base decision: verified, not assumed (2026-07-29)
+
+The claim "this fork is a superset of repo A and repo B" was re-checked
+against actual source, not READMEs, before committing to it:
+
+- Ibrahim's `run-script` whitelist (`allowedScripts` in `src/index.ts`, 34
+  entries) is a **strict superset of both** repo A's 20-entry whitelist and
+  repo B's 27-entry whitelist. Every script name in each is present here.
+- Repo A's exclusive features (from its PR #26) are all present as first-class
+  tools: `create-camera`, `duplicate-layer`, `delete-layer`, `set-layer-mask`,
+  `batch-set-layer-properties`, `set-composition-properties`.
+- Repo B's exclusive subsystems are all present: effects
+  (`list-layer-effects`, `list-available-effects`, `set-effect-property`,
+  `remove-effect`, `add-any-effect`), keyframe graph/easing control
+  (`set-effect-keyframe`), presets (`list/search/apply-preset`), audio
+  (`get-audio-info`, `set-audio-levels`, `analyze-audio-waveform`), markers
+  (`add-marker`, `add-markers-bulk`), plus `create-adjustment-layer`,
+  `center-layers`, `get-layer-clip-frames`.
+- Ibrahim-only additions on top: deep inspection (`getLayerFull`/`getCompFull`
+  → `inspect-layer`/`inspect-comp`), the rendering pipeline, the vision tools,
+  `execute-script`, and `localize-comp`.
+
+Conclusion: merging repo A into repo B by hand would have reproduced work
+already done here, minus rendering and vision. Nothing from A or B needs
+porting into this fork.
+
+## Environment this was verified against
+
+- Windows 11, Adobe After Effects 2026 (build `26.0x67`)
+- Node v26.3.0 / npm 11.16.0
+- Bridge folder: `%LOCALAPPDATA%\ae-mcp-bridge` (both `ae_command.json` and
+  `ae_mcp_result.json` live here — shared between the Node MCP server and the
+  AE ScriptUI panel)
+- Bridge panel install path: `%APPDATA%\Adobe\After Effects\26.0\Scripts\ScriptUI Panels\mcp-bridge-auto.jsx`
+
+## How to manually smoke-test (no MCP client app needed)
+
+The MCP server talks stdio JSON-RPC, so you can't just `npm start` and watch —
+it needs a client. `manual-tests/smoke-test.mjs` is a minimal MCP SDK client
+that spawns the server and calls a few tools directly. Run it from the repo
+root:
+
+```bash
+node manual-tests/smoke-test.mjs
+```
+
+Requires the After Effects bridge panel (`Window > mcp-bridge-auto.jsx`) to be
+open in AE with "Auto-run commands" checked, and a project open.
+
+**Known gotcha when testing manually**: the bridge panel seeds its
+"already-processed" command ID from whatever is sitting in `ae_command.json`
+_at panel startup_ (see `initLastProcessedCommand()` in
+`src/scripts/mcp-bridge-auto.jsx`) — intentional, so a stale command left over
+from a previous session doesn't get replayed. But it means if you write a
+command, then the panel restarts (or AE restarts) before it's picked up, that
+command is now permanently marked "already seen" and will silently never run,
+with no error logged anywhere. If a tool call times out for no obvious reason,
+first check whether the panel restarted between writing and checking, and just
+retry — a fresh call gets a fresh command ID and works fine. This is not a bug,
+it's documented in-code, but it cost real debugging time before we knew about
+it.
+
+## Fixes applied in this fork
+
+### 1. `see-frame` intermittent "(frame could not be read)" — FIXED 2026-07-28
+
+**Symptom**: `see-frame` with an explicit `times` value (e.g. `times: 1`) would
+render successfully in AE (`"Rendered comp ... - 1 frame"`) but the image
+content block would be missing, replaced with `(frame at t=1s could not be
+read)`. Reproduced twice in a row (not a fluke).
+
+**Root cause**: `target.saveFrameToPng(times[i], new File(path))` in
+`seeFrame()` (`src/scripts/mcp-bridge-auto.jsx`) is asynchronous on this AE
+build — it returns before the PNG is actually flushed to disk. Confirmed via
+a direct diagnostic script (`execute-script` tool, arbitrary ExtendScript):
+`file.exists` was `false` immediately after `saveFrameToPng()` returned, and
+`true` after a single 50ms poll, checked _within the same ExtendScript call_ —
+ruling out any Node-side file-read race.
+
+The codebase already knew about a version of this problem: `_importWithRetry()`
+(used by `contact-sheet` and `match-reference`) retries `importFile()` on
+exception for exactly this reason, per its own comment. `seeFrame()` hands the
+raw path back to Node instead of importing it itself, so it had no equivalent
+retry and was missed.
+
+**Fix**: added `_waitForFileReady(file, timeoutMs)` next to `_importWithRetry`
+in `src/scripts/mcp-bridge-auto.jsx` — polls `file.exists` every 50ms up to a
+timeout (default 3000ms) — and call it in `seeFrame()` right after each
+`saveFrameToPng()`, before pushing the frame to the result. If the file never
+appears, it now throws and surfaces as a per-frame `note` on the AE side (same
+error-reporting path already used for other per-frame failures), instead of
+silently omitting the image.
+
+**Verified**: same explicit-time call that failed twice in a row now returns a
+real 117KB image on retest, after rebuilding (`npm run build`), reinstalling
+the bridge (`npm run install-bridge`), and reloading the panel in AE (close +
+reopen `Window > mcp-bridge-auto.jsx` — required, ScriptUI panels don't hot
+reload).
+
+**Files touched**: `src/scripts/mcp-bridge-auto.jsx`
+
+## Open issues / not yet investigated
+
+- None currently open in this fork. (Update this section as new issues are
+  found — don't let it silently go stale.)
+
+### External blocker: ishu86 CEP extension will not load (AE 2026)
+
+Not a bug in this fork, but recorded here since it shapes the comparison work.
+`ishu86/after-effects-mcp` ships a **CEP extension** (not a ScriptUI panel).
+On this machine it fails to load with `Signature verification failed for
+extension com.aemcp.panel` (in `%TEMP%\CEP12-AEFT.log`).
+
+Ruled out as causes — all verified:
+
+- `PlayerDebugMode` **is** correctly set: `REG_SZ "1"` under
+  `HKCU\SOFTWARE\Adobe\CSXS.12`, confirmed identical in the native, `/reg:32`
+  and `/reg:64` views.
+- AE 2026's CEP runtime **is** CEP 12 (`CEP12-AEFT.log`), so `CSXS.12` is the
+  right key. `CSXS.10`/`.11` are also set.
+- The manifest is valid: `AEFT [24.0,99.9]`, `RequiredRuntime CSXS 12.0`,
+  bundle id matches the install folder name.
+
+Actual cause: **AE 2026 / CEP 12 enforces signature verification regardless of
+`PlayerDebugMode`.** Evidence: an audit of every CEP extension on this machine
+shows _every_ extension that successfully loads in AE is signed (has
+`META-INF`) — AEUX, Bodymovin, the Adobe CCX panels. The single unsigned
+extension present (`SuperPNG_Win`) is a Photoshop extension, so nothing here
+demonstrates an unsigned extension loading in AE at all. The classic
+`PlayerDebugMode` bypass appears to no longer work on this AE version.
+
+Real fix if execution is ever needed: sign the extension with Adobe's
+`ZXPSignCmd` (a self-signed certificate is sufficient for local use).
+
+**Workaround used instead**: the ishu86 MCP server's tool catalog can be
+enumerated over stdio _without_ AE or the panel running — `tools/list` works
+fine, only actual tool _execution_ needs the bridge. That was enough for the
+feature comparison below, so signing was not pursued.
+
+## Verified-working (smoke tested against real AE 2026)
+
+- `get-help`
+- `check-bridge` (version match confirmed)
+- `run-script` → `getProjectInfo` (real project data returned)
+- `inspect-comp` (real comp/layer data returned)
+- `inspect-layer` with `includeKeyframes: true` (verified keyframe data
+  written by `setLayerKeyframe` reads back correctly)
+- `setLayerKeyframe` (Position + Opacity, 2 keyframes each, correct
+  interpolation, correct values on readback)
+- `see-frame` (after the fix above — both default-time and explicit-time
+  cases confirmed)
+- `render-status` (empty-state response confirmed)
+- `create-project`, `open-project`, `save-project`, `close-project` (full
+  12-step safety test, see the project-lifecycle spec section above)
+- `import-footage`, `import-folder`, `replace-footage`, `find-missing-footage`,
+  `collect-files`, `reduce-project`, `organize-project-items` (full 46-step
+  safety test, see the asset-management spec section above)
+- `get-expression`, `enable-expression`, `add-expression-control`,
+  `link-properties`, `apply-expression-template` (22-step test, see the
+  expression-suite spec section above)
+- `get-keyframes`, `offset-keyframes`, `scale-keyframe-timing`,
+  `reverse-keyframes`, `copy-keyframes`, `apply-easy-ease` (25-step test,
+  found and fixed 2 real bugs during verification - see the
+  keyframe-manipulation spec section above)
+- `create-lower-third`, `create-title-card`, `create-transition`,
+  `create-logo-reveal`, `create-text-animator` (28-step test, found and
+  fixed 4 real bugs during verification, one cross-cutting - see the
+  motion-graphics-templates spec section and "Known limitations" above)
+- `batch-set-expression` (5-scenario test, see the spec section above) -
+  also incidentally exercised `create-text-layer`, previously untested.
+
+## Not yet tested
+
+Everything else in the 50-tool catalog — effects (`apply-effect`,
+`list-available-effects`, `set-effect-property`, etc.), presets, audio tools,
+markers, rendering (`add-to-render-queue`, `start-render`, `render-aerender`),
+`contact-sheet`, `match-reference`, `execute-script` (used only as a diagnostic
+tool so far, not smoke-tested as a general capability), and most other
+layer-creation tools (`create-camera`, `duplicate-layer`, etc.).
+
+## Feature comparison vs ishu86 (67 tools) — done 2026-07-29
+
+Catalog obtained via `tools/list` over stdio without AE running (see the CEP
+blocker above). ishu86 is **not a merge target** — it's a CEP extension with a
+script-generator architecture, so nothing ports mechanically — but it is a
+useful source of feature ideas. Neither server dominates.
+
+**In ishu86, entirely absent from this fork** (strongest port candidates):
+
+- ~~**Project lifecycle**: `create_project`, `open_project`, `save_project`,
+  `close_project`. This fork has _no_ project-level tools at all — arguably
+  the biggest single gap.~~ **Implemented 2026-07-29** — see "Fixes/features
+  applied" below. No longer a gap.
+- ~~**Asset management**: `import_footage`, `import_folder`, `replace_footage`,
+  `find_missing_footage`, `collect_files`, `reduce_project`,
+  `organize_project_items`.~~ **Implemented 2026-07-29.** (This bullet was
+  left un-struck by mistake when the block landed - fixed here, no code
+  change, doc-only correction.)
+- ~~**Keyframe timeline manipulation**: `offset_keyframes`,
+  `scale_keyframe_timing`, `reverse_keyframes`, `copy_keyframes`,
+  `apply_easy_ease`, `get_keyframes`.~~ **Implemented 2026-07-29.**
+- ~~**Expression suite**: `get_expression`, `remove_expression`,
+  `enable_expression`, `add_expression_control`, `apply_expression_template`,
+  `link_properties`.~~ **Implemented 2026-07-29.**
+- ~~**Motion-graphics templates**: `create_lower_third`, `create_title_card`,
+  `create_transition`, `create_logo_reveal`, `create_text_animator`.~~
+  **Implemented 2026-07-29.**
+- ~~Misc: `precompose_layers`, `add_light_layer`, `duplicate_composition`,
+  `reorder_effects`, `copy_effects`, `set_work_area`, `delete_marker`.~~
+  **Implemented 2026-07-29** (see block #6 spec below) - plus
+  `delete_composition`, which this list originally missed entirely (found
+  sitting next to `duplicate_composition` in ishu86's own schema file while
+  researching block #6).
+
+**In this fork, absent from ishu86** (i.e. reasons the base choice still holds):
+
+- Full **rendering pipeline** — `add-to-render-queue`, `render-queue`,
+  `start-render`, background `render-aerender`, `render-status`. ishu86 has
+  only `render_frame`.
+- **Visual feedback** — `see-frame`, `contact-sheet`, `match-reference`.
+- **Audio** — `analyze-audio-waveform`, `animate-to-audio`, `get-audio-info`,
+  `set-audio-levels`.
+- **Presets** — `list-presets`, `search-presets`, `apply-preset`.
+- `execute-script` (arbitrary ExtendScript), `set-layer-mask`,
+  `batch-set-layer-properties`, `center-layers`, `localize-comp` (Arabic/RTL),
+  `list-available-effects`, deep `inspect-comp`/`inspect-layer`,
+  `check-bridge`.
+
+## SPEC: project-lifecycle tools — IMPLEMENTED and verified 2026-07-29
+
+Written 2026-07-29 as a design-first spec, then implemented the same day.
+Read this before touching these four tools again — the destructive-operation
+contract below is a deliberate decision, not a default to rediscover.
+
+**Implementation**: `create-project` / `open-project` / `save-project` /
+`close-project` tools added to `src/index.ts` (registered just before
+`create-composition`), plus `createProject`/`openProject`/`saveProject`/
+`closeProject` bridge functions and a shared `_resolveSaveFirst()` gate added
+to `src/scripts/mcp-bridge-auto.jsx` (placed right after `getProjectInfo()`).
+All four bridge command names added to `allowedScripts` (`run-script`
+whitelist) and to `NO_UNDO_GROUP_COMMANDS`. Implemented exactly per the spec
+below — no deviations.
+
+**Verified 2026-07-29** via `manual-tests/project-lifecycle-test.mjs`, a
+12-step sequence designed specifically to exercise every branch of the
+`saveFirst` contract **without risking the real project's content** (the
+video layers + keyframes from earlier this session): save the real project
+first (so all further "discard" tests run against disposable throwaway
+projects, never the real one), exercise every gate branch, then restore the
+real project and confirm it came back byte-for-byte identical (path match +
+`inspect-comp` confirming all 3 original layers). All 12 assertions passed,
+including the two safety-critical paths:
+
+- `close-project {saveFirst:true}` on a dirty project with no file path yet →
+  correctly returned the informed error, did not silently discard or crash.
+- `close-project {saveFirst:false}` on a dirty disposable project → correctly
+  discarded and succeeded (the explicit, informed-consent path).
+
+Re-run `node manual-tests/project-lifecycle-test.mjs` (from the repo root)
+after any future change to these four tools or to `_resolveSaveFirst()`.
+
+### Why this needs a spec before code
+
+`create-project` / `open-project` / `close-project` can discard unsaved AE
+work. That is the one failure mode in this whole tool surface that is
+genuinely unrecoverable, so the contract must be explicit rather than left to
+whoever implements it. Two things informed the design:
+
+1. `executeCommand()` already wraps every command in
+   `app.beginSuppressDialogs()` (`src/scripts/mcp-bridge-auto.jsx` ~line 3637)
+   specifically so an AE modal can never block the single-threaded bridge
+   poll loop (a blocked panel never writes the result file → the whole
+   automation hangs). This is already solved — do not re-solve it.
+2. Because dialogs are globally suppressed, these tools must **never** rely
+   on AE's native "prompt to save changes?" behavior (AE's `CloseOptions`
+   enum has a `PROMPT_TO_SAVE_CHANGES` option — do not use it here). Under
+   suppression its actual behavior is undocumented/version-dependent. Instead,
+   check `app.project.dirty` explicitly in script and require the caller to
+   say what to do about it. Never let an implicit AE default decide.
+
+### Contract
+
+- `saveFirst` is a **required boolean, no default**, on both `open-project`
+  and `close-project` (the two operations that can throw away the _current_
+  project). Zod: `z.boolean().describe("Required. If true, save the current
+project first (if it has a file path; error if it doesn't and is dirty).
+If false, the current project's unsaved changes are discarded.")`. Do NOT
+  make this optional with a default — an omitted flag on a destructive
+  operation is exactly the ambiguity this spec exists to prevent.
+- Before doing anything destructive, check `app.project.dirty`:
+  - If `false` (nothing unsaved): proceed regardless of `saveFirst`.
+  - If `true` and `saveFirst === true`: call `app.project.save()` if
+    `app.project.file` exists; if there's no file path yet (never-saved new
+    project), return `{status:"error", error:"Project has unsaved changes
+and no file path yet; cannot saveFirst. Call save-project with an
+explicit path first, or pass saveFirst:false to discard."}` — do NOT
+    silently discard, do NOT silently proceed without saving.
+  - If `true` and `saveFirst === false`: proceed and discard (this is the
+    explicit, informed-consent path for discarding work).
+- `create-project` (maps to AE's `app.newProject()`) needs the same dirty
+  check on the _outgoing_ project before creating the new one — it takes
+  `saveFirst` too, for the same reason.
+- `save-project` takes an optional `filePath`: if provided, this is a
+  save-as (`app.project.save(new File(filePath))`); if omitted, `app.project.
+save()` (must already have a file path, else error — do not silently fall
+  back to a default path).
+- All four join `NO_UNDO_GROUP_COMMANDS` in `mcp-bridge-auto.jsx` (~line 3623) — undo groups are meaningless across a project boundary, and
+  wrapping `app.newProject()`/`app.open()`/`app.project.close()` in
+  `app.beginUndoGroup()` risks exactly the "Undo group mismatch" AE 2026
+  warning already documented in that file's comments for `startRender`/
+  `executeScript`.
+- None of the four belong in `READ_ONLY_COMMANDS` (~line 2550) — all mutate
+  state (even `close-project` ends the session's project context).
+
+### Tool-by-tool
+
+**`create-project`** (bridge command `createProject`)
+
+```
+{
+  saveFirst: z.boolean().describe("Required. Whether to save the outgoing project (if dirty) before creating the new one. See saveFirst contract above."),
+}
+```
+
+Bridge: dirty-check outgoing project per contract above, then
+`app.newProject()`. Return `{status:"success"}` or the informed-error shape
+above.
+
+**`open-project`** (bridge command `openProject`)
+
+```
+{
+  filePath: z.string().describe("Absolute path to the .aep project file to open."),
+  saveFirst: z.boolean().describe("Required. Whether to save the currently open project (if dirty) before switching. See saveFirst contract above."),
+}
+```
+
+Bridge: dirty-check current project per contract, then
+`app.open(new File(filePath))`. If the file doesn't exist, return a clear
+error rather than letting AE's own exception surface raw (match the style of
+existing error handling elsewhere in the file, e.g. `getCompFull`'s
+"Composition not found" pattern).
+
+**`save-project`** (bridge command `saveProject`)
+
+```
+{
+  filePath: z.string().optional().describe("Absolute path to save to (save-as). Omit to save to the project's existing file path (errors if the project has never been saved)."),
+}
+```
+
+Bridge: `filePath` provided → `app.project.save(new File(filePath))`; omitted
+→ error if `!app.project.file`, else `app.project.save()`.
+
+**`close-project`** (bridge command `closeProject`)
+
+```
+{
+  saveFirst: z.boolean().describe("Required. Whether to save before closing. See saveFirst contract above."),
+}
+```
+
+Bridge: dirty-check per contract, then `app.project.close(CloseOptions.
+DO_NOT_SAVE_CHANGES)` (we already handled saving explicitly above per the
+contract, so always pass `DO_NOT_SAVE_CHANGES` here — never
+`SAVE_CHANGES`/`PROMPT_TO_SAVE_CHANGES`, to avoid a second, redundant, or
+conflicting save path). After close, AE typically auto-creates a blank
+untitled project — note this in the tool description so the model doesn't
+expect "no project open" as a resulting state.
+
+### Wiring checklist (match existing patterns exactly — see `duplicate-layer`
+
+/ `delete-layer` in `src/index.ts` ~line 2829 as the template)
+
+1. Add all four bridge command names (`createProject`, `openProject`,
+   `saveProject`, `closeProject`) to the `allowedScripts` whitelist in
+   `run-script` (`src/index.ts` ~line 271-306).
+2. Add four `server.tool()` registrations following the exact
+   try/`sendBridgeCommand(cmd, parameters, 8000, 250)`/`bridgeToolResult`/
+   catch shape every other tool uses.
+3. Add four `case` branches to the big `switch (command)` in
+   `executeCommand()` (`mcp-bridge-auto.jsx`), following the
+   `logToPanel("Calling X function..."); result = X(args);
+logToPanel("Returned from X.");` pattern used by every other case.
+4. Implement the four functions themselves near the other project-level
+   functions (`getProjectInfo`, `listCompositions` are the closest existing
+   analogues for placement).
+5. Add all four bridge command names to `NO_UNDO_GROUP_COMMANDS`.
+6. Rebuild (`npm run build`), reinstall bridge (`npm run install-bridge`),
+   close+reopen the panel in AE (required — ScriptUI doesn't hot-reload),
+   then smoke-test with `manual-tests/smoke-test.mjs` or an ad-hoc script per
+   the pattern already established there. Test the error paths deliberately:
+   a dirty project with `saveFirst:false` (confirm it discards, don't just
+   assume), and a never-saved dirty project with `saveFirst:true` (confirm
+   the informed error fires instead of a crash or silent no-op).
+
+## SPEC: asset-management tools — IMPLEMENTED and verified 2026-07-29
+
+(branch `feature/asset-management-tools`)
+
+Written and implemented 2026-07-29, branched off
+`feature/project-lifecycle-tools` (a deliberate stack, not the general
+"branch from main" default — these two blocks are being built sequentially
+this time).
+
+Closes ishu86 gap #2: `import_footage`, `import_folder`, `replace_footage`,
+`find_missing_footage`, `collect_files`, `reduce_project`,
+`organize_project_items`. ishu86's CEP extension can't execute here (see the
+CEP blocker section above), so its **source** was read directly as ground
+truth for the real AE ExtendScript API surface rather than guessed from
+memory.
+
+**Confirmed from ishu86's source** (`assetGenerators.ts` /
+`projectGenerators.ts`):
+
+- `item.replace(file)` and `app.project.reduceProject([comp, ...])` are
+  genuine single native AE API calls — direct 1:1 ports.
+- "Import a folder," "find missing footage," "collect files," and "organize
+  into folders" have **no native AE API** — all four are hand-rolled via
+  `app.project.numItems`/`item(i)` iteration plus real properties
+  (`footageMissing`, `usedIn`, `parentFolder`, `items.addFolder()`) and real
+  `File`/`Folder` methods (`File.copy()`, `Folder.getFiles()`).
+- ishu86's zod schemas (`schemas.ts`) are dead code — never imported by the
+  actual handler, which casts args to `any`. Not evidence of what's actually
+  validated in that project.
+
+**Three deliberate deviations from ishu86**, decided before implementation:
+
+1. **`collect-files` does not repoint the live project.** ishu86 calls
+   `app.project.save(newPath)` to write the collected copy, which silently
+   changes what `app.project.file` points to — a later plain "save" would
+   overwrite the collected copy instead of the user's original. This version
+   requires the project already be saved, then uses `File.copy()` on the
+   existing `.aep` (never `app.project.save()` on the new path), so the live
+   project's identity never changes.
+2. **`reduce-project` requires explicit `confirm:true` (no default) and
+   explicit `compNames` (no active-comp fallback).** It permanently deletes
+   unused project items and isn't reliably undoable via Edit>Undo — same
+   informed-consent pattern as `saveFirst` on the project-lifecycle tools.
+3. **`organize-project-items`'s `custom` mode is a genuine new feature, not a
+   port.** ishu86's own `custom` mode creates named folders but never
+   actually moves any item into them (an unfinished no-op in their code).
+   This version adds a real `customFolders: [{folderName, itemNames?,
+itemIds?}]` mapping so items actually land where specified.
+
+Also: `import-folder` and `collect-files` both accumulate a `note` string of
+per-item failures (matching the existing pattern in `seeFrame()`) instead of
+ishu86's silent `catch (e) {}` swallowing.
+
+None of the 7 join `NO_UNDO_GROUP_COMMANDS` — a plain per-command undo group
+is correct for all of them. `find-missing-footage` joins `READ_ONLY_COMMANDS`
+(genuinely read-only, matches ishu86 not wrapping it in an undo group
+either).
+
+Full schema/logic detail for all 7 tools is implemented directly in
+`src/index.ts` (schemas) and `src/scripts/mcp-bridge-auto.jsx` (bridge
+functions) — this section records the _why_, the code itself is the
+authoritative _what_.
+
+**Verified 2026-07-29** via `manual-tests/asset-management-test.mjs`, a
+46-step scripted test following the same safety discipline as
+project-lifecycle: saved and closed the real project first, ran every
+mutating/destructive case (imports, replace, organize in all 3 modes,
+reduce-project's confirm gate, collect-files) against disposable scratch
+projects only, then restored the real project and confirmed its 3 layers
+still intact. All assertions passed on the second run (first run had two
+test-script bugs, not product bugs — a wrong expected count for
+`organize-project-items` type mode once `import-folder`'s own root-folder
+nesting was accounted for, and a forgotten `save-project` call before testing
+`collect-files`'s save-required gate — both fixed in the test, not the
+tools). Notably, `replace-footage` was verified via an independent
+`execute-script` check reading `itemByID(id).file.fsName` back, not just
+trusting the tool's success message, and `collect-files`'s no-repoint
+behavior was directly asserted by confirming `getProjectInfo`'s `path`
+matched the pre-collect saved path exactly afterward.
+
+Re-run `node manual-tests/asset-management-test.mjs` (from the repo root)
+after any future change to these 7 tools.
+
+## SPEC: expression-suite tools — IMPLEMENTED and verified 2026-07-29
+
+(branch `feature/expression-suite-tools`)
+
+Written 2026-07-29, branched off `feature/asset-management-tools` (continuing
+the sequential stack). Closes ishu86 gap #3. **Scoped tighter than the
+previous two blocks** — this session had ~25% of a 5h budget left when this
+block started, so fewer tools than ishu86 has, reusing existing helpers
+wherever possible.
+
+ishu86's `expressionGenerators.ts` was read directly as ground truth:
+
+- `set_expression`/`remove_expression` are just `prop.expression = "..."`/`""`
+  — **already fully covered by this fork's existing `setLayerExpression`**
+  (empty string already clears it per its own description). Not
+  reimplemented — would be pure duplication.
+- `add_expression_control` = adding a Slider/Angle/Color/Point/Checkbox/Layer
+  Control **effect** via match-name (`"ADBE Slider Control"` etc.), then
+  setting its one sub-property. ishu86 silently discards Dropdown Control's
+  default value (no map entry). Not replicated - see deviation below.
+- `link_properties` = a hand-rolled one-way expression
+  (`thisComp.layer("X").property("Y").value [+ offset]`) — **not** AE
+  parenting. ishu86 also has a `if (params.targetLayerIndex)` truthy-check
+  bug (breaks for index 0, low-impact since AE layers are 1-indexed anyway,
+  but fixed here for free using `!== undefined` consistently).
+- `apply_expression_template` = 20 hardcoded expression strings + naive
+  `{{param}}` substitution on top of `set_expression`. **Deliberately shipped
+  a smaller 6-template set here** (wiggle, loop, time, bounce, inertia,
+  overshoot) instead of porting all 20 - a budget-driven scope cut, easy to
+  extend later.
+- ishu86 also built (but never wired to a tool) a batch-expression-setter and
+  a template-introspection tool. Batch-expression-setter **implemented
+  2026-07-29** as `batch-set-expression` - see the spec section immediately
+  below. Template-introspection remains deferred (assessed as low-value: only
+  6 templates exist, already documented in the tool's own schema).
+
+**Reuse, not reinvention**: `findPropertyByNameOrMatchName(container,
+propertyName)` (`mcp-bridge-auto.jsx:858`) resolves a property by name or
+matchName - used by every new tool instead of writing new resolution logic.
+`LayerIdentifierSchema` (`compIndex`/`layerIndex`, already used by
+`setLayerKeyframe`/`setLayerExpression`) is the schema shape for every new
+tool's layer target - no new schema design needed there either.
+
+**Five tools added**: `get-expression` (read-only: expression string +
+enabled + error), `enable-expression` (toggles `.expressionEnabled` without
+touching the string - distinct from clearing via `setLayerExpression`),
+`add-expression-control`, `link-properties` (same-comp only, matching
+ishu86's actual scope), `apply-expression-template`. Full schema/logic detail
+is in `src/index.ts` and `src/scripts/mcp-bridge-auto.jsx` - this section
+records the _why_.
+
+**Verified 2026-07-29** via `manual-tests/expression-suite-test.mjs` (22
+steps, one disposable scratch project, lean per the budget constraint) - all
+assertions passed on the first real run (after fixing a test-script schema
+mistake for `createSolidLayer`, an existing tool called via `run-script`
+whose args I had wrong - `compName` not `compIndex`, `color` as a `[r,g,b]`
+0-1 array not an `{r,g,b}` 0-255 object, `size` not `width`/`height`; not a
+new-tool bug). Notably confirmed: `get-expression` round-trips a string set
+via the existing `setLayerExpression`; `enable-expression` toggles state
+without altering the expression text; `add-expression-control`'s default
+value was verified actually applied via an independent `execute-script`
+read (not just the tool's own success message), and the dropdown limitation
+surfaces as a `note` rather than silently vanishing; `link-properties`
+produces a real cross-layer expression string; `apply-expression-template`
+substitutes params with no leftover `{{...}}` tokens. Real project (3
+layers) restored intact at the end.
+
+## SPEC: batch-set-expression — IMPLEMENTED and verified 2026-07-29
+
+(branch `feature/batch-expression-setter`)
+
+Follow-up to the expression-suite block above, closing the
+batch-expression-setter gap noted there. Motivated by a real use case ("add
+a wiggle to all 8 text layers in one call" instead of N separate
+`setLayerExpression` round-trips). Scoped deliberately narrow: **one
+property name + one expression string applied to many layers** in the same
+comp, not a general per-item-different-expression batch tool - that's more
+flexibility than the motivating use case needs.
+
+**Resolution-family decision**: `setLayerExpression` (the single-layer tool
+this batches) uses the older raw-positional `LayerIdentifierSchema` +
+`_resolveCompAndLayerSimple` family. But this file's own "Known
+limitations" section says new tools should default to the comp-ordinal,
+`compName`-preferring `_resolveComp`/`_resolveLayer` family instead (the
+convention block #6 and `batch-set-layer-properties` already use), to avoid
+growing the unsafe-family list. `batch-set-expression` follows that
+guidance rather than matching `setLayerExpression`'s own family - it's a new
+bridge function built by combining three already-shared helpers
+(`_resolveComp`, `_resolveLayer`, `_resolveLayerProperty`), not new
+resolution logic. One side effect: `CompIdentifierSchema` (previously
+declared inline just before block #6's tools, ~line 3765) was moved up next
+to `LayerIdentifierSchema` (~line 937) so it's in scope for this tool's
+earlier position in the file - a pure relocation, no shape change.
+
+**Response shape decision**: modeled on `batch-set-layer-properties`'s
+`results[]` array of per-item `{layerIndex, layerName, status, message}`
+objects (top-level `status: "success"` even when individual items fail),
+not `copy-effects`'s flat `warnings[]` string list. This tool's items are
+independent per-layer pass/fail outcomes - exactly what `results[]` already
+models - whereas `warnings[]` is for accumulating non-fatal sub-issues
+within one logical operation, which doesn't fit here.
+
+**One tool added**: `batch-set-expression` - `compName`/`compIndex` (comp-
+ordinal) once, plus `propertyName`, `expressionString`, and a `targets`
+array of `{layerIndex}`/`{layerName}`. Empty-string `expressionString`
+removes the expression from every target, matching `setLayerExpression`'s
+existing convention.
+
+**Verified 2026-07-29** via `manual-tests/batch-expression-test.mjs` - all
+assertions passed on the first real run. Confirmed: expression applied to
+all 3 targets in one call and round-tripped via an independent
+`get-expression` read (not just the tool's own success message); a batch
+with one valid `layerName` and one nonexistent one reports
+`successCount: 1` of 2, with the bad target's per-item result
+`status: "error", message: "Layer not found"` while the valid target still
+succeeds (partial-failure isolation, top-level `status` stays "success");
+an invalid `propertyName` on an otherwise-valid layer reports a per-item
+"not found" error without aborting the batch; empty-string
+`expressionString` removed the expression, confirmed via `get-expression`
+returning `expression: ""`. Real project (3 layers) restored intact at the
+end.
+
+## SPEC: keyframe-manipulation tools — IMPLEMENTED and verified 2026-07-29
+
+(branch `feature/keyframe-manipulation-tools`)
+
+Written 2026-07-29, branched off `feature/expression-suite-tools`. Closes
+ishu86 gap #4 (final block on the current priority list):
+`offset_keyframes`, `scale_keyframe_timing`, `reverse_keyframes`,
+`copy_keyframes`, `apply_easy_ease`, `get_keyframes`.
+
+ishu86's `keyframeGenerators.ts` was read directly as ground truth. Key
+findings:
+
+- AE's scripting DOM has **no `setKeyTime()`** - `keyTime` is read-only, so
+  moving/scaling/reversing keyframe times is forced to be
+  destroy-all-keys + recompute + rebuild, a genuine API constraint, not a
+  shortcut.
+- `get-keyframes` is only partially redundant with this fork's existing
+  `inspect-layer`/`includeKeyframes` (`dumpLeaf()` in the jsx file) - that
+  only covers Transform-group properties, not effects, and neither source
+  returns temporal ease (speed/influence). Building it properly closes a
+  real gap rather than duplicating.
+- **Two real bugs found in ishu86, not replicated**: (1)
+  `offset_keyframes`/`scale_keyframe_timing` silently drop any keyframe
+  whose recomputed time goes negative during rebuild, yet still report the
+  _original_ key count as moved/scaled - fixed here by reporting the actual
+  re-added count plus a `note` for drops. (2) `copy_keyframes`/
+  `apply_easy_ease` use a falsy check (`if (params.xIndex)`) instead of
+  `!== undefined` on indices - latent (AE indices are 1-based, index 0 never
+  real) but fixed for consistency, same class of fix as `link-properties` in
+  the previous block.
+- `reverse_keyframes` is correct in ishu86 (properly swaps in/out
+  interpolation and ease) - ported directly.
+- `apply_easy_ease`'s ease value is confirmed as AE's real default
+  (`speed=0, influence=33.33`), matching this fork's own `buildEaseArray()`
+  default exactly. **Deliberate improvement**: omitting `keyframeIndex`
+  applies Easy Ease to all keyframes on the property (not an error/no-op) -
+  matches how AE's own Easy Ease command behaves with multiple keyframes
+  selected, and is the more common real use case.
+
+**Reuse, not reinvention**: `_resolveLayerProperty` (added in the expression-
+suite block) handles all property resolution - Transform/Effects/Text, no
+new lookup logic. `findKeyIndexAtTime`, `getPropertyDimensionCount`,
+`buildEaseArray`, `buildEaseArrayFromSpec` (existing, power
+`set-effect-keyframe`) are reused directly by `apply-easy-ease`.
+`LayerIdentifierSchema` is the schema shape for every single-layer tool.
+
+Full schema/logic detail is in `src/index.ts` and
+`src/scripts/mcp-bridge-auto.jsx` - this section records the _why_.
+
+**Verified 2026-07-29** via `manual-tests/keyframe-manipulation-test.mjs` (25
+steps) - two real bugs were found and fixed during verification, neither
+present in ishu86 (they're specific to this fork's own implementation, found
+by actually testing rather than just porting):
+
+1. **`apply-easy-ease` crashed**: "Unable to call setTemporalEaseAtKey ...
+   Value array does not have 1 elements." It sized the ease array using
+   `getPropertyDimensionCount()` (based on the property's _value_ shape - 3
+   for Position's `[x,y,z]`), but AE's temporal ease for a spatial property
+   is a single unified motion-path ease (length 1), not one value per axis -
+   value-dimensionality and ease-dimensionality are different concepts. Fixed
+   by reading the expected length from the key's own existing
+   `keyInTemporalEase(idx).length`/`keyOutTemporalEase(idx).length` instead
+   of guessing from the value shape.
+2. **Interpolation type was silently lost on every rebuild** (`offset-
+keyframes`, `scale-keyframe-timing`, `reverse-keyframes`, `copy-
+keyframes`): every rebuilt keyframe came back as `BEZIER`/`BEZIER`
+   regardless of its original type, with no error (each call was wrapped in
+   a silent `try/catch`, masking it). Root cause: `setTemporalEaseAtKey`
+   appears to force/promote a key to `BEZIER` interpolation as a side
+   effect, and the code called `setInterpolationTypeAtKey` _before_
+   `setTemporalEaseAtKey` - so the ease call clobbered the just-set
+   interpolation type. Fixed by reordering: ease first, interpolation type
+   last, in both `_rebuildKeyframesAtNewTimes` and `copyKeyframes`.
+
+Both were caught specifically because the test asserted on _interpolation
+type surviving the round-trip_ (via an intentionally asymmetric HOLD-in/
+LINEAR-out keyframe) rather than only checking counts and times - a useful
+lesson for verifying future keyframe-touching tools. Also two test-script
+false alarms (not product bugs): the existing `setLayerKeyframe` tool
+deliberately seeds an extra keyframe at `comp.time` on its first call for a
+property, which briefly looked like a keyframe-count bug until traced to
+that existing, intentional behavior; and an early version of the test lost
+its own asymmetric-interpolation test keyframe to an earlier destructive
+offset step, which was a test design issue (fixed by isolating that check to
+its own untouched property) not a tool bug.
+
+Re-run `node manual-tests/keyframe-manipulation-test.mjs` (from the repo
+root) after any future change to these 6 tools.
+
+## SPEC: motion-graphics templates — IMPLEMENTED and verified 2026-07-29
+
+(branch `feature/motion-graphics-templates`, off `feature/keyframe-manipulation-tools`)
+
+Written 2026-07-29. Block #5, chosen over ishu86's deferred
+batch-expression/template-introspection tools because it's a genuinely new
+capability category (composite multi-layer builders for common real
+deliverables) rather than completing something already 90% done. Closes:
+`create_lower_third`, `create_title_card`, `create_transition`,
+`create_logo_reveal`, `create_text_animator`.
+
+ishu86's `templateGenerators.ts` was read directly as ground truth. Confirmed
+portable - every AE call in this category (`addComp`, `addText`, `addSolid`,
+TextDocument mutation, `addProperty("ADBE ...")`, `KeyframeEase`,
+`setTemporalEaseAtKey`, animator/selector match-names) is plain ExtendScript
+with zero CEP-specific surface, same conclusion as every previous block.
+Also confirmed: a second ishu86 file, `src/presets/motion-graphics/index.ts`,
+is dead code (unreferenced), same pattern as `schemas.ts` found earlier -
+not a source to trust for "what's actually wired."
+
+**Six real bugs found in ishu86, fixed here rather than replicated:**
+
+1. `create_lower_third` accepts `secondaryColor` but never uses it anywhere
+   in the function body - dead parameter. Fixed: implemented as a real thin
+   accent stripe under the main bar (defaults to `primaryColor` if omitted,
+   never silently ignored).
+2. `create_lower_third`'s title/subtitle font is hardcoded
+   (`Arial-BoldMT`/`ArialMT`) for every style, despite a _different_, unused
+   ishu86 file implying styles should carry their own font. Fixed: a
+   per-style font default, plus an optional `fontFamily` override (this
+   fork's `createTextLayer` already supports arbitrary fonts, so this is
+   cheap and consistent).
+3. `create_transition`'s `easing` param is declared in the schema and typed,
+   but never referenced in the function body at all - completely dead.
+   Fixed: genuinely wired using this fork's own existing `buildEaseArray`/
+   `KeyframeEase`/`setTemporalEaseAtKey` (already proven in the
+   keyframe-manipulation block), applied in the correct order discovered
+   last block (ease before interpolation type - `setTemporalEaseAtKey`
+   appears to force-promote to BEZIER, so setting interpolation type last is
+   what makes it stick).
+4. `create_logo_reveal`: if neither `logoItemId` nor `logoItemName` is
+   supplied (neither is in the schema's `required` list, so this is
+   reachable), the generated code never declares the `logoItem` variable in
+   that branch, then immediately checks `if (!logoItem)` - a raw ES3
+   `ReferenceError`, not the intended friendly error. Fixed: explicit
+   validation in the bridge function returns a clear error instead.
+5. `create_logo_reveal`'s `style` schema enum has 6 values but the
+   implementation only handles 5 - `particle` silently falls through with
+   zero animation (logo just appears, no reveal). Fixed: `particle` dropped
+   from the enum entirely rather than accepted-and-ignored, matching the
+   same principle as `organize-project-items`'s custom-mode decision in the
+   asset-management block (implement properly or omit, never silently no-op).
+6. `create_text_animator`'s `delay` param is read into a local variable and
+   then never used again - dead. Its `wave` style also isn't a true
+   per-character wave (a shared, non-oscillating position offset plus a
+   scrolling selector window, despite the description implying real
+   per-character motion). Fixed: `delay` genuinely wired as a per-character
+   stagger via a `textIndex`-based expression on the selector (the standard
+   AE technique); `wave` rewritten as a real per-character oscillating
+   expression (`Math.sin(time*speed + textIndex*phase) * amplitude` on the
+   animator's Position), not a keyframed approximation.
+
+**Reuse**: comp resolution (by name, falling back to the active comp) is
+already duplicated identically across `createTextLayer`/`createSolidLayer`/
+`createShapeLayer` - factored into one new shared `_resolveCompByNameOrActive`
+helper used by all 5 new functions, without touching those 3 existing
+functions. Color convention matches the existing `[r,g,b]` 0-1 array
+established by those same functions, not ishu86's differing format. New
+functions call raw AE APIs directly (matching ishu86's own approach and this
+fork's own style in the keyframe-manipulation block) rather than composing
+through the 3 existing functions, since those return JSON strings rather than
+live layer references, making composition more awkward than writing focused
+code directly.
+
+**Schema conventions**: the 4 layer-creating tools (`create-lower-third`,
+`create-title-card`, `create-transition`, `create-logo-reveal`) use
+`compName` (optional, falls back to active comp) matching `createTextLayer`/
+`createSolidLayer`/`createShapeLayer` exactly - they're peers of those
+functions (add something to a target comp), not of the
+`compIndex`+`layerIndex` tools (which modify an existing layer).
+`create-text-animator` uses `LayerIdentifierSchema` instead, since it
+modifies an existing text layer, not creates one.
+
+Full schema/logic detail is in `src/index.ts` and
+`src/scripts/mcp-bridge-auto.jsx` - this section records the _why_.
+
+**Verified 2026-07-29** via `manual-tests/motion-graphics-templates-test.mjs`
+(28 steps). This was the most bug-dense block so far - four real bugs found
+and fixed, one of them (#3 below) a **cross-cutting bug affecting nearly
+every tool built in every previous block**, not something specific to this
+one. See "Known limitations" below for the full writeup; short version:
+
+1. **Invalid ease influence value.** `_applyEasingAtKey` used `0.1` as
+   "practically no ease" - originally coded as `0.01`, below AE's actual
+   valid range of `[0.1, 100]` for `KeyframeEase`, which crashed
+   `create-transition` outright with a `Constructor` error. Fixed by using
+   the real minimum, `0.1`.
+2. **`app.beginSuppressDialogs()` does not reliably suppress AE's native
+   "unsaved changes" dialog** raised internally by `app.open()`/
+   `app.newProject()` for a dirty current project - it blocked the entire
+   bridge (every MCP tool, not just the one call) until manually dismissed,
+   _even though_ `_resolveSaveFirst` had already decided discarding was
+   safe. Fixed in `createProject`/`openProject` by explicitly calling
+   `app.project.close(CloseOptions.DO_NOT_SAVE_CHANGES)` first (proven
+   reliable, no dialog, across dozens of calls all session) instead of
+   trusting `app.open()`/`app.newProject()` to handle a dirty project
+   silently themselves. This is a real reliability fix to the
+   project-lifecycle tools from block #1, only surfaced now because this
+   block's test created much heavier scratch-project state than any earlier
+   test.
+3. **`app.project.item(index)`'s positional index is not stable creation
+   order** - see "Known limitations" below, this is the big one.
+4. **A Text Animator's "Properties" group is a fixed ~103-slot catalog**
+   (every possible per-character property, Anchor Point always first), not
+   a growable list of what's been added. `addProperty(matchName)` activates
+   a specific slot and returns a working reference to it (so the _write_
+   side - what `create-text-animator` itself does - was correct all along);
+   but re-discovering "the one I just added" afterward via `.property(1)`
+   always returns Anchor Point regardless of what's active. The fix
+   (searching by `matchName` + a non-empty `.expression`/value) was only
+   needed in the _test's_ verification code, not the tool itself - recorded
+   here anyway since it's a real, reusable lesson for any future work
+   touching Text Animator properties.
+
+Also fixed for consistency (not bugs, just correctness identified while
+writing the new code): `_easeDimensionForProperty` was added proactively so
+`create-transition`'s new easing code wouldn't reproduce the exact
+value-dimension-vs-ease-dimension crash already found and fixed in
+`apply-easy-ease` last block - applying that lesson before it could bite a
+second time, rather than after.
+
+Re-run `node manual-tests/motion-graphics-templates-test.mjs` (from the repo
+root) after any future change to these 5 tools.
+
+## SPEC: layer/composition management tools — IMPLEMENTED and verified 2026-07-29
+
+(branch `feature/layer-comp-management-tools`, off `feature/motion-graphics-templates`)
+
+Written 2026-07-29. Block #6, closing out the "Misc" bullet from the
+feature-comparison table above: `precompose_layers`, `add_light_layer`,
+`duplicate_composition`, `reorder_effects`, `copy_effects`, `set_work_area`,
+`delete_marker`. **Plus `delete_composition`**, found sitting right next to
+`DuplicateCompositionSchema` in ishu86's `schemas.ts` while researching this
+block - the feature-comparison table above never listed it as a gap (an
+oversight in that doc, not a deliberate omission), but it's absent from this
+fork too and belongs with the same block.
+
+ishu86's `compositionGenerators.ts`, `layerGenerators.ts`,
+`effectsGenerators.ts`, and `markerGenerators.ts` were read directly as ground
+truth. All 8 are thin wrappers around native AE calls
+(`comp.duplicate()`/`.remove()`, `comp.layers.addLight()`,
+`comp.layers.precompose()`, `effect.moveTo()`, `effectsGroup.addProperty(matchName)`,
+`markerProp.removeKey()`, `comp.workAreaStart`/`workAreaDuration`) - no
+CEP-specific surface, same conclusion as every previous block.
+
+**Key design decision: which comp/layer resolution convention to use.**
+This fork already has _two different, undocumented_ `compIndex` semantics
+coexisting (found while researching this block, not previously written down):
+
+- `_resolveCompAndLayerSimple`/`resolveCompAndLayer` (mcp-bridge-auto.jsx) -
+  `compIndex` = raw 1-based position in the whole Project-panel item list via
+  `app.project.item(compIndex)`. Used by `apply-effect`, `list-layer-effects`,
+  `add-marker`, every `LayerIdentifierSchema` tool. This is the instability
+  already documented below.
+- `_resolveComp`/`_resolveLayer` (mcp-bridge-auto.jsx) - `compIndex` = the
+  Nth _composition_ specifically (a comp-only ordinal counter, comps found by
+  scanning and incrementing a counter only `instanceof CompItem`), with
+  `compName` checked first and active-comp as final fallback. Used by
+  `duplicate-layer`, `delete-layer`, `set-composition-properties`,
+  `set-layer-mask`, `batch-set-layer-properties`.
+- **The same composition can need a different numeric `compIndex` depending
+  on which tool you call** (a folder or non-comp item before it shifts the
+  raw-position count but not the comp-ordinal count). Not fixed (same
+  "sweeping change, out of scope for one block" reasoning as the original
+  finding) - added to "Known limitations" below since it's a real,
+  previously-undocumented gap, not new instability introduced by this block.
+- **Decision for all 8 new tools: use the `_resolveComp`/`_resolveLayer`
+  convention** (`compName` optional, `compIndex` optional as comp-ordinal
+  fallback, active-comp as final fallback; `layerIndex`/`layerName` optional
+  pair where a layer is needed) - matches `duplicate-layer`/`delete-layer`
+  exactly (the closest sibling tools - these are structural/destructive comp
+  and layer operations, not per-property animation edits), and is the
+  direction CONTEXT.md's existing limitations section already recommends
+  ("switching to `compName` everywhere"). No new resolution helpers needed -
+  `_resolveComp`/`_resolveLayer` are reused as-is for all 8.
+
+**Effect resolution reuses `resolveEffectOnLayer`** (mcp-bridge-auto.jsx,
+already backs `remove-effect`: accepts `effectIndex`/`effectName`/
+`effectMatchName`) for `reorder-effects` - a deliberate improvement over
+ishu86, whose `reorder_effects` is index-only with no name fallback at all.
+`copy-effects` needs a _list_ of effects (or "all"), so it iterates
+`effectsGroup.property(i)` directly (ishu86's own approach) rather than
+calling `resolveEffectOnLayer` per index.
+
+**Bugs found in ishu86, not replicated:**
+
+1. `add_light_layer`'s `color` accepts an optional `a` (alpha) component
+   (`ColorSchema` is shared with every other color field) which
+   `colorToES3()` then emits as a 4-element array - passed straight into
+   `.setValue()` on a Light layer's Color property, which is a plain
+   3-component Color control. Fixed here by using this fork's own `[r,g,b]`
+   0-1 array convention (established in the motion-graphics-templates block,
+   no alpha field exists at all) - the bug class doesn't exist in this
+   fork's parameter shape to begin with.
+2. `copy_effects` copies each effect property's current static `.value` via
+   `setValue()`, wrapped in a bare `try {} catch (e) {}` that silently
+   swallows every failure (a keyframed or expression-driven source property
+   can't be copied via a static `setValue` - it just silently doesn't copy,
+   and the caller has no way to know). Fixed here: same no-silent-swallow
+   pattern as `offset-keyframes`/`scale-keyframe-timing` from the
+   keyframe-manipulation block - a `warnings` array in the result lists any
+   property that couldn't be copied and why (keyframed/expression-enabled
+   properties are detected and named explicitly, not lumped in with generic
+   failures).
+3. `delete_marker`/`get_markers`/`snap_to_marker` all use
+   `if (params.layerIndex || params.layerName)` - a falsy check, not
+   `!== undefined`. Same latent-not-triggerable class as `link_properties`/
+   `copy_keyframes` in earlier blocks (AE indices are 1-based, so a real
+   index 0 never occurs through normal use) - fixed for free/consistency.
+4. **`reorder_effects` reads `effect.name`/`effect.propertyIndex` off the
+   _same_ effect reference immediately after calling `effect.moveTo()`.**
+   Confirmed live: After Effects invalidates that reference the instant the
+   move happens - re-reading it throws `ReferenceError: Object is invalid`,
+   so the tool would error out on every call despite the reorder itself
+   succeeding. ishu86's own generated code has the identical bug (reads
+   `effect.name` after `moveTo()` in the same script) - never caught on
+   their side because their CEP extension can't load on this AE install
+   (the persistent blocker noted earlier in this file), so it was never
+   actually run against live AE. Fixed here by capturing `effect.name`
+   _before_ the move, and reporting the already-known `newIndex` from the
+   request instead of re-reading `.propertyIndex` afterward.
+5. **`precompose_layers` treats the return value of
+   `comp.layers.precompose()` as the new replacement layer.** Confirmed
+   live: `precompose()` actually returns the new **`CompItem`** (the nested
+   composition itself), not a layer - reading `.index` or `.source` off it
+   throws `TypeError: undefined is not an object` (neither property exists
+   on a `CompItem`). Same root cause as bug #4 - ishu86's own generated code
+   makes the identical assumption (`generateResultObject({ index:
+'precompLayer.index', ..., sourceCompId: 'precompLayer.source.id' })`)
+   and was never live-tested for the same CEP-blocker reason. Fixed here:
+   the actual replacement layer is looked up afterward at the lowest index
+   among the originally-selected `layerIndices` (AE's own placement rule -
+   confirmed live), and the CompItem's `id`/`name` are reported as
+   `sourceCompId`/`sourceCompName` instead of trying to read them through a
+   nonexistent `.source` on the wrong object type.
+
+**Deliberate scope limits (documented, not fixed):**
+
+- `copy-effects` only copies each effect's current static property values,
+  never keyframes or expressions on those properties (matches ishu86's own
+  scope) - a caller who needs full keyframe fidelity on a copied effect
+  should follow up with this fork's own `copy-keyframes` tool (built last
+  block) for that specific property. Not extended to auto-chain into
+  `copy-keyframes` internally - keeps this tool's behavior simple and
+  predictable rather than surprising.
+- `delete-composition`/`delete-layer` do not check whether the target is
+  used elsewhere (nested as another comp's layer source, referenced in the
+  render queue) before removing it - matches ishu86 and matches this fork's
+  own pre-existing `delete-layer` precedent exactly; native AE behavior
+  applies (referencing layers become missing-source, same as manually
+  deleting in the UI).
+- `set-work-area` does not pre-validate `start`/`duration` against
+  `comp.duration` before calling AE's native setters - matches ishu86's
+  approach exactly. **Correction after live testing (2026-07-29)**: ishu86's
+  own writeup assumes AE clamps an out-of-range `workAreaDuration` silently;
+  live testing on this build shows AE actually **throws** ("Unable to set
+  'workAreaDuration'. Value 100 out of range 0.03 to 4.03.") rather than
+  clamping. Not a bug in this fork's implementation - the bridge function's
+  existing try/catch already surfaces this correctly as a `status:"error"`
+  result instead of a false "success", which is the right behavior; ishu86's
+  assumption about AE's own clamping behavior was simply wrong, and this
+  fork does not repeat it in its documentation or tests.
+
+**Tool-by-tool:**
+
+- `duplicate-composition` (bridge `duplicateComposition`) - `compName`/
+  `compIndex` optional pair, `newName` optional. `comp.duplicate()`.
+- `delete-composition` (bridge `deleteComposition`) - `compName`/`compIndex`
+  optional pair. Captures name before `.remove()`.
+- `add-light-layer` (bridge `addLightLayer`) - `compName`/`compIndex`
+  optional pair, `name`/`type` (`PARALLEL`/`SPOT`/`POINT`/`AMBIENT`, default
+  `POINT`)/`color` ([r,g,b] 0-1, optional)/`intensity` optional.
+  `comp.layers.addLight(name, [comp.width/2, comp.height/2])`.
+- `precompose-layers` (bridge `precomposeLayers`) - `compName`/`compIndex`
+  optional pair, `layerIndices` (required array of 1-based ints, matches
+  ishu86 - AE's own `precompose()` only accepts indices, no name-array
+  alternative exists to offer), `name` required, `moveAttributes` optional
+  (default `true`, matches AE's own UI default). `comp.layers.precompose(...)`.
+- `reorder-effects` (bridge `reorderEffects`) - `compName`/`compIndex` +
+  `layerIndex`/`layerName` optional pairs, `effectIndex`/`effectName`/
+  `effectMatchName` (via `resolveEffectOnLayer`, improvement over ishu86's
+  index-only), `newIndex` required. `effect.moveTo(newIndex)`.
+- `copy-effects` (bridge `copyEffects`) - `compName`/`compIndex` +
+  `sourceLayerIndex`/`sourceLayerName` + `targetLayerIndex`/`targetLayerName`
+  (all via `_resolveComp`/`_resolveLayer`), `effectIndices` optional array
+  (omit = copy all). Returns `copiedEffects`, `count`, and `warnings` (bug
+  fix #2 above).
+- `delete-marker` (bridge `deleteMarker`) - `compName`/`compIndex` +
+  `layerIndex`/`layerName` optional pair (present = layer marker, absent =
+  composition marker, matches ishu86's inference exactly but with
+  `!== undefined` checks), `markerIndex` required.
+  `markerProp.removeKey(markerIndex)`.
+- `set-work-area` (bridge `setWorkArea`) - `compName`/`compIndex` optional
+  pair, `start` required, `duration` required positive.
+
+All 8 added to `allowedScripts` in `src/index.ts`. None added to
+`READ_ONLY_COMMANDS` (all mutate) or `NO_UNDO_GROUP_COMMANDS` (plain,
+individually-undoable ops - the dispatcher's central
+`beginUndoGroup`/`endUndoGroup` wrap is correct as-is, same as every prior
+block's non-render/non-lifecycle tools).
+
+**Verified 2026-07-29** via `manual-tests/layer-comp-management-test.mjs`.
+Re-run after any future change to these 8 tools.
+
+## Known limitations
+
+### `compIndex`'s positional index can shift as a project grows (discovered 2026-07-29)
+
+Every `compIndex`/`layerIndex`-based tool in this fork (the `LayerIdentifierSchema`
+convention - `setLayerKeyframe`, every expression-suite tool, every
+keyframe-manipulation tool, `create-text-animator`, and more) resolves a
+composition via `app.project.item(compIndex)`. That index is **the item's
+current position in the Project panel's flat item list, not a stable ID
+assigned at creation** - confirmed live: a composition created first (and
+initially at position 1) had shifted to **position 3** later in the same
+session, after only a few more items were added and After Effects
+auto-created its own built-in "Solids" folder (a real, automatic AE
+behavior whenever a solid-color layer is created). No tool in this codebase
+did anything to explicitly move or reorder that composition - the position
+simply isn't stable once a project has more than a couple of items or any
+folders.
+
+**Practical impact**: `compIndex` is safe to treat as stable only in a
+freshly-created, simple scratch project immediately after creating the
+target comp (which is exactly the shape of every previous block's test -
+why this was never caught until a test finally created enough items to
+trigger it). In any real project with multiple comps, imported footage, or
+folders (including AE's own auto-created "Solids"/"Comps" folders), a
+`compIndex` captured earlier in a session can silently point at the wrong
+composition later, since nothing about the target comp itself changed.
+
+**Not fixed here** - this is a pre-existing, cross-cutting design property
+of the whole `LayerIdentifierSchema` convention (present since block #1 or
+earlier, in code this fork inherited, not introduced this session), and
+fixing it properly (e.g. switching to `compName` everywhere, or resolving
+`compIndex` against `item.id` instead of positional index) would be a
+sweeping change across every tool in every block, out of scope for a single
+block's fix. Recorded here as a known limitation so a future session
+doesn't have to rediscover it, and so any caller relying on a `compIndex`
+captured earlier in a long session knows to re-resolve it (e.g. via
+`getProjectInfo`, matching by name) rather than trust it stays valid.
+
+**What already avoids this**: the four motion-graphics tools that create
+new content (`create-lower-third`, `create-title-card`, `create-transition`,
+`create-logo-reveal`) all use `compName` (falling back to the active comp),
+not `compIndex` - they were designed this way from the start, matching
+`createTextLayer`/`createSolidLayer`/`createShapeLayer`'s existing
+convention, and are unaffected by this limitation.
+
+### A second, different `compIndex` semantic also exists (discovered 2026-07-29, while researching block #6)
+
+The instability above describes one resolution helper. This codebase
+actually has **two, and they disagree with each other**:
+
+- `_resolveCompAndLayerSimple`/`resolveCompAndLayer` - `compIndex` = raw
+  1-based position in the whole Project-panel item list
+  (`app.project.item(compIndex)`). Backs `apply-effect`,
+  `list-layer-effects`, `add-marker`, every `LayerIdentifierSchema` tool.
+  This is the semantic described above.
+- `_resolveComp`/`_resolveLayer` - `compIndex` = the Nth _composition_
+  specifically (a counter incremented only when `instanceof CompItem`),
+  checked only if `compName` didn't resolve, falling back to the active
+  comp last. Backs `duplicate-layer`, `delete-layer`,
+  `set-composition-properties`, `set-layer-mask`,
+  `batch-set-layer-properties`, and (as of block #6) all 8 new
+  layer/comp-management tools.
+
+**Practical impact**: the same composition can require a _different_
+numeric `compIndex` depending on which tool you call, if any non-comp item
+(a folder, imported footage, a solid) sits before it in the Project panel -
+raw-position counting and comp-only counting diverge as soon as that
+happens. Neither semantic is "wrong" in isolation; the problem is that two
+different tool families silently disagree about what the same parameter
+name means.
+
+**Not fixed here** - same reasoning as above (standardizing on one semantic
+project-wide is a sweeping cross-cutting change, out of scope for a single
+block). Block #6 deliberately chose the `_resolveComp`/`_resolveLayer`
+(comp-ordinal, `compName`-preferring) semantic for all its new tools, since
+it's the direction this limitation already recommended moving toward - so
+new tools added going forward should default to that convention too, rather
+than perpetuating the raw-positional one.
+
+#### Full tool inventory by resolution family (researched 2026-07-29)
+
+A complete Explore pass over `src/index.ts` and `src/scripts/mcp-bridge-auto.jsx`
+found the raw-positional side is actually **three** subtly different
+implementations, not one, plus one tool that bypasses the bridge entirely.
+Use this table to know which counting rule applies before trusting a
+`compIndex` value with any specific tool:
+
+- **Raw-positional via `LayerIdentifierSchema` + `_resolveCompAndLayerSimple`**
+  (`app.project.item(compIndex)`, then bracket `comp.layers[layerIndex]`):
+  `setLayerKeyframe`, `setLayerExpression`, `get-expression`,
+  `enable-expression`, `add-expression-control`, `apply-expression-template`,
+  `get-keyframes`, `offset-keyframes`, `scale-keyframe-timing`,
+  `reverse-keyframes`, `apply-easy-ease`, `create-text-animator` (12 tools,
+  all bare-required `compIndex`+`layerIndex`, no `compName`/`layerName`
+  alternative).
+- **Raw-positional via the `resolveCompAndLayer` helper** (same
+  `app.project.item(compIndex)`, but method-call `comp.layer(layerIndex)`
+  and defaults both indices to `1` if omitted): `set-effect-property`,
+  `set-effect-keyframe`, `list-layer-effects`, `remove-effect`,
+  `set-audio-levels`.
+- **Raw-positional, resolved inline** (`app.project.item(compIndex)`
+  written directly in the bridge function, no shared helper at all):
+  `apply-effect`, `add-any-effect`, `apply-effect-template`, `add-marker`,
+  `get-audio-info`, `center-layers`, `get-layer-clip-frames`.
+- **Raw-positional via bracket indexing on the whole items collection**
+  (`app.project.items[compIndex]` - not even `.item()` - plus
+  `comp.layers[idx]` bracket for both layers): `link-properties`,
+  `copy-keyframes`. The least safe existing variant, and the only one with
+  _no_ name-based alternative on the layer side either (no
+  `sourceLayerName`/`targetLayerName`).
+- **Comp-ordinal, `compName`-preferring (`_resolveComp`/`_resolveLayer`) -
+  already safe, no action needed**: `duplicate-layer`, `delete-layer`,
+  `set-composition-properties`, `set-layer-mask`,
+  `batch-set-layer-properties`, all 8 block-#6 tools
+  (`duplicate-composition`, `delete-composition`, `add-light-layer`,
+  `precompose-layers`, `reorder-effects`, `copy-effects`, `delete-marker`,
+  `set-work-area`), the 4 motion-graphics creators (`create-lower-third`,
+  `create-title-card`, `create-transition`, `create-logo-reveal`),
+  `localize-comp`, `create-camera`, `inspect-comp`, `inspect-layer`,
+  `animate-to-audio`/`animate-from-data`, `batch-set-expression`,
+  `set-time-remap`.
+- **Deliberately excluded from any future fix, vestigial**: `test-animation`
+  (`src/index.ts` ~line 1436). Bypasses the bridge dispatcher entirely -
+  writes a standalone `.jsx` temp file the user must manually run via
+  `File > Scripts > Run Script File...`, uses blocking `alert()` popups,
+  and duplicates what `setLayerKeyframe`/`setLayerExpression` already do
+  properly through the real bridge. Inherited from the base fork, not part
+  of the maintained tool surface - a candidate for removal, not migration,
+  if anyone ever revisits it.
+
+#### Mitigation adopted instead of a full refactor (decided 2026-07-29)
+
+A full standardization pass (migrate all ~20 tools above onto
+`_resolveComp`/`_resolveLayer`, delete `_resolveCompAndLayerSimple`/
+`resolveCompAndLayer`) was scoped out in detail but **deliberately not
+implemented**: the actual trigger condition for a wrong-target bug is
+narrow (a non-comp item before the target comp, _and_ a caller reusing a
+`compIndex` across the wrong tool family without re-resolving), it hasn't
+caused a real observed incident, and the fix would be the single largest,
+most cross-cutting change of the whole project - including a breaking
+semantic change to `compIndex` on 12+ tools - for a bug class that's still
+hypothetical in practice.
+
+Instead, the safety net is enforced as **repo-resident agent guidance**
+rather than a code change: `.claude/skills/ae-mcp-compindex-safety/SKILL.md`
+(auto-discovered by any Claude Code session opened in this repo) and
+`AGENTS.md` (repo root, the cross-tool convention other coding agents like
+Codex auto-load) both codify the safe practice - prefer `compName`
+wherever a tool accepts it; if only `compIndex` is available, re-resolve it
+immediately before the call using the counting rule for that _specific_
+tool family from the table above, never reuse a `compIndex` captured for a
+different tool. If this bug class ever causes a real, observed
+wrong-target incident, that would be the trigger to revisit the full
+refactor with a concrete case to test against instead of a hypothetical
+one.
+
+## SPEC: set-time-remap — IMPLEMENTED and verified 2026-07-29
+
+(branch `feature/time-remap-tool`)
+
+Closes the highest value-for-effort item from `GAPS.md` (written the same
+day): AE's "Enable Time Remapping" feature - freeze frames and speed ramps
+on a layer's own playback - had no tool in this fork or in any sibling repo
+(repo A, repo B, ishu86).
+
+**Key finding, correcting `GAPS.md`'s own cost estimate**:
+`_resolveLayerProperty(layer, propertyName)` (`mcp-bridge-auto.jsx:1108`)
+only searches three fixed groups - `"ADBE Transform Group"`, `"ADBE Effect
+Parade"`, `"ADBE Text Properties"`. Time Remap (`"ADBE Time Remapping"`) is
+a top-level `AVLayer` property, a sibling of those groups, not nested under
+any of them - and it doesn't exist at all until `layer.timeRemapEnabled =
+true` is set. `GAPS.md` assumed the existing property-resolution helpers
+"can likely already handle" Time Remap once enabled; this turned out to be
+wrong. `setTimeRemap()` uses direct `layer.property("ADBE Time Remapping")`
+access instead (locale-safe match-name lookup, the standard ExtendScript
+pattern), not `_resolveLayerProperty`.
+
+**Resolution-family decision**: `_resolveComp`/`_resolveLayer`
+(comp-ordinal, `compName`-preferring), matching `batch-set-expression`'s
+decision and this file's standing guidance for all new tools.
+
+**One tool, two optional params, four behaviors** - deliberately not split
+into separate enable/disable/get/set tools:
+
+- `enabled: false` -> disable time remapping (removes the property and any
+  keyframes on it).
+- `enabled` omitted (default true) + `keyframes` omitted -> ensure time
+  remapping is on (AE auto-creates 2 default keyframes at the layer's
+  in/out points the first time it's enabled) and return the current state.
+  This same call also serves as the read/inspect path - no separate getter
+  needed.
+- `enabled` omitted (default true) + `keyframes` provided -> ensure it's
+  on, then `property.setValueAtTime(time, value)` for each `{time, value}`
+  pair (same mechanism `setLayerKeyframe` already uses elsewhere), adding
+  or overwriting a keyframe at that comp time. Equal `value`s across two
+  keyframes freeze the frame between them; differing `value`s create a
+  speed ramp (the slope of value-over-time is the effective playback
+  speed).
+
+**Per-keyframe error isolation**: each keyframe's `setValueAtTime` call is
+wrapped individually and collected into a `keyframeResults[]` array (same
+partial-failure-isolation pattern `batch-set-expression` established) - one
+bad keyframe doesn't abort the rest, and the response also always includes
+the full current `keys[]` state afterward.
+
+**Response shape**: the `keys[]` field reuses `getKeyframes`'s exact
+per-keyframe serialization (`time`, `value`, `inInterp`/`outInterp` via
+`enumName(KeyframeInterpolationType, ...)`, `inEase`/`outEase` as
+`{speed, influence}`) rather than inventing a new keyframe JSON shape.
+
+**Layer-type guard**: `layer instanceof AVLayer` is checked first (rules
+out camera/light layers, which aren't `AVLayer` at all), then
+`layer.timeRemapEnabled = true` is wrapped in its own try/catch, since AE
+throws for AV layers whose source isn't time-based (e.g. text/shape
+layers) - this surfaces as a clear per-call error rather than a crash.
+
+**Verified 2026-07-29** via `manual-tests/time-remap-test.mjs` - all
+assertions passed on the second run (see correction below). Time remap
+needs a layer with genuine time-varying source content, so the test builds
+one via `precompose-layers` (a text layer with a `wiggle` expression on
+Position, precomposed into a nested comp) and runs `set-time-remap` against
+the resulting precomp layer. Confirmed: default-enable creates AE's own 2
+default keyframes at the layer's in/out points (`numKeys: 2`); a
+freeze-frame pair (`{time:1,value:0.5}`/`{time:3,value:0.5}`) round-trips
+both keyframes at value 0.5; a speed-ramp pair (`{time:4,value:1}`/
+`{time:5,value:3}`) round-trips with distinct values; `enabled: false`
+disables time remapping, and a follow-up default call re-enables with a
+_fresh_ default 2-keyframe state, confirming the prior custom keyframes
+were actually discarded (not just hidden); the real project's 3 layers
+were unchanged after restore.
+
+**Correction, found live (not assumed)**: the test's first run asserted
+that a negative `time` value would fail the per-keyframe try/catch, based
+on a comment elsewhere in this file's codebase (`_rebuildKeyframesAtNewTimes`,
+which deliberately _skips_ negative `newTime` as its own design choice, not
+because AE's API rejects it). That assumption was wrong - AE's Time Remap
+`setValueAtTime` accepted `time: -5` without throwing, inserting a
+keyframe before the layer's nominal start. The test was corrected to assert
+the real (permissive) behavior. The per-keyframe try/catch itself is
+unchanged and still defensively correct (matches `batch-set-expression`'s
+proven pattern) - this run just didn't find a live input that exercises the
+catch branch. Worth knowing for anyone building on top of this tool:
+Time Remap keyframing is very permissive about `time`/`value` ranges: a
+caller can produce values before the layer's start or in ranges that don't
+correspond to real source content, which will read back as black/held
+frames rather than erroring.
+
+## Next planned step
+
+All 6 originally-planned tool blocks are implemented and verified (project
+lifecycle, asset management, expression suite, keyframe manipulation,
+motion-graphics templates, layer/composition management), plus follow-up
+blocks: the `compIndex` docs mitigation, `batch-set-expression`, and
+`set-time-remap`. `GAPS.md` (written 2026-07-29) tracks further candidates
+found by comparing against sibling repos and general AE capability, ranked
+by value-for-effort - check there before starting new work.
+
+**Layer styles were investigated and found blocked**, not implemented:
+AE's scripting API does not support enabling or configuring Layer Styles
+at all (`canSetEnabled: false` for the master group and every individual
+style, confirmed live on text/solid/shape layers) - see `GAPS.md` item #3
+for the full finding. This is a platform limitation, not something to
+revisit without a genuinely new angle (e.g. an `.ffx` preset-based
+workaround, not yet investigated).
+
+The full `compIndex` semantic standardization remains deliberately
+deferred until it causes a real observed incident rather than staying a
+documented/mitigated risk (see "Known limitations" above).
+
+## SPEC: frameNumbers param on see-frame — IMPLEMENTED and verified 2026-07-29
+
+(branch `feature/frame-index-param`)
+
+Closes `GAPS.md` item #5: `see-frame`'s `times` param was seconds-only, so
+capturing an exact frame on a non-round frame rate (23.976, 29.97) required
+the caller to compute `frame / frameRate` themselves. Added a `frameNumbers`
+param (same `number | number[]` shape as `times`, combinable with it) -
+conversion happens in the bridge's `seeFrame()` using the resolved comp's
+own `frameRate`, right before the existing clamp-into-`[0, duration]` loop,
+so both params share the same clamping/rendering path. `contact-sheet` was
+deliberately left alone - it only takes a `count` (auto-sampled evenly), no
+explicit position list, so a frame-index alternative doesn't apply there.
+
+Verified via `manual-tests/frame-index-param-test.mjs` against the real
+project's "Comp 1" (29.97 fps): `times` alone, `frameNumbers` alone (single
+number and array form), and both combined in one call all returned the
+expected image counts.
+
+## SPEC: set-shape-path / get-shape-path — IMPLEMENTED and verified 2026-07-29
+
+(branch `feature/shape-path-authoring`)
+
+Closes `GAPS.md` item #1: nothing could author a freeform bezier path on a
+shape layer. `createShapeLayer` only builds parametric shapes (Rect/Ellipse/
+Star); `set-layer-mask`'s `new Shape()` never touched `inTangents`/
+`outTangents` and hardcoded `closed = true`.
+
+### Live feasibility probe (Phase 0, before any code was written)
+
+Per `GAPS.md`'s own warning ("worth confirming a concrete use case first",
+the same discipline that caught the layer-styles block), every design
+assumption below was verified live against AE 26.0x67 with
+`manual-tests/shape-path-probe.mjs`, using only the existing `execute-script`
+tool (no bridge changes needed to probe). Findings, in the order they change
+the design:
+
+- **P1 - writable at all**: `"ADBE Vector Shape - Group"` is addable inside a
+  vector group's Contents, and exposes `"ADBE Vector Shape"` as a real
+  `PropertyValueType.SHAPE`, `canVaryOverTime: true` property. Not blocked
+  like Layer Styles.
+- **P2/P3 - tangents round-trip, and are RELATIVE to their own vertex**:
+  written verbatim, read back exact (shape-layer paths are full float
+  precision). A vertex far from the origin with a tangent of `[50,0]` reads
+  back as exactly `[50,0]`, not translated into absolute coordinates.
+- **P4 - AE does NOT validate array lengths**: a `Shape` with 3 vertices and
+  2 `inTangents` is accepted silently, zero-filling the missing entry. This
+  is the reason `src/lib/shape-path.ts` exists at all - validation has to
+  happen before the data reaches AE, because AE will not catch it.
+- **P5 - keyframing works, but reference invalidation is real**: `Shape`
+  properties are keyframable via `setValueAtTime`. AE also accepts
+  _mismatched vertex counts across keyframes_ without error - it just
+  interpolates the in-betweens into a torn, garbage shape - so
+  `assertMorphCompatible` rejects this client-side instead. Separately (and
+  initially crashed the probe): a property reference obtained from a group
+  **is invalidated by any later `addProperty` on that same group**
+  (`ReferenceError: Object is invalid`). The bridge handler works around
+  this by doing every `addProperty` (group, path, fill, stroke) first, then
+  resolving the Path property fresh at the end - see the comment above
+  `setShapePath`'s fill/stroke block.
+- **P6 - coordinate space**: a shape layer's default anchor point is
+  `[0,0,0]`, default position is the comp centre. Path vertex `[0,0]`
+  therefore renders at the comp's centre, not its top-left, and not the
+  origin of comp space. Confirmed visually (a square with vertex `[0,0]` at
+  its top-left corner rendered dead-centre in a 640x360 comp). Y is positive
+  downward, matching AE's general convention. This is stated explicitly in
+  the `set-shape-path` tool description because it's the failure mode most
+  likely to make a numerically-correct call look wrong.
+- **P7 - parametric shapes have no Path property**: `"ADBE Vector Shape -
+Rect"`'s children are Shape Direction/Size/Position/Roundness - no
+  `"ADBE Vector Shape"` anywhere. There is no scripted conversion from
+  parametric to freeform; a bezier path always needs its own
+  `"ADBE Vector Shape - Group"`.
+- **P8/P9 - mask paths accept tangents and keyframes too**: `"ADBE Mask
+Shape"` round-trips `inTangents`/`outTangents` and is keyframable via
+  `setValueAtTime`, same as shape-layer paths. One real difference: mask
+  paths round-trip at _lower precision_ (a written `40` reads back as
+  `39.9999847412109`, ~3e-5 drift) where shape-layer paths are exact. Masks
+  also accept `closed: false` (an open path), which `set-layer-mask` had
+  never exposed.
+- **P10 - a bare path with no Fill and no Stroke renders literally nothing**.
+  Confirmed visually: an identical path/frame combination rendered an empty
+  white frame with no fill, then a visible green rectangle after adding one.
+  `setShapePath` therefore adds a default white Fill when the caller
+  supplies neither `fillColor` nor `strokeColor`, and reports this in
+  `notes` so it's never a silent surprise.
+
+### Design
+
+- **Property chain**: `ShapeLayer` -> `"ADBE Root Vectors Group"` (Contents)
+  -> `"ADBE Vector Group"` (one per shape; `groupIndex` selects/creates) ->
+  `"ADBE Vectors Group"` (that group's Contents) -> `"ADBE Vector Shape -
+Group"` (`pathIndex` selects/creates) -> `"ADBE Vector Shape"` (the
+  writable Path). Omitting `groupIndex`/`pathIndex` appends a new group/path;
+  supplying both overwrites an existing one (read the indices back first
+  with `get-shape-path`).
+- **Two tools**: `set-shape-path` (write; can create the layer via
+  `createLayer: true`) and `get-shape-path` (read-only, in
+  `READ_ONLY_COMMANDS`; enumerates every group/path plus their non-path
+  siblings - fills, strokes, parametric shapes - when indices are omitted,
+  so structure is discoverable rather than assumed).
+- **Input shape**: either explicit `vertices` (+ optional `inTangents`/
+  `outTangents`/`closed`) or a `generator` spec - never both. Generators
+  (`roundedRect`, `ellipse`, `polygon`, `star`) run server-side in
+  `src/lib/shape-path.ts`, not in ExtendScript, so the JSX handler stays one
+  code path and the generator math gets real vitest coverage (34 tests) -
+  the only automated coverage this whole feature has, since `tests/` never
+  reaches `index.ts` or the `.jsx`.
+- **Validation happens in TypeScript, before the bridge**: `normalizePath`
+  enforces vertex/tangent array agreement (P4), `assertMorphCompatible`
+  enforces equal vertex counts across morph keyframes (P5) - both are things
+  AE itself silently gets wrong rather than errors on.
+- **`set-layer-mask` retrofit**: added `maskInTangents`/`maskOutTangents`
+  (curved masks), `maskClosed` (open paths, was hardcoded `true`), and `time`
+  (writes a keyframe via `setValueAtTime` instead of a static value).
+  Omitting all four reproduces the exact prior behaviour - verified by
+  re-running the original raw-`maskPath` call shape unchanged.
+- **Bridge version bumped** `1.10.0-mcp-enhanced` -> `1.11.0-mcp-enhanced`
+  (both `mcp-bridge-auto.jsx`'s `BRIDGE_VERSION` and `index.ts`'s
+  `EXPECTED_BRIDGE_VERSION`), the first version bump since the initial
+  commit - the three tool blocks immediately before this one had skipped it.
+
+### Verification
+
+`tests/shape-path.test.ts` (34 tests): `normalizePath` validation/defaults,
+`assertMorphCompatible`, and geometric assertions on all four generators
+(vertex counts, kappa handle scaling, radius clamping, rotation, closed
+flags). `npm run typecheck && npm test && npm run lint` all clean (the only
+lint errors anywhere in the repo are pre-existing `no-undef`/`no-empty`
+findings in older `manual-tests/*.mjs` files, confirmed unrelated by running
+`npx eslint src tests` alone).
+
+`manual-tests/shape-path-test.mjs` against live AE (43 assertions, all
+passing), following the mandated save -> close -> scratch project -> mutate
+-> close -> reopen original -> assert-unchanged discipline: raw vertex/tangent
+round-trip through `get-shape-path`; all four generators produce the right
+vertex counts and genuinely curved output (not polygons); a 3-keyframe morph
+with matching vertex counts (a 10-gon animating outward into a 5-point star,
+both 10 vertices) succeeds and reads back correctly; a mismatched-vertex-count
+morph and a tangent/vertex length mismatch are both rejected client-side with
+messages naming the exact problem; overwriting an existing path via
+`groupIndex`/`pathIndex` works; targeting a Fill's index as if it were a path
+returns a clean error; calling `set-shape-path` on a text layer is refused and
+points at `set-layer-mask`; the default-fill fallback fires and is reported;
+`set-layer-mask` gained curved masks, open masks, and a keyframed mask path
+while its original raw-`maskPath` call shape still works unchanged. Visual
+confirmation via `see-frame` (not just numeric round-trips) for the
+coordinate-space finding (P6), the curve genuinely curving (P3), and the
+fill-required finding (P10) - screenshots inspected directly during
+development. Real project ("Comp 1", 3 layers) reopened and confirmed
+unchanged at the end of both the probe and the full test run.
+
+## SPEC: socket bridge transport, Phase 0 probe — MEASURED and verified 2026-07-30
+
+Feasibility probe for replacing the file-polling bridge with a TCP socket
+transport. Run with `node manual-tests/socket-probe.mjs` against live After
+Effects 26.0x67 on Windows 11 with the MCP Bridge Auto panel open. All twelve
+questions answered, all assertions passing. These are measurements, not
+assumptions, and the ones that contradict the plan are called out.
+
+`docs/ARCHITECTURE.md:7-9` claims ExtendScript "cannot open a socket". That is
+false and must be corrected: the Socket object exists and does everything the
+transport needs.
+
+**S1 Socket exists.** `typeof Socket === "function"`, constructs without
+throwing. Default `encoding` is **"ASCII"** (the plan guessed BINARY) and
+default `timeout` is 10 seconds. `for (var k in s)` enumerates NOTHING, so the
+object's members are not introspectable. There is no `localPort` member, which
+is what kills ephemeral ports (see S12).
+
+**S2 listen() works, and its encoding argument is a trap.** `listen(47800)`
+returns true and leaves `encoding` set to **"UTF-8"**. But `listen(port,
+"UTF-8")` also returns true and leaves `encoding` at **"ASCII"** — passing the
+encoding argument does the opposite of what it looks like. Never use the 2-arg
+form; set `conn.encoding = "UTF-8"` explicitly on each accepted connection.
+
+**S3 HARD GATE, BAD RESULT: listen() binds a WILDCARD address.** netstat shows
+`0.0.0.0:47800` and `[::]:47800` LISTENING. `listen()` takes no interface
+argument, so this is not configurable. A TCP connect to this machine's own
+non-loopback address (Wi-Fi, 10.112.95.27) also succeeded. Caveat on that
+second signal: Windows loops traffic to a local IP internally, so a same-host
+connect does not prove a REMOTE host can reach the port — that depends on the
+host firewall. The bind itself is unambiguous from netstat regardless.
+
+Consequence: the bridge exposes unbounded `eval` (mcp-bridge-auto.jsx:5383) and
+`startRender` on an all-interfaces port. The token is therefore MANDATORY, not
+optional, and SECURITY.md must document the residual exposure and recommend an
+inbound block rule for 47800-47815.
+
+**S4 The peer address is NOT readable.** `conn.host` on an accepted connection
+is the empty string (`"host" in conn` is true, the value is useless). AE cannot
+reject non-loopback peers itself, which removes the mitigation the plan hoped
+for and leaves the token as the only barrier. Since ExtendScript has no CSPRNG,
+be honest in SECURITY.md: the token restores parity with the file transport
+(any local process running as the user can already write `ae_command.json`) and
+claims nothing more.
+
+**S5 HARD GATE PASSED: poll() is non-blocking.** 20 consecutive polls take
+0-1ms total, 0.05ms each. An idle poll returns exactly `null`. The 50ms tick is
+safe.
+
+Two related findings that cost real debugging time and will bite the panel:
+
+- **poll() can return null while another connection is still queued.** The poll
+  map over 20 calls read `c.c.................` with two pending connections
+  separated by an idle poll. A "drain until null" loop therefore does NOT empty
+  the backlog. The panel's tick must not treat one null as proof there is no
+  pending work; poll a bounded few times per tick, and any drain needs several
+  consecutive idle polls.
+- **A connection nobody accepts stays in the backlog indefinitely.** Probe
+  connections that connected and hung up were still sitting there several steps
+  later, with `connected=true` and `eof=true`.
+
+**S6 readln() returns a full 256KB line** in 3ms, no truncation. No chunked
+read is needed on the AE side.
+
+**S7 Chunked writes are fast; large strings are the real hazard.** 1MB written
+as 32 x 32KB chunks took 5-6ms and every byte arrived (1048577 received).
+`write()` returns the byte count it took (32768 for a 32KB block).
+
+The first version of this probe built a 4MB string in ExtendScript by doubling
+and handed it to a single `conn.write()`. That froze After Effects hard enough
+to require a force quit. The freeze is in string construction plus one huge
+write, not in the socket. Keep the 32KB chunked `writeSocketLine` loop, and
+never build a multi-megabyte string in ExtendScript.
+
+**S8 Use the 2-arg getPrefAsLong, and do NOT gate on havePref.**
+`getPrefAsLong("Main Pref Section", "Pref_SCRIPTING_FILE_NETWORK_SECURITY")`
+returns 1 when the permission is enabled. The 3-arg
+`PREF_Type_MACHINE_INDEPENDENT` form THROWS ("could not be found in the
+preferences"). `"Main Pref Section v2"` also returns 1. `havePref(...)` returns
+**false** even though the 2-arg read works, so a havePref guard would wrongly
+conclude the permission is absent.
+
+**S9 A second listen() on a bound port returns false**, it does not throw
+(`socket.error` reads "I/O error"). A falsy check is enough for the port scan;
+keep the try/catch anyway.
+
+**S10 app.settings round-trips, $.getenv does not see the client's env.**
+`saveSetting("MCPBridge","port","47899")` reads back exactly, so the in-panel
+Port field can persist without a file. All three of `AE_MCP_BRIDGE_PORT`,
+`AE_MCP_BRIDGE_TRANSPORT` and `AE_MCP_BRIDGE_DIR` read back **null** inside AE,
+because After Effects is not launched from the MCP client's environment. This
+independently confirms the plan's decision: port rendezvous MUST be a file, an
+env var shared by both sides cannot work.
+
+**S11 HARD GATE PASSED: connections survive a blocking command.** After a
+6043ms hard `$.sleep` with zero yielding (strictly harsher than `rq.render()`,
+which may pump internally), a connection made ~1.2s into the block was still in
+the accept backlog, its buffered command line was intact ("DURING_BLOCK"), the
+reply reached the client, and the listener was still usable. The plan's
+blocking-command design holds: during a long render no socket call is in
+progress, so per-operation timeouts are correct and the only trap is Node's
+idle-based `socket.setTimeout`.
+
+**S12 Ephemeral ports are not viable.** `listen(0)` returns true, but there is
+no `localPort` member and `host` is empty, so AE can never learn which port it
+got. Deterministic base 47800 plus a 16-port scan plus a published rendezvous
+file is the only workable design.
+
+**Cleanup** verified: the listener closes and port 47800 is immediately
+rebindable, so the probe leaves no zombie socket. The probe also registers an
+abort handler that releases the listener if a step throws.
+
+## SPEC: bridge panel Transport UI — IMPLEMENTED and verified 2026-07-30
+
+Redesigned the mcp-bridge-auto.jsx panel to surface the socket transport added
+in C4/C5: a "Transport" group showing live socket/permission/file-fallback
+status, per-transport command counters, last-command latency, error/reject
+counts, a Port field with Apply and Restart listener, per-transport enable
+checkboxes, and a Copy Diagnostics modal (ScriptUI has no clipboard API, so
+this is a non-readonly edittext the user selects and copies manually).
+
+Two bugs found only by live use of the finished UI, both fixed here:
+
+**Copy Diagnostics was permanently disabled.** `bridgeTick`'s `finally` block
+called `updateTransportPanel()` (which sets `copyDiagButton.enabled =
+!isChecking`) BEFORE resetting `isChecking = false`, so the button always read
+`isChecking === true` and never re-enabled. Fixed by resetting `isChecking`
+first, then refreshing the panel.
+
+**Socket latency regressed from ~88ms to ~140ms average** after the panel
+redesign landed, confirmed by manual-tests/transport-select-test.mjs and
+isolated with a raw-socket phase breakdown (manual-tests/_lat.mjs, not
+committed - connect/ack/exec broken out separately). The breakdown showed
+`exec` staying at ~1ms (command execution itself was never the cost) while
+`ack` carried the entire regression, which said the delay was in AE noticing
+the pending connection, not in running the command.
+
+Two contributing causes, both real, in order of what was tried:
+
+1. `updateTransportPanel()` rewrote five ScriptUI widgets on every 50ms tick
+   (20x/second) regardless of whether anything changed. Fixed with a 250ms
+   throttle (`updateTransportPanelIfDue`) and per-field change checks so a
+   widget is only touched when its text actually differs. This alone did not
+   fix the regression (avg stayed ~140-145ms), but is still correct: UI writes
+   are idle-time work, not per-command work, so this landed anyway. Also
+   deferred both `updateTransportPanelIfDue()` and `flushLogIfDue()` to only
+   run on a tick that served NO command (`servedWork` guard in `bridgeTick`),
+   since a redraw sandwiched between two back-to-back commands measures as
+   command latency even though it did no useful work for that command.
+
+2. **The real cause, confirmed by a direct A/B measurement: After Effects
+   throttles `app.scheduleTask` when its window is not focused.** With the AE
+   window unfocused, raw `ack` time (time from TCP connect to the panel's ACK
+   line) averaged ~140ms against a requested 50ms tick. With the AE window
+   focused, the SAME probe against the SAME running panel averaged ~44-46ms -
+   right at the requested tick rate. Six consecutive samples in each state,
+   no code changed between them; only window focus changed. This is a platform
+   behavior of After Effects' idle-task scheduler, not a bug in this bridge,
+   and nothing in mcp-bridge-auto.jsx can reduce it further: `scheduleTask`
+   is the only repeating-execution primitive ExtendScript offers.
+
+   Practical consequence: socket latency is ~45-50ms with AE focused and
+   ~140ms with AE backgrounded. Both are still faster than the file
+   transport's 250-367ms measured under the same unfocused condition in the
+   same test run, so backgrounding AE does not erase the benefit of the
+   socket transport, it just reduces the win from roughly 5-8x to roughly
+   2-3x. This is worth a one-line mention in user-facing docs (C8) so nobody
+   files "socket transport is slower than expected" as a bug when AE is
+   simply not the focused window.
+
+Verified live against After Effects 26.0x67: `manual-tests/socket-smoke-test.mjs`
+(protocol-level, unchanged by this UI work) and `manual-tests/transport-select-test.mjs`
+(server-level) both pass; 249 automated tests pass; `npm run typecheck` and
+`npx eslint src tests` are clean (one expected warning: `lastBridgeResult` in
+`src/index.ts` is written in C5 but not read until C7 wires up `get-results`).
+
+## SPEC: socket transport core, client and dispatch (C1-C5) — IMPLEMENTED and verified 2026-07-30
+
+The Phase 0 probe (above) cleared all three hard gates, so C1-C5 built the
+transport itself. Recorded together here since none of C1-C5 has its own SPEC
+entry yet (C0 and C6 already do, above).
+
+**C1 - `src/lib/bridge-socket.ts`.** Pure protocol core, zero I/O, so it is fully
+unit tested (53 tests): `candidatePorts` (preferred port first, then the
+47800-47815 scan, de-duplicated), rendezvous file name encode/decode,
+`parseRendezvous` (never throws - a truncated or hand-mangled file is just "no
+listener here"), `selectRendezvous` (pinned port wins outright, else lowest port
+
+- lowest rather than newest-bound is what keeps a second AE instance from
+  silently re-targeting a user already working in the first one),
+  `encodeCommandLine`/`isAckLine`/`classifyControlLine`, and `createFrameReader`.
+
+The frame reader is the one piece worth calling out: it splits incoming bytes on
+the literal byte `0x0A` **before** decoding, never on an already-decoded string.
+TCP can put a chunk boundary anywhere, including the middle of a multibyte UTF-8
+sequence, and decoding a partial sequence produces a silent U+FFFD instead of an
+error. Splitting at the byte level is safe because a UTF-8 continuation byte is
+always `>= 0x80`, so `0x0A` cannot occur inside one. This is exactly the
+corruption class the `.jsx`'s explicit `encoding = "UTF-8"` comments already
+guard against on the AE side, tested with a chunk boundary deliberately placed
+mid-Arabic-character.
+
+**C2 - `src/lib/bridge-socket-client.ts`.** `sendOverSocket()`, the Node side of
+one command: connect, write the command line, read the ACK, read the result,
+classify the outcome into one of five `SendPhase` values (`connect`/`ack`/
+`auth`/`io`/`deadline`). `canFallbackFrom(phase)` is the single function that
+decides whether a given failure proves nothing executed - see "Fallback: the
+correctness rule" in the plan, and C7's `classifySocketFailure` (below) which
+must never disagree with it. Deliberately does NOT use `socket.setTimeout`
+(an idle timer, and a render is pure idle time) or `setKeepAlive` (a dead
+loopback peer signals immediately via FIN/RST, so it buys nothing). Tested
+against a real `net` server standing in for the panel: happy path, Arabic round
+trip, a 1MB result across 200 writes, token rejection, a server that ACKs and
+then goes idle for 400ms under a 5000ms deadline (the test that would catch
+someone reintroducing `socket.setTimeout`), and a destroy-after-ACK case that
+must report `phase:"io"` and must NOT be fallback-eligible.
+
+**C3 - `tests/bridge-e2e.test.ts`.** Converted two standalone `.cjs` scripts
+(`bridge-roundtrip-test.cjs`, `verify-fixes.cjs`) that had good fake-AE logic but
+that CI never ran, into a CI-enforced suite that spawns the real built
+`build/index.js` over MCP stdio and drives it against a fake file-transport
+panel. Landed before C4/C5 touched the risky transport-selection code, so the
+existing file-only behavior had a regression net _before_ anything about it
+changed. Both `.cjs` files deleted.
+
+**C4 - socket listener in `src/scripts/mcp-bridge-auto.jsx`.** `startSocketListener`
+binds the first free port in the scan range, sets `conn.encoding = "UTF-8"`
+explicitly (the 2-arg `listen(port, "UTF-8")` form does the _opposite_ - probe
+S2), and publishes the rendezvous file. `serviceSocketOnce` polls up to
+`SOCKET_POLLS_PER_TICK` (4) times per 50ms tick, because probe S5 found `poll()`
+can return `null` while a second connection is still queued - one `poll()` per
+tick would not drain a burst. Large results are written in 32KB chunks
+(`writeSocketLine`), never as one multi-megabyte string, because the Phase 0
+probe froze After Effects hard enough to need a force quit doing exactly that.
+`$.global.mcpSocketListener` survives a panel close/reopen so the listener and
+its rendezvous file are always cleaned up, mirroring the existing
+`mcpCheckTaskId` pattern - a leaked _listening_ socket is worse than a leaked
+task because it holds the port.
+
+**C5 - `sendBridgeCommand` in `src/index.ts`.** The one rewrite: tries the socket
+via `maybeDiscover()` (a 5-second-cached read of the bridge folder, so a closed
+panel costs one wasted `ECONNREFUSED` per 5 seconds, not one per command), falls
+back to files only when `canFallbackFrom` says so, and stamps every successful
+result into `lastBridgeResult` regardless of which transport served it (read by
+C7's `get-results`). Signature and return contract are byte-for-byte identical
+to the file-only version, so all ~80 call sites and `bridgeToolResult` needed
+zero changes.
+
+**Two live bugs found during C5/C6 verification, both load-bearing for C7:**
+
+1. ExtendScript's `JSON.stringify` emits raw, literal newline bytes for an empty
+   array (`[\n\n]`) regardless of the indent argument, which fragmented NDJSON
+   framing and truncated results. Fixed in `emitResult` by stripping raw CR/LF
+   before framing - safe because a raw `0x0A` in serialized JSON is always
+   insignificant whitespace between tokens; a newline _inside_ a string value is
+   always escaped to `\n` by `JSON.stringify` itself.
+2. An unterminated trailing fragment on socket close was being accepted as a
+   successful result - this is how bug #1 reached a caller looking like success,
+   the worst failure mode because it is silent. Fixed in `sendOverSocket`: an
+   unterminated fragment on close is now accepted ONLY if it parses as a JSON
+   object; otherwise it is reported as `phase:"io"` (acknowledged, so NOT
+   fallback-eligible - the command already ran, only the answer was lost).
+
+Both verified live with a payload containing LF, CRLF, tab, quotes, backslash
+and Arabic, all surviving intact in one frame.
+
+## SPEC: transport-aware get-results, run-bridge-test, check-bridge (C7) — IMPLEMENTED and verified 2026-07-30
+
+C5 gave every tool a socket-aware `sendBridgeCommand`, but three tools bypassed
+it or assumed the file transport's shape. Fixing all three was C7.
+
+**`get-results`.** The socket transport returns its result in-band over the
+connection and never touches `ae_mcp_result.json` at all. The pre-existing
+`get-results` read only that file, so on a healthy all-socket session it would
+return whatever the last FILE-transport command left behind - stale by hours,
+or simply absent. Fixed by having `get-results` check the in-memory
+`lastBridgeResult` (written by C5 on every successful command, either
+transport) first, annotating it with `_source: "server-memory"`, `_ageMs`, and
+`_transport`, and falling back to the file read only when the cache is empty -
+which still matters for a freshly started server attaching to a
+file-transport session someone else already ran. `lastBridgeResult` is
+deliberately NOT updated when `waitForBridgeResult` returns the synthesized
+timeout envelope: caching a timeout as "the last result" would erase the last
+_real_ result, which is precisely the thing a user runs `get-results` to
+recover after a command appears to hang.
+
+**`run-bridge-test`.** Previously queued `bridgeTestEffects` and told the caller
+to fetch the result later via `get-results` - a workaround for file-transport
+latency that cost the tool every safety property the ordinary path has: no id
+correlation, no timeout synthesis, no `isError` classification, and it was the
+only caller reaching around `sendBridgeCommand` into `bridgeMutex` directly.
+Changed to a plain `await sendBridgeCommand("bridgeTestEffects", {}, 30000, 250)`,
+matching every other tool. This removes the last direct `bridgeMutex` caller,
+so `sendBridgeCommand` is now the single bridge entry point without exception.
+
+**`check-bridge`.** The largest of the three. Previously ran one `ping` through
+the normal path and reported pass/fail plus a stale-panel heuristic; nothing
+about the socket was visible at all. Now:
+
+- Re-reads the bridge folder fresh via a new `discoverNow()` rather than the
+  5-second discovery cache `maybeDiscover()` uses, because `check-bridge` exists
+  to describe _this instant_ and a cached selection could name a panel the user
+  closed four seconds ago.
+- Probes **every** published rendezvous file in parallel with a real `ping`
+  (not just the selected one), so two After Effects instances are both
+  reported, with which one is targeted, rather than only ever seeing the one
+  the server happens to be talking to.
+- Classifies _why_ the socket is unusable into a closed `SocketProblem` union:
+  `transport-disabled` (the kill switch), `permission-disabled`, `no-rendezvous`,
+  `pinned-port-not-found`, `protocol-mismatch`, `connection-refused`,
+  `connect-failed`, `token-rejected`, `no-acknowledgement`, and
+  `acknowledged-no-result`. This is five more states than the plan sketched,
+  because `classifySocketFailure` reuses `SendPhase`/reason pairs that
+  distinguish causes the plan's six-state sketch would have collapsed - a dead
+  port (panel closed) and a connection that neither answers nor refuses (a
+  firewall dropping the SYN) need completely different user-facing advice, and
+  so do "nobody is listening" versus "AE_MCP_BRIDGE_PORT names a port nobody
+  bound."
+- `classifySocketFailure` is deliberately built from the SAME `SendPhase`/reason
+  values `sendBridgeCommand` already branches on, and `wouldFallBackToFile` on
+  each listener report is read straight from `canFallbackFrom` - the same
+  function C5 uses. This was the whole point of routing C7 through Opus at high
+  effort: `check-bridge` must never describe a bridge state that the actual
+  85-odd tools do not experience, or it becomes actively misleading.
+- The panel's `ping` reply was extended (additively - an old panel just omits
+  the fields) to report its OWN socket state: `socketListening`, `socketPort`,
+  `socketStatus`, `networkPermission`, `fileTransportEnabled`. This was
+  necessary, not optional: `permission-disabled` cannot be inferred from Node at
+  all, because the same "Allow Scripts to Write Files and Access Network"
+  permission gates the socket AND the file transport's writes. If it were off,
+  Node would see an absent rendezvous file - indistinguishable from "no panel
+  open" or "every port in the scan range was taken" - unless the panel says so
+  itself.
+- A live listener's `aeVersion`/`project` in the report prefer the LIVE `ping`
+  reply over the rendezvous file's bind-time snapshot, since the rendezvous
+  file is written once at bind time and a user may have opened a different
+  project since. Verified live and in `tests/bridge-e2e.test.ts`: a fake socket
+  panel publishes one project name in its rendezvous file and reports a
+  different one over `ping`, and the report shows the second.
+
+Tested in `tests/bridge-e2e.test.ts` with a new `FakeSocketAE` (a real `net.Server`
+speaking the exact NDJSON protocol, not a mock) covering: a healthy socket
+reported as such only when a real command actually used it; commands routed
+over the socket and never touching the file panel (proving no double
+execution); `get-results` returning the socket's in-band result byte for byte;
+`run-bridge-test` returning its result directly; a rejected token classified as
+`token-rejected` with a same-run fallback to files; a closed-but-still-published
+listener classified as `connection-refused` (and its stale rendezvous file left
+alone - it is only minutes old, not the 24h `RENDEZVOUS_MAX_AGE_MS` that makes
+deletion safe); an unreadable future protocol version classified as
+`protocol-mismatch` rather than the misleading "no listener"; and two listeners
+correctly both reported with the lowest port selected. 260 automated tests pass
+(11 new); `npm run typecheck`, `npm run build`, `npx eslint src tests`, and
+`npm run format:check` on the touched files are all clean.
+
+Live-verified against After Effects 26.0x67 with `manual-tests/tools-transport-test.mjs`
+(new): `check-bridge` reporting `problem: null` and `transportInUse: "socket"`
+against a real listening panel; `get-results` returning a fresh
+`server-memory`-sourced result immediately after a socket command; `run-bridge-test`
+delivering its result directly (including an AE-side error from
+`bridgeTestEffects` on an empty scratch comp with no layer to test - the
+correct behavior is that the tool call itself did NOT hang or silently swallow
+it); `AE_MCP_BRIDGE_TRANSPORT=file` reporting `transport-disabled` while every
+command still succeeds; `AE_MCP_BRIDGE_PORT` pinned to a port nobody bound
+reporting `pinned-port-not-found` with the port named in the hint; and an empty
+bridge folder reporting `no-rendezvous` with `ok:false`.
+
+## SPEC: socket bridge transport - final wrap-up (C0-C8) — SHIPPED 2026-07-30
+
+The whole feature, end to end, now that C8 (this entry) closes it out. Nine
+commits on `feature/socket-bridge`, not yet merged to `main`:
+
+| Commit | Contents                                                                                                                    |
+| ------ | --------------------------------------------------------------------------------------------------------------------------- |
+| C0     | Live feasibility probe (`manual-tests/socket-probe.mjs`), 12 questions answered, all recorded above under "Phase 0 probe".  |
+| C1     | `src/lib/bridge-socket.ts`, pure protocol core, 53 tests.                                                                   |
+| C2     | `src/lib/bridge-socket-client.ts`, `sendOverSocket`, tested against a real `net` server.                                    |
+| C3     | `tests/bridge-e2e.test.ts` against the file transport; deleted the two superseded `.cjs` harnesses.                         |
+| C4     | Socket listener in `mcp-bridge-auto.jsx`.                                                                                   |
+| C5     | `sendBridgeCommand` prefers the socket, falls back to files.                                                                |
+| C6     | Panel Transport UI; found and fixed the empty-array NDJSON bug and the accept-a-truncated-close bug.                        |
+| C7     | `get-results`, `run-bridge-test`, `check-bridge` made transport aware.                                                      |
+| C8     | This entry, plus `docs/ARCHITECTURE.md`, `README.md`/`README.ar.md`, `ENHANCEMENTS.md`, `SECURITY.md`, `install-bridge.js`. |
+
+**What shipped:** a TCP socket transport that the bridge prefers automatically,
+with the original file-polling transport retained as an always-on fallback so
+nothing regresses for a panel that predates 1.12, has the network permission
+disabled, or hits `AE_MCP_BRIDGE_TRANSPORT=file`. Per-command latency measured
+against live After Effects 26.0x67 dropped from 250-367ms (file, unfocused
+window) to ~45-50ms (socket, focused) or ~140ms (socket, unfocused - an AE
+platform behavior, not a bridge limitation). `check-bridge` went from one
+opaque timeout covering four indistinguishable failure causes to eleven named
+`socketProblem` states, each with its own actionable hint, plus a live probe of
+every published listener rather than a guess.
+
+**What did NOT ship, and why:**
+
+- **No merge to `main`.** Per repo convention this branch stacks and waits for
+  an explicit instruction to merge.
+- **No firewall rule applied automatically.** `install-bridge.js` prints the
+  exact command; the user runs it. This project does not modify firewall
+  settings programmatically - see `SECURITY.md`.
+- **The file transport was NOT removed.** It cannot be, per the exit criteria
+  the plan set: two minor releases with the fallback on by default, verified
+  socket operation on both Windows and macOS (macOS is unverified in this repo
+  entirely - that gap has to close first) across three AE versions, and a full
+  release cycle with zero open `socket-transport` issues. None of that clock has
+  started yet; this is the commit that starts it.
+- **No streaming.** Each command is still one request/response round trip. The
+  socket removes the fixed poll-interval floor, it does not add push
+  notifications or a persistent event channel - correctly so, since the
+  concurrency model (one command in flight at a time, serialized by the mutex)
+  never needed one.
+
+**Known residual, tracked, not blocking:** `manual-tests/**` has no Node globals
+configured in its eslint override, producing pre-existing `no-undef` errors
+there specifically (background task `task_2a4c0de0`); `src/lib/shape-path.ts`
+and `tests/shape-path.test.ts` fail `prettier --check` from drift that predates
+this branch. Neither is part of this feature and neither was touched by it.

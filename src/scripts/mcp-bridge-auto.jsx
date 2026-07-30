@@ -372,6 +372,439 @@ function createSolidLayer(args) {
 }
 
 
+// Shared comp resolution for the layer-creation-style functions above and the
+// motion-graphics template functions below: resolve by name, falling back to
+// the active comp. Factored out of createTextLayer/createSolidLayer/
+// createShapeLayer's identical inline logic (those three are left untouched -
+// this is used only by new code) so it isn't quadrupled again here.
+function _resolveCompByNameOrActive(compName) {
+    var comp = null;
+    if (compName) {
+        for (var i = 1; i <= app.project.numItems; i++) {
+            var item = app.project.item(i);
+            if (item instanceof CompItem && item.name === compName) { comp = item; break; }
+        }
+    }
+    if (!comp) {
+        if (app.project.activeItem instanceof CompItem) { comp = app.project.activeItem; }
+        else { throw new Error("No composition found with name '" + (compName || "") + "' and no active composition."); }
+    }
+    return comp;
+}
+
+// Apply an ease + interpolation pair at a keyframe already created via
+// setValueAtTime. Order matters: setTemporalEaseAtKey appears to force/promote
+// a key to BEZIER interpolation as a side effect (confirmed while fixing the
+// keyframe-manipulation tools), so ease is always applied first and
+// interpolation type last so it's the one that sticks. "linear" easing means
+// literal LINEAR interpolation (no bezier curve at all); "easeIn"/"easeOut"/
+// "easeInOut" mean BEZIER interpolation with the given ease on the relevant
+// side(s).
+// Ease-array dimensionality is NOT the same as value dimensionality: a
+// spatial property (Position) uses ONE unified ease for the whole motion
+// path even though its value is [x,y,z] (length 3) - using value.length here
+// would reproduce the exact crash found and fixed in apply-easy-ease
+// ("Value array does not have 1 elements"). A non-spatial multi-dimensional
+// property (Scale) genuinely does take one ease per axis. propertyValueType
+// distinguishes the two; value.length is only trustworthy for the non-spatial
+// case.
+function _easeDimensionForProperty(property) {
+    try {
+        var t = property.propertyValueType;
+        if (t === PropertyValueType.TwoD_SPATIAL || t === PropertyValueType.ThreeD_SPATIAL) return 1;
+        if (t === PropertyValueType.TwoD || t === PropertyValueType.ThreeD) {
+            var v = property.value;
+            return (v instanceof Array) ? v.length : 1;
+        }
+    } catch (e) {}
+    return 1;
+}
+
+function _applyEasingAtKey(property, keyIndex, easing, isFirstKey, isLastKey) {
+    if (easing === "linear" || !easing) {
+        try { property.setInterpolationTypeAtKey(keyIndex, KeyframeInterpolationType.LINEAR, KeyframeInterpolationType.LINEAR); } catch (e) {}
+        return;
+    }
+    var dim = _easeDimensionForProperty(property);
+    var easedIn = buildEaseArray(dim, 0, 75);
+    var easedOut = buildEaseArray(dim, 0, 75);
+    // KeyframeEase influence must be in [0.1, 100] - 0.1 is the real minimum,
+    // used here to approximate "practically no ease" on the untouched side of
+    // an easeIn/easeOut keyframe (an earlier 0.01 was below AE's valid range
+    // and crashed the Constructor call).
+    var linearArr = buildEaseArray(dim, 0, 0.1);
+    var inEase = (easing === "easeIn" && isFirstKey) ? linearArr : easedIn;
+    var outEase = (easing === "easeOut" && isLastKey) ? linearArr : easedOut;
+    try { property.setTemporalEaseAtKey(keyIndex, inEase, outEase); } catch (e3) {}
+    try { property.setInterpolationTypeAtKey(keyIndex, KeyframeInterpolationType.BEZIER, KeyframeInterpolationType.BEZIER); } catch (e4) {}
+}
+
+var LOWER_THIRD_STYLES = {
+    "modern":    { barHeight: 8,  textSize: 42, subtitleSize: 26, font: "Arial-BoldMT", animDuration: 0.5 },
+    "corporate": { barHeight: 60, textSize: 38, subtitleSize: 24, font: "Georgia-Bold", animDuration: 0.6 },
+    "news":      { barHeight: 50, textSize: 44, subtitleSize: 26, font: "Impact",       animDuration: 0.3 },
+    "minimal":   { barHeight: 4,  textSize: 36, subtitleSize: 22, font: "ArialMT",       animDuration: 0.5 },
+    "social":    { barHeight: 70, textSize: 46, subtitleSize: 28, font: "Verdana-Bold",  animDuration: 0.4 }
+};
+
+function createLowerThird(args) {
+    try {
+        var comp = _resolveCompByNameOrActive(args.compName);
+        var title = args.title;
+        if (!title) return JSON.stringify({ status: "error", error: "title is required." });
+        var subtitle = args.subtitle || "";
+        var styleName = args.style || "modern";
+        var style = LOWER_THIRD_STYLES[styleName];
+        if (!style) return JSON.stringify({ status: "error", error: "Unknown style: " + styleName + ". Use one of: " + (function () { var k = []; for (var n in LOWER_THIRD_STYLES) k.push(n); return k.join(", "); })() });
+
+        var primaryColor = args.primaryColor || [0.1, 0.4, 0.9];
+        // secondaryColor: a real, functional accent stripe above the main bar -
+        // ishu86 accepts this param but never uses it anywhere; here it actually
+        // does something, defaulting to primaryColor rather than being ignored.
+        var secondaryColor = args.secondaryColor || primaryColor;
+        var textColor = args.textColor || [1, 1, 1];
+        var fontFamily = args.fontFamily || style.font;
+        var position = args.position || "bottomLeft";
+        var startTime = (args.startTime !== undefined && args.startTime !== null) ? Number(args.startTime) : 0;
+        var duration = (args.duration !== undefined && args.duration !== null) ? Number(args.duration) : 5;
+        var animateIn = (args.animateIn === undefined || args.animateIn === null) ? true : !!args.animateIn;
+        var animateOut = (args.animateOut === undefined || args.animateOut === null) ? true : !!args.animateOut;
+        var animDuration = style.animDuration;
+
+        var ltHeight = style.barHeight + (subtitle ? 90 : 60);
+        var ltComp = app.project.items.addComp("Lower Third - " + title, comp.width, ltHeight, 1, duration, comp.frameRate);
+
+        var accent = ltComp.layers.addSolid(secondaryColor, "Accent", ltComp.width, 4, 1);
+        _transformProp(accent, "ADBE Position").setValue([ltComp.width / 2, 2]);
+
+        var bar = ltComp.layers.addSolid(primaryColor, "Bar", ltComp.width, style.barHeight, 1);
+        _transformProp(bar, "ADBE Position").setValue([ltComp.width / 2, style.barHeight / 2 + 4]);
+
+        var titleRes = JSON.parse(createTextLayer({
+            compName: ltComp.name, text: title, fontSize: style.textSize, color: textColor,
+            fontFamily: fontFamily, position: [20, style.barHeight + 30], alignment: "left"
+        }));
+        var titleLayer = ltComp.layer(titleRes.layer.index);
+
+        var subtitleLayer = null;
+        if (subtitle) {
+            var subRes = JSON.parse(createTextLayer({
+                compName: ltComp.name, text: subtitle, fontSize: style.subtitleSize, color: textColor,
+                fontFamily: fontFamily, position: [20, style.barHeight + 30 + style.textSize * 0.9], alignment: "left"
+            }));
+            subtitleLayer = ltComp.layer(subRes.layer.index);
+        }
+
+        var animLayers = [accent, bar, titleLayer];
+        if (subtitleLayer) animLayers.push(subtitleLayer);
+        for (var li = 0; li < animLayers.length; li++) {
+            var lyr = animLayers[li];
+            var op = _transformProp(lyr, "ADBE Opacity");
+            if (animateIn) {
+                op.setValueAtTime(0, 0);
+                op.setValueAtTime(animDuration, 100);
+            }
+            if (animateOut) {
+                op.setValueAtTime(duration - animDuration, 100);
+                op.setValueAtTime(duration, 0);
+            }
+        }
+
+        var mainLayer = comp.layers.add(ltComp);
+        mainLayer.startTime = startTime;
+        var mx = (position === "bottomRight") ? comp.width - ltComp.width / 2 - 20 : (position === "bottomCenter" ? comp.width / 2 : ltComp.width / 2 + 20);
+        _transformProp(mainLayer, "ADBE Position").setValue([mx, comp.height - ltHeight / 2 - 20]);
+
+        return JSON.stringify({ status: "success", message: "Lower third created.", compName: ltComp.name, layerIndex: mainLayer.index });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function createTitleCard(args) {
+    try {
+        var comp = _resolveCompByNameOrActive(args.compName);
+        var title = args.title;
+        if (!title) return JSON.stringify({ status: "error", error: "title is required." });
+        var subtitle = args.subtitle || "";
+        var style = args.style || "minimal";
+        var validStyles = { "cinematic": true, "documentary": true, "social": true, "minimal": true };
+        if (!validStyles[style]) return JSON.stringify({ status: "error", error: "Unknown style: " + style + ". Use one of: cinematic, documentary, social, minimal." });
+
+        var backgroundColor = args.backgroundColor || null;
+        var fontFamily = args.fontFamily || "Arial-BoldMT";
+        var fontSize = (args.fontSize !== undefined && args.fontSize !== null) ? Number(args.fontSize) : 64;
+        var textColor = args.textColor || [1, 1, 1];
+        var startTime = (args.startTime !== undefined && args.startTime !== null) ? Number(args.startTime) : 0;
+        var duration = (args.duration !== undefined && args.duration !== null) ? Number(args.duration) : 4;
+
+        if (backgroundColor) {
+            var bg = comp.layers.addSolid(backgroundColor, "Title Background", comp.width, comp.height, 1);
+            bg.startTime = startTime;
+            bg.outPoint = startTime + duration;
+        }
+
+        var titleRes = JSON.parse(createTextLayer({
+            compName: comp.name, text: title, fontSize: fontSize, color: textColor,
+            fontFamily: fontFamily, position: [comp.width / 2, comp.height / 2 - (subtitle ? fontSize * 0.4 : 0)], alignment: "center",
+            startTime: startTime, duration: duration
+        }));
+        var titleLayer = comp.layer(titleRes.layer.index);
+        var titleOp = _transformProp(titleLayer, "ADBE Opacity");
+        var titleScale = _transformProp(titleLayer, "ADBE Scale");
+        var titlePos = _transformProp(titleLayer, "ADBE Position");
+
+        var subtitleLayer = null;
+        if (subtitle) {
+            var subRes = JSON.parse(createTextLayer({
+                compName: comp.name, text: subtitle, fontSize: Math.floor(fontSize * 0.4), color: textColor,
+                fontFamily: "ArialMT", position: [comp.width / 2, comp.height / 2 + fontSize * 0.6], alignment: "center",
+                startTime: startTime, duration: duration
+            }));
+            subtitleLayer = comp.layer(subRes.layer.index);
+        }
+
+        if (style === "cinematic") {
+            titleOp.setValueAtTime(startTime, 0);
+            titleOp.setValueAtTime(startTime + 1.2, 100);
+            titleScale.setValueAtTime(startTime, [110, 110, 100]);
+            titleScale.setValueAtTime(startTime + 1.2, [100, 100, 100]);
+            titleOp.setValueAtTime(startTime + duration - 1, 100);
+            titleOp.setValueAtTime(startTime + duration, 0);
+        } else if (style === "documentary") {
+            titleOp.setValueAtTime(startTime, 0);
+            titleOp.setValueAtTime(startTime + 0.8, 100);
+            titleOp.setValueAtTime(startTime + duration - 0.8, 100);
+            titleOp.setValueAtTime(startTime + duration, 0);
+        } else if (style === "social") {
+            titleScale.setValueAtTime(startTime, [60, 60, 100]);
+            titleScale.setValueAtTime(startTime + 0.4, [110, 110, 100]);
+            titleScale.setValueAtTime(startTime + 0.6, [100, 100, 100]);
+            titleOp.setValueAtTime(startTime, 0);
+            titleOp.setValueAtTime(startTime + 0.2, 100);
+        } else {
+            titleOp.setValueAtTime(startTime, 0);
+            titleOp.setValueAtTime(startTime + 0.5, 100);
+        }
+        if (subtitleLayer) {
+            var subOp = _transformProp(subtitleLayer, "ADBE Opacity");
+            subOp.setValueAtTime(startTime + 0.3, 0);
+            subOp.setValueAtTime(startTime + 1, 100);
+        }
+
+        return JSON.stringify({ status: "success", message: "Title card created.", titleLayerIndex: titleLayer.index });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function createTransition(args) {
+    try {
+        var comp = _resolveCompByNameOrActive(args.compName);
+        var type = args.type;
+        var validTypes = { "wipe_left": true, "wipe_right": true, "wipe_up": true, "wipe_down": true, "dissolve": true, "push": true, "slide": true, "zoom": true };
+        if (!type || !validTypes[type]) return JSON.stringify({ status: "error", error: "type is required and must be one of: wipe_left, wipe_right, wipe_up, wipe_down, dissolve, push, slide, zoom." });
+
+        var color = args.color || [0, 0, 0];
+        var startTime = (args.startTime !== undefined && args.startTime !== null) ? Number(args.startTime) : 0;
+        var duration = (args.duration !== undefined && args.duration !== null) ? Number(args.duration) : 1;
+        var easing = args.easing || "linear";
+
+        var layer = comp.layers.addSolid(color, "Transition", comp.width, comp.height, 1);
+        layer.startTime = startTime;
+        layer.outPoint = startTime + duration;
+        var endTime = startTime + duration;
+
+        function setTwoKeys(property, t0, v0, t1, v1) {
+            property.setValueAtTime(t0, v0);
+            var i0 = findKeyIndexAtTime(property, t0);
+            if (i0 > 0) _applyEasingAtKey(property, i0, easing, true, false);
+            property.setValueAtTime(t1, v1);
+            var i1 = findKeyIndexAtTime(property, t1);
+            if (i1 > 0) _applyEasingAtKey(property, i1, easing, false, true);
+        }
+
+        if (type.indexOf("wipe_") === 0) {
+            var wipe = layer.property("ADBE Effect Parade").addProperty("ADBE Linear Wipe");
+            var angleMap = { "wipe_left": 0, "wipe_right": 180, "wipe_up": 90, "wipe_down": 270 };
+            var wipeAngle = _safeProp(wipe, "ADBE Linear Wipe-0002", "Wipe Angle");
+            if (wipeAngle) wipeAngle.setValue(angleMap[type]);
+            var completion = _safeProp(wipe, "ADBE Linear Wipe-0001", "Transition Completion");
+            if (completion) setTwoKeys(completion, startTime, 0, endTime, 100);
+        } else if (type === "dissolve") {
+            setTwoKeys(_transformProp(layer, "ADBE Opacity"), startTime, 100, endTime, 0);
+        } else if (type === "push" || type === "slide") {
+            var pos = _transformProp(layer, "ADBE Position");
+            var startX = comp.width / 2 + comp.width;
+            var endX = comp.width / 2;
+            setTwoKeys(pos, startTime, [startX, comp.height / 2], endTime, [endX, comp.height / 2]);
+        } else if (type === "zoom") {
+            setTwoKeys(_transformProp(layer, "ADBE Scale"), startTime, [0, 0, 100], endTime, [100, 100, 100]);
+        }
+
+        return JSON.stringify({ status: "success", message: "Transition created.", layerIndex: layer.index, type: type });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function createLogoReveal(args) {
+    try {
+        var comp = _resolveCompByNameOrActive(args.compName);
+
+        // Explicit validation instead of ishu86's raw ReferenceError when neither
+        // logoItemId nor logoItemName is given (that path in ishu86 never declares
+        // the variable it then checks).
+        if ((args.logoItemId === undefined || args.logoItemId === null) && !args.logoItemName) {
+            return JSON.stringify({ status: "error", error: "Provide logoItemId or logoItemName." });
+        }
+        var logoItem = null;
+        if (args.logoItemId !== undefined && args.logoItemId !== null) {
+            logoItem = app.project.itemByID(args.logoItemId);
+        }
+        if (!logoItem && args.logoItemName) {
+            for (var i = 1; i <= app.project.numItems; i++) {
+                var it = app.project.item(i);
+                if (it.name === args.logoItemName) { logoItem = it; break; }
+            }
+        }
+        if (!logoItem) return JSON.stringify({ status: "error", error: "Logo item not found (checked logoItemId and logoItemName)." });
+
+        var style = args.style || "fade";
+        // "particle" dropped rather than accepted-and-silently-ignored - ishu86's
+        // schema lists it but has no implementation branch for it at all.
+        var validStyles = { "fade": true, "scale": true, "slide": true, "spin": true, "glitch": true };
+        if (!validStyles[style]) return JSON.stringify({ status: "error", error: "Unknown style: " + style + ". Use one of: fade, scale, slide, spin, glitch." });
+
+        var backgroundColor = args.backgroundColor || null;
+        var startTime = (args.startTime !== undefined && args.startTime !== null) ? Number(args.startTime) : 0;
+        var duration = (args.duration !== undefined && args.duration !== null) ? Number(args.duration) : 3;
+
+        if (backgroundColor) {
+            var bg = comp.layers.addSolid(backgroundColor, "Logo Background", comp.width, comp.height, 1);
+            bg.startTime = startTime;
+            bg.outPoint = startTime + duration;
+        }
+
+        var logoLayer = comp.layers.add(logoItem);
+        logoLayer.startTime = startTime;
+        logoLayer.outPoint = startTime + duration;
+        _transformProp(logoLayer, "ADBE Position").setValue([comp.width / 2, comp.height / 2]);
+
+        var op = _transformProp(logoLayer, "ADBE Opacity");
+        var scale = _transformProp(logoLayer, "ADBE Scale");
+        var rotation = _transformProp(logoLayer, "ADBE Rotation");
+
+        if (style === "fade") {
+            op.setValueAtTime(startTime, 0);
+            op.setValueAtTime(startTime + 1, 100);
+        } else if (style === "scale") {
+            scale.setValueAtTime(startTime, [0, 0, 100]);
+            scale.setValueAtTime(startTime + 0.6, [110, 110, 100]);
+            scale.setValueAtTime(startTime + 0.8, [100, 100, 100]);
+            op.setValueAtTime(startTime, 0);
+            op.setValueAtTime(startTime + 0.2, 100);
+        } else if (style === "slide") {
+            var pos = _transformProp(logoLayer, "ADBE Position");
+            pos.setValueAtTime(startTime, [-comp.width * 0.2, comp.height / 2]);
+            pos.setValueAtTime(startTime + 0.8, [comp.width / 2, comp.height / 2]);
+        } else if (style === "spin") {
+            rotation.setValueAtTime(startTime, -180);
+            rotation.setValueAtTime(startTime + 1, 0);
+            scale.setValueAtTime(startTime, [0, 0, 100]);
+            scale.setValueAtTime(startTime + 1, [100, 100, 100]);
+            op.setValueAtTime(startTime, 0);
+            op.setValueAtTime(startTime + 0.3, 100);
+        } else if (style === "glitch") {
+            try { _transformProp(logoLayer, "ADBE Position").expression = "wiggle(30, 5)"; } catch (eGlitch) {}
+            op.setValueAtTime(startTime, 0);
+            op.setValueAtTime(startTime + 0.1, 100);
+            op.setValueAtTime(startTime + 0.15, 0);
+            op.setValueAtTime(startTime + 0.2, 100);
+        }
+
+        return JSON.stringify({ status: "success", message: "Logo reveal created.", layerIndex: logoLayer.index, style: style });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function createTextAnimator(args) {
+    try {
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var layer = cl.layer;
+        if (!(layer instanceof TextLayer)) {
+            return JSON.stringify({ status: "error", error: "Layer '" + layer.name + "' is not a text layer." });
+        }
+        var animatorType = args.animatorType;
+        var validTypes = { "typewriter": true, "fadeInChars": true, "scaleInChars": true, "slideInChars": true, "randomize": true, "wave": true };
+        if (!animatorType || !validTypes[animatorType]) {
+            return JSON.stringify({ status: "error", error: "animatorType is required and must be one of: typewriter, fadeInChars, scaleInChars, slideInChars, randomize, wave." });
+        }
+        var startTime = (args.startTime !== undefined && args.startTime !== null) ? Number(args.startTime) : 0;
+        var duration = (args.duration !== undefined && args.duration !== null) ? Number(args.duration) : 2;
+        // delay: genuine per-character stagger (ishu86 accepts this but never uses
+        // it) - wired via a textIndex-based expression on the selector's Offset,
+        // the standard AE technique for staggering a per-character animator.
+        var delay = (args.delay !== undefined && args.delay !== null) ? Number(args.delay) : 0.05;
+
+        var textProp = layer.property("ADBE Text Properties");
+        var animators = textProp.property("Animators");
+        var animator = animators.addProperty("ADBE Text Animator");
+        animator.name = animatorType;
+        var selectors = animator.property("Selectors");
+        var selector = selectors.addProperty("ADBE Text Selector");
+
+        var startProp = _safeProp(selector, "ADBE Text Percent Start", "Start");
+        var endProp = _safeProp(selector, "ADBE Text Percent End", "End");
+        var offsetProp = _safeProp(selector, "ADBE Text Percent Offset", "Offset");
+
+        if (animatorType === "randomize") {
+            try { selector.property("ADBE Text Randomize Order").setValue(1); } catch (eRand) {}
+        }
+        if (offsetProp) {
+            try { offsetProp.expression = "textIndex * " + delay + " * 100 / Math.max(1, textIndex.length)"; } catch (eOff) {}
+        }
+        if (startProp && endProp) {
+            startProp.setValueAtTime(startTime, 0);
+            endProp.setValueAtTime(startTime, 0);
+            startProp.setValueAtTime(startTime + duration, 100);
+            endProp.setValueAtTime(startTime + duration, 100);
+        }
+
+        // "ADBE Text Animator Properties" (real match name), not the friendly
+        // string "Properties" - the latter resolves to AE's full ~103-entry
+        // catalog of every possible per-character property (Anchor Point first),
+        // not the small collection of properties actually added to this
+        // animator, so addProperty()/property(1) against it silently operated
+        // on the wrong group (confirmed live: numProperties came back 103 with
+        // "Anchor Point" at index 1, not the one property just added).
+        var properties = _safeProp(animator, "ADBE Text Animator Properties", "Properties");
+        if (animatorType === "typewriter" || animatorType === "fadeInChars") {
+            properties.addProperty("ADBE Text Opacity").setValue(0);
+        } else if (animatorType === "scaleInChars") {
+            properties.addProperty("ADBE Text Scale 3D").setValue([0, 0, 100]);
+        } else if (animatorType === "slideInChars") {
+            properties.addProperty("ADBE Text Position 3D").setValue([0, 50, 0]);
+        } else if (animatorType === "randomize") {
+            properties.addProperty("ADBE Text Opacity").setValue(0);
+        } else if (animatorType === "wave") {
+            // Real per-character oscillation via expression on the animator's own
+            // Position, keyed off textIndex - not ishu86's shared, non-oscillating
+            // offset + scrolling selector window (which produces a moving band,
+            // not per-character motion, despite its description).
+            var waveAmp = (args.waveAmplitude !== undefined && args.waveAmplitude !== null) ? Number(args.waveAmplitude) : 20;
+            var waveSpeed = (args.waveSpeed !== undefined && args.waveSpeed !== null) ? Number(args.waveSpeed) : 4;
+            var wavePos = properties.addProperty("ADBE Text Position 3D");
+            wavePos.expression = "amp = " + waveAmp + ";\nspeed = " + waveSpeed + ";\n[0, Math.sin(time*speed + textIndex*0.5)*amp, 0];";
+        }
+
+        return JSON.stringify({ status: "success", message: "Text animator added.", animatorName: animator.name });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
 function setLayerProperties(args) {
     try {
         var compName = args.compName || "";
@@ -666,6 +1099,593 @@ function setLayerExpression(compIndex, layerIndex, propertyName, expressionStrin
         return JSON.stringify({ success: true, message: "Expression " + action + " for '" + propertyName + "' on layer '" + layer.name + "'." });
     } catch (e) {
         return JSON.stringify({ success: false, message: "Error setting expression: " + e.toString() + " (Line: " + e.line + ")" });
+    }
+}
+
+// Shared property lookup for the expression-suite tools, matching the exact
+// search order setLayerExpression()/setLayerKeyframe() already use above:
+// Transform Group, then Effect Parade, then Text Properties.
+function _resolveLayerProperty(layer, propertyName) {
+    var transformGroup = layer.property("ADBE Transform Group");
+    var property = transformGroup ? transformGroup.property(propertyName) : null;
+    if (!property) {
+        if (layer.property("ADBE Effect Parade") && layer.property("ADBE Effect Parade").property(propertyName)) {
+            property = layer.property("ADBE Effect Parade").property(propertyName);
+        } else if (layer.property("ADBE Text Properties") && layer.property("ADBE Text Properties").property(propertyName)) {
+            property = layer.property("ADBE Text Properties").property(propertyName);
+        }
+    }
+    return property || null;
+}
+
+function _resolveCompAndLayerSimple(compIndex, layerIndex) {
+    // app.project.item(index) (method call), not app.project.items[index]
+    // (bracket indexing) - the latter does not reliably return the item at
+    // that position once a project has more than a couple of items (confirmed
+    // live: failed with "Composition not found" for a valid compIndex once the
+    // motion-graphics-templates test's project grew past its first couple of
+    // items, despite working in every earlier, simpler single-comp test). Every
+    // other comp-lookup in this file already uses the .item(i) method form.
+    var comp = app.project.item(compIndex);
+    if (!comp || !(comp instanceof CompItem)) {
+        throw new Error("Composition not found at index " + compIndex);
+    }
+    var layer = comp.layers[layerIndex];
+    if (!layer) {
+        throw new Error("Layer not found at index " + layerIndex + " in composition '" + comp.name + "'");
+    }
+    return { comp: comp, layer: layer };
+}
+
+function getExpression(args) {
+    try {
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var property = _resolveLayerProperty(cl.layer, args.propertyName);
+        if (!property) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' not found on layer '" + cl.layer.name + "'." });
+        }
+        return JSON.stringify({
+            status: "success",
+            expression: property.expression || "",
+            expressionEnabled: !!property.expressionEnabled,
+            expressionError: property.expressionError || null
+        });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function enableExpression(args) {
+    try {
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var property = _resolveLayerProperty(cl.layer, args.propertyName);
+        if (!property) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' not found on layer '" + cl.layer.name + "'." });
+        }
+        if (!property.expression) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' has no expression to enable/disable." });
+        }
+        property.expressionEnabled = !!args.enabled;
+        return JSON.stringify({ status: "success", expressionEnabled: !!property.expressionEnabled });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+var EXPRESSION_CONTROL_MATCH_NAMES = {
+    "slider": "ADBE Slider Control",
+    "color": "ADBE Color Control",
+    "point": "ADBE Point Control",
+    "checkbox": "ADBE Checkbox Control",
+    "dropdown": "ADBE Dropdown Control",
+    "angle": "ADBE Angle Control",
+    "layer": "ADBE Layer Control"
+};
+// Sub-property name (friendly name, matching this file's existing convention
+// of using friendly names like layer.Effects rather than raw match-names)
+// used to set each control's default value. Dropdown intentionally omitted -
+// see addExpressionControl()'s note for why.
+var EXPRESSION_CONTROL_VALUE_PROP = {
+    "slider": "Slider",
+    "color": "Color",
+    "point": "Point",
+    "checkbox": "Checkbox",
+    "angle": "Angle",
+    "layer": "Layer"
+};
+
+function addExpressionControl(args) {
+    try {
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var matchName = EXPRESSION_CONTROL_MATCH_NAMES[args.controlType];
+        if (!matchName) {
+            return JSON.stringify({ status: "error", error: "Unknown controlType: " + args.controlType });
+        }
+
+        var effect = cl.layer.Effects.addProperty(matchName);
+        effect.name = args.controlName;
+
+        var note = null;
+        if (args.defaultValue !== undefined && args.defaultValue !== null) {
+            if (args.controlType === "dropdown") {
+                note = "Dropdown Control's default value is not settable via this implementation's scripting API; the control was created without a default.";
+            } else {
+                var valueProp = effect.property(EXPRESSION_CONTROL_VALUE_PROP[args.controlType]);
+                if (valueProp) valueProp.setValue(args.defaultValue);
+            }
+        }
+
+        var out = { status: "success", effectName: effect.name, matchName: matchName };
+        if (note) out.note = note;
+        return JSON.stringify(out);
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function linkProperties(args) {
+    try {
+        var comp = app.project.items[args.compIndex];
+        if (!comp || !(comp instanceof CompItem)) {
+            return JSON.stringify({ status: "error", error: "Composition not found at index " + args.compIndex });
+        }
+        var sourceLayer = (args.sourceLayerIndex !== undefined && args.sourceLayerIndex !== null) ? comp.layers[args.sourceLayerIndex] : null;
+        var targetLayer = (args.targetLayerIndex !== undefined && args.targetLayerIndex !== null) ? comp.layers[args.targetLayerIndex] : null;
+        if (!sourceLayer) return JSON.stringify({ status: "error", error: "Source layer not found at index " + args.sourceLayerIndex });
+        if (!targetLayer) return JSON.stringify({ status: "error", error: "Target layer not found at index " + args.targetLayerIndex });
+
+        var sourceProp = _resolveLayerProperty(sourceLayer, args.sourceProperty);
+        var targetProp = _resolveLayerProperty(targetLayer, args.targetProperty);
+        if (!sourceProp) return JSON.stringify({ status: "error", error: "Source property '" + args.sourceProperty + "' not found on layer '" + sourceLayer.name + "'." });
+        if (!targetProp) return JSON.stringify({ status: "error", error: "Target property '" + args.targetProperty + "' not found on layer '" + targetLayer.name + "'." });
+        if (!sourceProp.canSetExpression) {
+            return JSON.stringify({ status: "error", error: "Source property '" + args.sourceProperty + "' does not support expressions." });
+        }
+
+        var expr = "thisComp.layer(" + args.targetLayerIndex + ").property(\"" + args.targetProperty + "\").value";
+        if (args.offset !== undefined && args.offset !== null) {
+            expr += " + " + (args.offset instanceof Array ? JSON.stringify(args.offset) : args.offset);
+        }
+        sourceProp.expression = expr;
+
+        return JSON.stringify({ status: "success", expression: expr });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+var EXPRESSION_TEMPLATES = {
+    "wiggle": { text: "wiggle({{freq}}, {{amp}})", defaults: { freq: 2, amp: 20 } },
+    "loop": { text: "loopOut(\"{{type}}\")", defaults: { type: "cycle" } },
+    "time": { text: "time * {{speed}}", defaults: { speed: 1 } },
+    "bounce": {
+        text: "n = 0;\nif (numKeys > 0) {\n  n = nearestKey(time).index;\n  if (nearestKey(time).time > time) n--;\n}\nif (n == 0) value;\nelse {\n  t = time - key(n).time;\n  amp = {{amp}};\n  freq = {{freq}};\n  decay = {{decay}};\n  value + amp * Math.sin(freq * t * 2 * Math.PI) / Math.exp(decay * t);\n}",
+        defaults: { amp: 50, freq: 3, decay: 4 }
+    },
+    "inertia": {
+        text: "n = 0;\nif (numKeys > 0) {\n  n = nearestKey(time).index;\n  if (nearestKey(time).time > time) n--;\n}\nif (n == 0) value;\nelse {\n  t = time - key(n).time;\n  amp = {{amp}};\n  decay = {{decay}};\n  value + (velocityAtTime(key(n).time - 0.001) * amp) * Math.exp(-decay * t);\n}",
+        defaults: { amp: 0.05, decay: 4 }
+    },
+    "overshoot": {
+        text: "freq = {{freq}};\ndecay = {{decay}};\nn = 0;\nif (numKeys > 0) {\n  n = nearestKey(time).index;\n  if (nearestKey(time).time > time) n--;\n}\nif (n == 0) value;\nelse {\n  t = time - key(n).time;\n  value + (velocityAtTime(key(n).time - 0.001)) * (Math.sin(freq * t * 2 * Math.PI) / Math.exp(decay * t)) / (freq * 2 * Math.PI);\n}",
+        defaults: { freq: 2, decay: 6 }
+    }
+};
+
+function applyExpressionTemplate(args) {
+    try {
+        var template = EXPRESSION_TEMPLATES[args.template];
+        if (!template) {
+            return JSON.stringify({ status: "error", error: "Unknown template: " + args.template });
+        }
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var property = _resolveLayerProperty(cl.layer, args.propertyName);
+        if (!property) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' not found on layer '" + cl.layer.name + "'." });
+        }
+        if (!property.canSetExpression) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' does not support expressions." });
+        }
+
+        var expr = template.text;
+        var params = args.params || {};
+        for (var key in template.defaults) {
+            var value = (params[key] !== undefined && params[key] !== null) ? params[key] : template.defaults[key];
+            expr = expr.split("{{" + key + "}}").join(value);
+        }
+
+        property.expression = expr;
+        return JSON.stringify({ status: "success", expression: expr });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function batchSetExpression(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        var targets = args.targets;
+        if (!targets || !targets.length) {
+            return JSON.stringify({ status: "error", message: "No targets provided. Pass an array of {layerIndex or layerName}." });
+        }
+
+        var results = [];
+        var action = args.expressionString === "" ? "removed" : "set";
+        for (var i = 0; i < targets.length; i++) {
+            var t = targets[i];
+            var layer = _resolveLayer(comp, t);
+            if (!layer) {
+                results.push({ layerIndex: t.layerIndex, layerName: t.layerName, status: "error", message: "Layer not found" });
+                continue;
+            }
+            try {
+                var property = _resolveLayerProperty(layer, args.propertyName);
+                if (!property) {
+                    results.push({ layerIndex: layer.index, layerName: layer.name, status: "error", message: "Property '" + args.propertyName + "' not found." });
+                    continue;
+                }
+                if (!property.canSetExpression) {
+                    results.push({ layerIndex: layer.index, layerName: layer.name, status: "error", message: "Property '" + args.propertyName + "' does not support expressions." });
+                    continue;
+                }
+                property.expression = args.expressionString;
+                results.push({ layerIndex: layer.index, layerName: layer.name, status: "success", message: "Expression " + action + "." });
+            } catch (eLayer) {
+                results.push({ layerIndex: layer.index, layerName: layer.name, status: "error", message: eLayer.toString() });
+            }
+        }
+
+        var successCount = 0;
+        for (var r = 0; r < results.length; r++) { if (results[r].status === "success") successCount++; }
+        return JSON.stringify({ status: "success", propertyName: args.propertyName, successCount: successCount, count: results.length, results: results }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// setTimeRemap() and _resolveLayerProperty() deliberately don't share a
+// lookup path: Time Remap ("ADBE Time Remapping") is a top-level AVLayer
+// property, a sibling of Transform Group/Effect Parade/Text Properties, not
+// nested under any of them - and it doesn't exist until timeRemapEnabled is
+// set true. Direct layer.property() access is required.
+function setTimeRemap(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        var layer = _resolveLayer(comp, args);
+        if (!layer) return JSON.stringify({ status: "error", message: "Layer not found." });
+        if (!(layer instanceof AVLayer)) {
+            return JSON.stringify({ status: "error", message: "Layer '" + layer.name + "' is not an AV layer; time remapping requires an AV layer with a time-based source." });
+        }
+
+        if (args.enabled === false) {
+            try {
+                layer.timeRemapEnabled = false;
+            } catch (eDisable) {
+                return JSON.stringify({ status: "error", message: "Failed to disable time remapping on layer '" + layer.name + "': " + eDisable.toString() });
+            }
+            return JSON.stringify({ status: "success", layerName: layer.name, timeRemapEnabled: false, message: "Time remapping disabled." });
+        }
+
+        if (!layer.timeRemapEnabled) {
+            try {
+                layer.timeRemapEnabled = true;
+            } catch (eEnable) {
+                return JSON.stringify({ status: "error", message: "Could not enable time remapping on layer '" + layer.name + "': " + eEnable.toString() + ". This layer type may not support time remapping (e.g. text, shape, camera, or light layers)." });
+            }
+        }
+
+        var property = layer.property("ADBE Time Remapping");
+        if (!property) {
+            return JSON.stringify({ status: "error", message: "Could not access Time Remap property after enabling it on layer '" + layer.name + "'." });
+        }
+
+        var keyframeResults = [];
+        if (args.keyframes && args.keyframes.length) {
+            for (var i = 0; i < args.keyframes.length; i++) {
+                var kf = args.keyframes[i];
+                try {
+                    property.setValueAtTime(kf.time, kf.value);
+                    keyframeResults.push({ time: kf.time, value: kf.value, status: "success" });
+                } catch (eKf) {
+                    keyframeResults.push({ time: kf.time, value: kf.value, status: "error", message: eKf.toString() });
+                }
+            }
+        }
+
+        var keys = [];
+        for (var k = 1; k <= property.numKeys; k++) {
+            var inEaseOut = null, outEaseOut = null;
+            try {
+                var inE = property.keyInTemporalEase(k);
+                var outE = property.keyOutTemporalEase(k);
+                inEaseOut = { speed: inE[0].speed, influence: inE[0].influence };
+                outEaseOut = { speed: outE[0].speed, influence: outE[0].influence };
+            } catch (e) {}
+            keys.push({
+                time: property.keyTime(k),
+                value: property.keyValue(k),
+                inInterp: enumName(KeyframeInterpolationType, property.keyInInterpolationType(k)),
+                outInterp: enumName(KeyframeInterpolationType, property.keyOutInterpolationType(k)),
+                inEase: inEaseOut,
+                outEase: outEaseOut
+            });
+        }
+
+        return JSON.stringify({
+            status: "success",
+            layerName: layer.name,
+            timeRemapEnabled: layer.timeRemapEnabled,
+            numKeys: property.numKeys,
+            keyframeResults: keyframeResults,
+            keys: keys
+        }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// ---- Keyframe-manipulation helpers ----
+// AE's scripting DOM has no setKeyTime() - keyTime is read-only - so moving,
+// scaling, or reversing keyframe times is forced to be a
+// snapshot -> clear-all -> rebuild-at-new-times cycle, not a shortcut.
+
+function _snapshotKeyframes(property) {
+    var snapshot = [];
+    for (var i = 1; i <= property.numKeys; i++) {
+        snapshot.push({
+            time: property.keyTime(i),
+            value: property.keyValue(i),
+            inInterp: property.keyInInterpolationType(i),
+            outInterp: property.keyOutInterpolationType(i),
+            inEase: property.keyInTemporalEase(i),
+            outEase: property.keyOutTemporalEase(i)
+        });
+    }
+    return snapshot;
+}
+
+function _clearAllKeyframes(property) {
+    while (property.numKeys > 0) {
+        property.removeKey(1);
+    }
+}
+
+// Rebuild keyframes from a snapshot array where each entry additionally has a
+// computed `newTime`. Entries with newTime < 0 are skipped (AE keyframes
+// cannot have negative time) and reported in the returned `dropped` list -
+// unlike ishu86's equivalent, which silently drops these while still
+// reporting the original key count as the number moved/scaled.
+function _rebuildKeyframesAtNewTimes(property, snapshot) {
+    var addedCount = 0;
+    var dropped = [];
+    for (var i = 0; i < snapshot.length; i++) {
+        var k = snapshot[i];
+        if (k.newTime < 0) {
+            dropped.push(k.time);
+            continue;
+        }
+        property.setValueAtTime(k.newTime, k.value);
+        var newIndex = findKeyIndexAtTime(property, k.newTime);
+        if (newIndex > 0) {
+            // Ease is set BEFORE interpolation type: setTemporalEaseAtKey appears to
+            // force/promote a key to BEZIER interpolation as a side effect, which
+            // would silently clobber a HOLD/LINEAR type if applied afterward - the
+            // interpolation-type call must be last so it's the one that sticks.
+            try { property.setTemporalEaseAtKey(newIndex, k.inEase, k.outEase); } catch (e) {}
+            try { property.setInterpolationTypeAtKey(newIndex, k.inInterp, k.outInterp); } catch (e) {}
+        }
+        addedCount++;
+    }
+    return { addedCount: addedCount, dropped: dropped };
+}
+
+function getKeyframes(args) {
+    try {
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var property = _resolveLayerProperty(cl.layer, args.propertyName);
+        if (!property) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' not found on layer '" + cl.layer.name + "'." });
+        }
+        var keys = [];
+        for (var i = 1; i <= property.numKeys; i++) {
+            var inEaseOut = null, outEaseOut = null;
+            try {
+                var inE = property.keyInTemporalEase(i);
+                var outE = property.keyOutTemporalEase(i);
+                inEaseOut = { speed: inE[0].speed, influence: inE[0].influence };
+                outEaseOut = { speed: outE[0].speed, influence: outE[0].influence };
+            } catch (e) {}
+            keys.push({
+                time: property.keyTime(i),
+                value: safeValue(property.keyValue(i)),
+                inInterp: enumName(KeyframeInterpolationType, property.keyInInterpolationType(i)),
+                outInterp: enumName(KeyframeInterpolationType, property.keyOutInterpolationType(i)),
+                inEase: inEaseOut,
+                outEase: outEaseOut
+            });
+        }
+        return JSON.stringify({ status: "success", numKeys: property.numKeys, keys: keys });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function offsetKeyframes(args) {
+    try {
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var property = _resolveLayerProperty(cl.layer, args.propertyName);
+        if (!property) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' not found on layer '" + cl.layer.name + "'." });
+        }
+        var offsetSeconds = (args.offsetSeconds !== undefined && args.offsetSeconds !== null) ? Number(args.offsetSeconds) : 0;
+        var snapshot = _snapshotKeyframes(property);
+        for (var i = 0; i < snapshot.length; i++) snapshot[i].newTime = snapshot[i].time + offsetSeconds;
+
+        _clearAllKeyframes(property);
+        var rebuilt = _rebuildKeyframesAtNewTimes(property, snapshot);
+
+        var out = { status: "success", keyframesMoved: rebuilt.addedCount };
+        if (rebuilt.dropped.length) {
+            out.note = "Dropped " + rebuilt.dropped.length + " keyframe(s) whose offset time would be negative (original times: " + rebuilt.dropped.join(", ") + ").";
+        }
+        return JSON.stringify(out);
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function scaleKeyframeTiming(args) {
+    try {
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var property = _resolveLayerProperty(cl.layer, args.propertyName);
+        if (!property) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' not found on layer '" + cl.layer.name + "'." });
+        }
+        if (property.numKeys === 0) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' has no keyframes to scale." });
+        }
+        var scale = Number(args.scale);
+        var snapshot = _snapshotKeyframes(property);
+        var anchorTime = (args.anchorTime !== undefined && args.anchorTime !== null) ? Number(args.anchorTime) : snapshot[0].time;
+        for (var i = 0; i < snapshot.length; i++) snapshot[i].newTime = anchorTime + (snapshot[i].time - anchorTime) * scale;
+
+        _clearAllKeyframes(property);
+        var rebuilt = _rebuildKeyframesAtNewTimes(property, snapshot);
+
+        var out = { status: "success", keyframesScaled: rebuilt.addedCount, anchorTime: anchorTime };
+        if (rebuilt.dropped.length) {
+            out.note = "Dropped " + rebuilt.dropped.length + " keyframe(s) whose scaled time would be negative (original times: " + rebuilt.dropped.join(", ") + ").";
+        }
+        return JSON.stringify(out);
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function reverseKeyframes(args) {
+    try {
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var property = _resolveLayerProperty(cl.layer, args.propertyName);
+        if (!property) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' not found on layer '" + cl.layer.name + "'." });
+        }
+        if (property.numKeys === 0) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' has no keyframes to reverse." });
+        }
+        var snapshot = _snapshotKeyframes(property);
+        var firstTime = snapshot[0].time;
+        var lastTime = snapshot[snapshot.length - 1].time;
+        var reversed = [];
+        for (var i = snapshot.length - 1; i >= 0; i--) {
+            var k = snapshot[i];
+            reversed.push({
+                newTime: firstTime + (lastTime - k.time),
+                value: k.value,
+                // In/out interpolation and ease swap on reversal: what was
+                // incoming becomes outgoing and vice versa.
+                inInterp: k.outInterp,
+                outInterp: k.inInterp,
+                inEase: k.outEase,
+                outEase: k.inEase
+            });
+        }
+
+        _clearAllKeyframes(property);
+        var rebuilt = _rebuildKeyframesAtNewTimes(property, reversed);
+
+        return JSON.stringify({ status: "success", keyframesReversed: rebuilt.addedCount });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function copyKeyframes(args) {
+    try {
+        var comp = app.project.items[args.compIndex];
+        if (!comp || !(comp instanceof CompItem)) {
+            return JSON.stringify({ status: "error", error: "Composition not found at index " + args.compIndex });
+        }
+        var sourceLayer = (args.sourceLayerIndex !== undefined && args.sourceLayerIndex !== null) ? comp.layers[args.sourceLayerIndex] : null;
+        var targetLayer = (args.targetLayerIndex !== undefined && args.targetLayerIndex !== null) ? comp.layers[args.targetLayerIndex] : null;
+        if (!sourceLayer) return JSON.stringify({ status: "error", error: "Source layer not found at index " + args.sourceLayerIndex });
+        if (!targetLayer) return JSON.stringify({ status: "error", error: "Target layer not found at index " + args.targetLayerIndex });
+
+        var sourceProp = _resolveLayerProperty(sourceLayer, args.sourceProperty);
+        var targetProp = _resolveLayerProperty(targetLayer, args.targetProperty);
+        if (!sourceProp) return JSON.stringify({ status: "error", error: "Source property '" + args.sourceProperty + "' not found on layer '" + sourceLayer.name + "'." });
+        if (!targetProp) return JSON.stringify({ status: "error", error: "Target property '" + args.targetProperty + "' not found on layer '" + targetLayer.name + "'." });
+
+        var timeOffset = (args.timeOffset !== undefined && args.timeOffset !== null) ? Number(args.timeOffset) : 0;
+        var snapshot = _snapshotKeyframes(sourceProp);
+        var copiedCount = 0;
+        for (var i = 0; i < snapshot.length; i++) {
+            var k = snapshot[i];
+            var newTime = k.time + timeOffset;
+            if (newTime < 0) continue;
+            targetProp.setValueAtTime(newTime, k.value);
+            var newIndex = findKeyIndexAtTime(targetProp, newTime);
+            if (newIndex > 0) {
+                // Same ordering fix as _rebuildKeyframesAtNewTimes above: ease first,
+                // interpolation type last, since setTemporalEaseAtKey appears to force
+                // a promotion to BEZIER that would otherwise clobber HOLD/LINEAR.
+                try { targetProp.setTemporalEaseAtKey(newIndex, k.inEase, k.outEase); } catch (e) {}
+                try { targetProp.setInterpolationTypeAtKey(newIndex, k.inInterp, k.outInterp); } catch (e) {}
+            }
+            copiedCount++;
+        }
+
+        return JSON.stringify({ status: "success", keysCopied: copiedCount });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function applyEasyEase(args) {
+    try {
+        var cl = _resolveCompAndLayerSimple(args.compIndex, args.layerIndex);
+        var property = _resolveLayerProperty(cl.layer, args.propertyName);
+        if (!property) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' not found on layer '" + cl.layer.name + "'." });
+        }
+        if (property.numKeys === 0) {
+            return JSON.stringify({ status: "error", error: "Property '" + args.propertyName + "' has no keyframes." });
+        }
+
+        var type = args.type || "both";
+        var indices = [];
+        if (args.keyframeIndex !== undefined && args.keyframeIndex !== null) {
+            indices.push(args.keyframeIndex);
+        } else {
+            // Omitted keyframeIndex means "all keyframes" - matches how AE's
+            // own Easy Ease command behaves with multiple keys selected,
+            // and is the more common real use case than one key at a time.
+            for (var i = 1; i <= property.numKeys; i++) indices.push(i);
+        }
+
+        for (var j = 0; j < indices.length; j++) {
+            var idx = indices[j];
+            if (idx < 1 || idx > property.numKeys) continue;
+            var currentIn = property.keyInTemporalEase(idx);
+            var currentOut = property.keyOutTemporalEase(idx);
+            // Temporal ease array length is per-property, not per value dimension:
+            // spatial properties like Position use ONE ease value for the whole
+            // motion path (unless dimensions are separated), not one per axis, so
+            // getPropertyDimensionCount() (based on the property's VALUE shape,
+            // e.g. 3 for [x,y,z]) does not reliably match what setTemporalEaseAtKey
+            // expects here. Read the expected length from the key's own existing
+            // ease array instead - guaranteed to match since it's the same key.
+            var easedIn = buildEaseArray(currentIn.length, 0, 33.33);
+            var easedOut = buildEaseArray(currentOut.length, 0, 33.33);
+            var newIn = (type === "in" || type === "both") ? easedIn : currentIn;
+            var newOut = (type === "out" || type === "both") ? easedOut : currentOut;
+            property.setTemporalEaseAtKey(idx, newIn, newOut);
+        }
+
+        return JSON.stringify({ status: "success", keyframesEased: indices.length, type: type });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
     }
 }
 
@@ -2522,21 +3542,138 @@ panel.spacing = 10;
 panel.margins = 16;
 var statusText = panel.add("statictext", undefined, "Waiting for commands...");
 statusText.alignment = ["fill", "top"];
+// (Dockable panels DO work on AE 2025/2026 with the correct ScriptUI pattern below,
+// so the old "floating window only" warning was removed.)
+
+// --- Transport panel: status lines + controls, all in one group so a narrow
+// dock wraps rows instead of clipping them (each row is its own "row" group). ---
+var transportPanel = panel.add("panel", undefined, "Transport");
+transportPanel.orientation = "column";
+transportPanel.alignChildren = ["fill", "top"];
+transportPanel.spacing = 6;
+transportPanel.margins = 10;
+
+var transportSocketText = transportPanel.add("statictext", undefined, "Socket: starting...");
+transportSocketText.alignment = ["fill", "top"];
+var transportPermissionText = transportPanel.add("statictext", undefined, "Permission: checking...");
+transportPermissionText.alignment = ["fill", "top"];
+var transportFileText = transportPanel.add("statictext", undefined, "File fallback: ON");
+transportFileText.alignment = ["fill", "top"];
+var transportStatsText = transportPanel.add("statictext", undefined, "0 socket / 0 file");
+transportStatsText.alignment = ["fill", "top"];
+var transportErrText = transportPanel.add("statictext", undefined, "errors 0 | rejected 0");
+transportErrText.alignment = ["fill", "top"];
+
+var portRow = transportPanel.add("group");
+portRow.orientation = "row";
+portRow.alignChildren = ["left", "center"];
+portRow.add("statictext", undefined, "Port:");
+var portField = portRow.add("edittext", undefined, String(SOCKET_PORT_BASE));
+portField.characters = 6;
+var applyPortButton = portRow.add("button", undefined, "Apply");
+var restartListenerButton = portRow.add("button", undefined, "Restart listener");
+
+// Error placement: shown immediately below the field it concerns rather than
+// only in the log at the bottom, which is easy to miss. Empty when there is
+// nothing wrong; never removed from the layout (that would reflow every other
+// row each time it toggled).
+var portErrorText = transportPanel.add("statictext", undefined, "");
+portErrorText.alignment = ["fill", "top"];
+
+var checkboxRow = transportPanel.add("group");
+checkboxRow.orientation = "row";
+checkboxRow.alignChildren = ["left", "center"];
+var autoRunCheckbox = checkboxRow.add("checkbox", undefined, "Auto-run commands");
+autoRunCheckbox.value = true;
+var socketCheckbox = checkboxRow.add("checkbox", undefined, "Socket");
+socketCheckbox.value = true;
+var fileCheckbox = checkboxRow.add("checkbox", undefined, "File");
+fileCheckbox.value = true;
+
+var buttonRow = transportPanel.add("group");
+buttonRow.orientation = "row";
+buttonRow.alignChildren = ["left", "center"];
+var checkButton = buttonRow.add("button", undefined, "Check now");
+var copyDiagButton = buttonRow.add("button", undefined, "Copy diagnostics");
+var clearLogButton = buttonRow.add("button", undefined, "Clear log");
+
+var verboseCheckbox = transportPanel.add("checkbox", undefined, "Verbose log");
+verboseCheckbox.value = false;
+
 var logPanel = panel.add("panel", undefined, "Command Log");
 logPanel.orientation = "column";
 logPanel.alignChildren = ["fill", "fill"];
 var logText = logPanel.add("edittext", undefined, "", {multiline: true, readonly: true});
-logText.preferredSize.height = 200;
-// (Dockable panels DO work on AE 2025/2026 with the correct ScriptUI pattern below,
-// so the old "floating window only" warning was removed.)
-var autoRunCheckbox = panel.add("checkbox", undefined, "Auto-run commands");
-autoRunCheckbox.value = true;
+// Reduced from 200 to pay for the Transport controls above without growing
+// the panel's default height.
+logText.preferredSize.height = 160;
 // How often the panel checks for a new command, in ms. Lowered from 500 to 250
 // to halve per-command latency; the per-check work is tiny (a file existence
 // check), so the CPU cost is negligible and rendering quality is unaffected.
 var checkInterval = 250;
+// The tick now serves BOTH transports. Socket accept latency drops from ~125ms
+// average to ~25ms, while the file poll stays on exactly its old 250ms cadence
+// (every 5th 50ms tick), so the file path's cost is unchanged. If the listener
+// cannot bind we fall back to a plain 250ms tick, since there is nothing to
+// accept and the extra wakeups would buy nothing.
+var TICK_MS = 50;
+var FILE_CHECK_EVERY = 5;
+var tickCount = 0;
 var isChecking = false;
 var currentCommandId = "";
+
+// --- socket transport state -------------------------------------------------
+var SOCKET_PORT_BASE = 47800;
+var SOCKET_PORT_TRIES = 16;
+var SOCKET_PROTOCOL_VERSION = 1;
+// Probe S7: a 32KB chunked write loop moves 1MB in ~5ms, while building and
+// writing one multi-megabyte string freezes After Effects hard enough to need a
+// force quit. Never write a whole large result in a single call.
+var SOCKET_CHUNK = 32768;
+// Probe S5: poll() can return null while ANOTHER connection is still queued
+// behind it, so a single poll per tick does not drain a burst.
+var SOCKET_POLLS_PER_TICK = 4;
+var socketListener = null;
+var socketPort = 0;
+var socketToken = "";
+var socketStatus = "not started";
+var socketPermission = false;
+// Set for the duration of a socket-served command. executeCommand's result
+// writes go here instead of to the result file, which is the ONLY change the 83
+// command handlers are exposed to.
+var currentResultSink = null;
+var currentTransport = "file";
+var socketCommandCount = 0;
+var fileCommandCount = 0;
+var socketRejectCount = 0;
+var socketErrorCount = 0;
+var lastCommandName = "";
+var lastCommandMs = 0;
+// Unlike AE_MCP_BRIDGE_TRANSPORT on the Node side, the panel's Socket checkbox
+// is a runtime toggle: unchecking it actually closes the listener and removes
+// the rendezvous file (see its onClick below), so Node sees an instant refusal
+// rather than sitting out an ACK timeout against a socket nobody is servicing.
+// socketListener's presence IS that state; there is no separate flag. The File
+// checkbox has no listener to close, so it is a plain gate read in bridgeTick.
+var fileTransportEnabled = true;
+
+// --- log ring buffer ---------------------------------------------------
+// logToPanel used to prepend onto the FULL accumulated text on every call, so
+// its cost grew without bound over a long session (O(n) per call across
+// however many thousand lines had ever been logged). A fixed-size ring buffer
+// plus a throttled flush bounds both the memory and the widget-redraw cost
+// regardless of session length or tick rate.
+var LOG_MAX_LINES = 200;
+var LOG_FLUSH_MS = 200;
+var logLines = []; // newest first
+var logDirty = false;
+var lastLogFlushAt = 0;
+// Repainting the Transport status lines is throttled for the same reason the
+// log is: at TICK_MS=50 an unthrottled refresh rewrites five ScriptUI widgets
+// 20 times a second, which measurably slowed command round trips (141ms vs
+// 88ms average). Nothing here changes faster than a human can read anyway.
+var PANEL_UPDATE_MS = 250;
+var lastPanelUpdateAt = 0;
 // Dedup key for the last command we acted on. We deduplicate by the server-issued
 // commandId instead of mutating a "status" field inside the shared command file:
 // the Node server also writes that file, so an AE-side read-modify-write would race
@@ -2544,7 +3681,7 @@ var currentCommandId = "";
 // command under concurrent/rapid tool dispatch). The server matches results purely
 // by _commandId, so AE never needs to write the command file at all.
 var lastProcessedCommandId = "";
-var BRIDGE_VERSION = "1.10.0-mcp-enhanced";
+var BRIDGE_VERSION = "1.12.0-mcp-socket";
 // Pure read-only commands: they never mutate the project, so we skip the undo
 // group for them (no empty "MCP: ping" entries cluttering Edit > Undo History).
 var READ_ONLY_COMMANDS = {
@@ -2557,7 +3694,11 @@ var READ_ONLY_COMMANDS = {
     "getLayerFull": true,
     "getCompFull": true,
     "getLayerClipFrames": true,
-    "getLayerAudioInfo": true
+    "getLayerAudioInfo": true,
+    "findMissingFootage": true,
+    "getExpression": true,
+    "getKeyframes": true,
+    "getShapePath": true
 };
 // MUST mirror getAETempDir() on the Node server side. On Windows we use
 // LOCALAPPDATA (never redirected by OneDrive) so both processes resolve to the
@@ -2594,6 +3735,270 @@ function getCommandFilePath() {
 }
 function getResultFilePath() {
     return getBridgeFolder().fsName + "/ae_mcp_result.json";
+}
+
+// ===========================================================================
+// Socket transport
+//
+// After Effects LISTENS and the Node server connects once per command, because
+// poll() is the only non-blocking primitive ExtendScript has and it exists only
+// on the listening side. Every constant and guard below is backed by a live
+// measurement recorded in CONTEXT.md ("socket bridge transport, Phase 0 probe").
+// ===========================================================================
+
+function getRendezvousPath(port) {
+    return getBridgeFolder().fsName + "/ae_bridge_port_" + port + ".json";
+}
+
+// Probe S8: the 2-arg form reads this correctly, the 3-arg
+// PREF_Type_MACHINE_INDEPENDENT form THROWS, and havePref() returns false even
+// when the value is readable. So: 2-arg only, and never gate on havePref.
+function isNetworkPermissionEnabled() {
+    try {
+        return app.preferences.getPrefAsLong(
+            "Main Pref Section", "Pref_SCRIPTING_FILE_NETWORK_SECURITY") === 1;
+    } catch (e) {
+        return false;
+    }
+}
+
+/*
+ * A per-session token, published in the rendezvous file next to the port.
+ *
+ * Be honest about what this is: ExtendScript has no CSPRNG, so it is a nuisance
+ * barrier and a protocol tag, NOT authentication. It exists because probe S3
+ * found listen() binds 0.0.0.0 with no way to ask for loopback, and probe S4
+ * found the accepted connection's host is an empty string so we cannot reject a
+ * non-loopback peer either. Any local process running as this user can already
+ * write ae_command.json today, so the token restores parity with the file
+ * transport and claims nothing beyond that. See SECURITY.md.
+ */
+function makeSocketToken() {
+    var hex = "0123456789abcdef";
+    var out = "";
+    var seed = (new Date()).getTime();
+    try { seed += Math.floor($.hiresTimer); } catch (e) {}
+    for (var i = 0; i < 32; i++) {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        var a = Math.floor(Math.random() * 16);
+        var b = Math.floor(seed / 65536) % 16;
+        out += hex.charAt((a ^ b) & 15);
+    }
+    return out;
+}
+
+function writeRendezvousFile(port, token) {
+    try {
+        var f = new File(getRendezvousPath(port));
+        f.encoding = "UTF-8";
+        if (!f.open("w")) { return false; }
+        f.write(JSON.stringify({
+            v: SOCKET_PROTOCOL_VERSION,
+            port: port,
+            token: token,
+            bridgeVersion: BRIDGE_VERSION,
+            aeVersion: app.version,
+            boundAt: new Date().toISOString(),
+            // Same wording as the ping reply, so check-bridge shows one value
+            // whether it read this file or asked the panel directly.
+            project: (app.project && app.project.file) ? app.project.file.name : "Untitled Project"
+        }));
+        f.close();
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+function removeRendezvousFile(port) {
+    try {
+        var f = new File(getRendezvousPath(port));
+        if (f.exists) { f.remove(); }
+    } catch (e) {}
+}
+
+/*
+ * Close any listener this panel (or a previous run of it) left bound.
+ *
+ * A leaked LISTENING socket is worse than the leaked scheduled task the
+ * mcpCheckTaskId pattern already guards against, because it holds the port and
+ * the next panel run would bind 47801 instead. $.global is the only state that
+ * survives a panel close and reopen, so that is where the handle lives.
+ */
+function stopSocketListener() {
+    try {
+        if ($.global.mcpSocketListener) { $.global.mcpSocketListener.close(); }
+    } catch (e) {}
+    $.global.mcpSocketListener = null;
+    var stalePort = $.global.mcpSocketPort;
+    if (stalePort) { removeRendezvousFile(stalePort); }
+    $.global.mcpSocketPort = 0;
+    socketListener = null;
+    socketPort = 0;
+    socketToken = "";
+    // Leaving the previous status in place would make the panel (and the ping
+    // report check-bridge reads) claim "listening" after the listener is gone.
+    // Callers that stop in order to restart overwrite this immediately.
+    socketStatus = "stopped";
+}
+
+// The port the user pinned in the panel, or 0. Probe S10: app.settings round
+// trips reliably, while $.getenv sees NONE of the AE_MCP_BRIDGE_* variables
+// inside AE (it is not launched from the MCP client's environment), which is
+// also why the rendezvous has to be a file rather than a shared env var.
+function getPreferredSocketPort() {
+    try {
+        if (app.settings.haveSetting("MCPBridge", "port")) {
+            var v = parseInt(app.settings.getSetting("MCPBridge", "port"), 10);
+            if (v > 0 && v < 65536) { return v; }
+        }
+    } catch (e) {}
+    return 0;
+}
+
+function startSocketListener(preferredPort) {
+    stopSocketListener();
+    socketPermission = isNetworkPermissionEnabled();
+    if (!socketPermission) {
+        socketStatus = "permission disabled";
+        return false;
+    }
+
+    var ports = [];
+    if (preferredPort > 0 && preferredPort < 65536) { ports.push(preferredPort); }
+    for (var i = 0; i < SOCKET_PORT_TRIES; i++) {
+        var p = SOCKET_PORT_BASE + i;
+        var seen = false;
+        for (var j = 0; j < ports.length; j++) { if (ports[j] === p) { seen = true; } }
+        if (!seen) { ports.push(p); }
+    }
+
+    for (var k = 0; k < ports.length; k++) {
+        var s = new Socket();
+        var bound = false;
+        // Probe S9: a second listen() on a taken port returns FALSE rather than
+        // throwing, but keep the try/catch anyway; this file is never linted.
+        try { bound = s.listen(ports[k]); } catch (e) { bound = false; }
+        if (bound) {
+            // Probe S2: plain listen(port) leaves encoding at UTF-8 but
+            // listen(port, "UTF-8") leaves it at ASCII, so the 2-arg form does
+            // the opposite of what it looks like. Never use it, and set the
+            // encoding explicitly rather than trusting either.
+            s.encoding = "UTF-8";
+            socketListener = s;
+            socketPort = ports[k];
+            socketToken = makeSocketToken();
+            $.global.mcpSocketListener = s;
+            $.global.mcpSocketPort = socketPort;
+            if (!writeRendezvousFile(socketPort, socketToken)) {
+                socketStatus = "bound " + socketPort + " but could not publish rendezvous";
+                return true;
+            }
+            socketStatus = "listening";
+            return true;
+        }
+        try { s.close(); } catch (e2) {}
+    }
+    socketStatus = "no free port in " + SOCKET_PORT_BASE + "-" + (SOCKET_PORT_BASE + SOCKET_PORT_TRIES - 1);
+    return false;
+}
+
+// Probe S7: write() returns the byte count it accepted, and 32 x 32KB chunks
+// move 1MB in ~5ms. Chunking is not an optimization here, it is what keeps a
+// large result from wedging the application.
+function writeSocketLine(conn, line) {
+    var text = line + "\n";
+    var pos = 0;
+    while (pos < text.length) {
+        var piece = text.substr(pos, SOCKET_CHUNK);
+        var wrote;
+        try { wrote = conn.write(piece); } catch (e) { return false; }
+        if (wrote === false) { return false; }
+        pos += piece.length;
+    }
+    return true;
+}
+
+function rejectConnection(conn, reason, commandId) {
+    socketRejectCount++;
+    try {
+        writeSocketLine(conn, JSON.stringify({
+            _ack: 0, error: reason, commandId: commandId || ""
+        }));
+    } catch (e) {}
+    try { conn.close(); } catch (e2) {}
+}
+
+/*
+ * Accept at most one connection and serve at most one command on it.
+ *
+ * The ACK is written BEFORE dispatching to executeCommand. That single ordering
+ * decision is what lets a ten minute render coexist with the server's 1.5s
+ * liveness check, and it is the evidence that makes the server's file fallback
+ * provably safe: no ACK means nothing ran, so a retry cannot double-execute a
+ * deleteLayer. Do not move it below the dispatch.
+ */
+function serviceSocketOnce() {
+    if (!socketListener) { return false; }
+    var conn = null;
+    try { conn = socketListener.poll(); } catch (e) { socketErrorCount++; return false; }
+    if (!conn) { return false; }
+
+    try {
+        // Probe S1: a fresh socket's encoding defaults to ASCII, not BINARY and
+        // not UTF-8. Arabic and every other non-ASCII payload depends on this line.
+        conn.encoding = "UTF-8";
+        // Bounds readln() and each individual write(). It does NOT bound
+        // executeCommand, which is exactly why a long render is safe.
+        conn.timeout = 30;
+
+        var line = conn.readln();
+        if (!line) { rejectConnection(conn, "bad-request", ""); return true; }
+
+        var req = null;
+        try { req = JSON.parse(line); } catch (pe) { req = null; }
+        if (!req || typeof req.command !== "string") {
+            rejectConnection(conn, "bad-request", (req && req.commandId) || "");
+            return true;
+        }
+        if (req.v !== SOCKET_PROTOCOL_VERSION) {
+            rejectConnection(conn, "protocol-mismatch", req.commandId || "");
+            return true;
+        }
+        if (!socketToken || req.token !== socketToken) {
+            rejectConnection(conn, "unauthorized", req.commandId || "");
+            return true;
+        }
+
+        writeSocketLine(conn, JSON.stringify({
+            _ack: 1,
+            commandId: req.commandId || "",
+            bridgeVersion: BRIDGE_VERSION
+        }));
+
+        currentCommandId = req.commandId || "";
+        // Claim the id on the file path too, so a command that arrives over the
+        // socket can never also be replayed out of ae_command.json.
+        if (currentCommandId) { lastProcessedCommandId = currentCommandId; }
+        currentTransport = "socket";
+        currentResultSink = function (resultString) {
+            writeSocketLine(conn, resultString);
+        };
+        try {
+            executeCommand(req.command, req.args || {});
+        } finally {
+            currentResultSink = null;
+            currentTransport = "file";
+        }
+        socketCommandCount++;
+        try { conn.close(); } catch (ec) {}
+        return true;
+    } catch (e) {
+        socketErrorCount++;
+        try { logToPanel("Socket error: " + e.toString()); } catch (e2) {}
+        try { conn.close(); } catch (e3) {}
+        return true;
+    }
 }
 function getProjectInfo() {
     var project = app.project;
@@ -2653,6 +4058,388 @@ function getProjectInfo() {
     }
 
     return JSON.stringify(result, null, 2);
+}
+
+// Shared dirty-check/save-first gate for the project-lifecycle commands that
+// can discard unsaved work (createProject, openProject, closeProject).
+// executeCommand() suppresses all AE dialogs for every command
+// (app.beginSuppressDialogs()), so these commands must never rely on AE's own
+// "save changes?" prompt (CloseOptions.PROMPT_TO_SAVE_CHANGES) - its behavior
+// under suppression is undocumented/version-dependent. The caller must say
+// explicitly what to do via the required saveFirst arg instead.
+// Returns null if it is safe to proceed, or a JSON error string if the caller
+// must be stopped (never silently discards, never silently proceeds unsaved).
+function _resolveSaveFirst(saveFirst) {
+    if (!app.project.dirty) return null; // nothing unsaved; proceed regardless of saveFirst
+    if (saveFirst === true) {
+        if (!app.project.file) {
+            return JSON.stringify({
+                status: "error",
+                error: "Project has unsaved changes and no file path yet; cannot saveFirst. Call save-project with an explicit filePath first, or pass saveFirst:false to discard."
+            });
+        }
+        app.project.save();
+        return null;
+    }
+    // saveFirst === false: explicit, informed-consent discard path.
+    return null;
+}
+
+function createProject(args) {
+    try {
+        var gate = _resolveSaveFirst(args && args.saveFirst);
+        if (gate) return gate;
+        // Explicitly close the current project before creating the new one,
+        // instead of relying on app.newProject()'s own internal handling of a
+        // dirty current project. Confirmed live: app.beginSuppressDialogs() does
+        // NOT reliably suppress the native "save changes?" dialog that app.open()/
+        // app.newProject() raise themselves for a dirty project - it blocked the
+        // whole bridge (and thus every other MCP tool) until manually dismissed,
+        // even though _resolveSaveFirst had already decided discarding was fine.
+        // Project.close(CloseOptions.DO_NOT_SAVE_CHANGES) has been reliable with
+        // no dialog across every call in this codebase's own test suites, so do
+        // that explicitly first rather than trusting the dialog suppression.
+        try { app.project.close(CloseOptions.DO_NOT_SAVE_CHANGES); } catch (eClose) {}
+        app.newProject();
+        return JSON.stringify({ status: "success", message: "Created a new project." });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function openProject(args) {
+    try {
+        var filePath = args && args.filePath;
+        if (!filePath) {
+            return JSON.stringify({ status: "error", error: "filePath is required." });
+        }
+        var file = new File(filePath);
+        if (!file.exists) {
+            return JSON.stringify({ status: "error", error: "Project file not found: " + filePath });
+        }
+        var gate = _resolveSaveFirst(args && args.saveFirst);
+        if (gate) return gate;
+        // See the comment in createProject() above: explicitly close the current
+        // project first rather than relying on app.open()'s own (unreliable)
+        // dialog suppression for a dirty current project.
+        try { app.project.close(CloseOptions.DO_NOT_SAVE_CHANGES); } catch (eClose) {}
+        app.open(file);
+        return JSON.stringify({ status: "success", message: "Opened project: " + filePath, path: filePath });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function saveProject(args) {
+    try {
+        var filePath = args && args.filePath;
+        if (filePath) {
+            app.project.save(new File(filePath));
+            return JSON.stringify({ status: "success", message: "Project saved to: " + filePath, path: filePath });
+        }
+        if (!app.project.file) {
+            return JSON.stringify({ status: "error", error: "Project has never been saved and no filePath was provided. Provide filePath to save it for the first time." });
+        }
+        app.project.save();
+        return JSON.stringify({ status: "success", message: "Project saved.", path: app.project.file.fsName });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function closeProject(args) {
+    try {
+        var gate = _resolveSaveFirst(args && args.saveFirst);
+        if (gate) return gate;
+        app.project.close(CloseOptions.DO_NOT_SAVE_CHANGES);
+        return JSON.stringify({ status: "success", message: "Project closed. After Effects may have automatically opened a new blank project." });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+// Shared project-item lookup by id (fast, uses the real itemByID API) or name
+// (linear scan, matching the existing _resolveComp() pattern above). Returns
+// null if neither identifies an item.
+function _findProjectItemByIdOrName(itemId, itemName) {
+    if (itemId !== undefined && itemId !== null) {
+        var byId = app.project.itemByID(itemId);
+        if (byId) return byId;
+    }
+    if (itemName) {
+        for (var i = 1; i <= app.project.numItems; i++) {
+            var it = app.project.item(i);
+            if (it.name === itemName) return it;
+        }
+    }
+    return null;
+}
+
+function importFootage(args) {
+    try {
+        var filePath = args && args.filePath;
+        if (!filePath) return JSON.stringify({ status: "error", error: "filePath is required." });
+        var file = new File(filePath);
+        if (!file.exists) return JSON.stringify({ status: "error", error: "File not found: " + filePath });
+
+        var importOptions = new ImportOptions(file);
+        if (args.sequence) {
+            importOptions.sequence = true;
+            if (args.forceAlphabetical) importOptions.forceAlphabetical = true;
+        }
+        var imported = app.project.importFile(importOptions);
+        if (args.name) imported.name = args.name;
+
+        return JSON.stringify({
+            status: "success",
+            item: {
+                id: imported.id,
+                name: imported.name,
+                width: imported.width,
+                height: imported.height,
+                duration: (imported.duration !== undefined ? imported.duration : null),
+                frameRate: (imported.frameRate !== undefined ? imported.frameRate : null)
+            }
+        });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function importFolder(args) {
+    try {
+        var folderPath = args && args.folderPath;
+        if (!folderPath) return JSON.stringify({ status: "error", error: "folderPath is required." });
+        var folder = new Folder(folderPath);
+        if (!folder.exists) return JSON.stringify({ status: "error", error: "Folder not found: " + folderPath });
+
+        var recursive = !!(args && args.recursive);
+        var imported = [];
+        var note = null;
+
+        function walk(f, parentFolderItem) {
+            var entries = f.getFiles();
+            for (var i = 0; i < entries.length; i++) {
+                var entry = entries[i];
+                if (entry instanceof Folder) {
+                    if (!recursive) continue;
+                    var subFolderItem = app.project.items.addFolder(entry.name);
+                    if (parentFolderItem) subFolderItem.parentFolder = parentFolderItem;
+                    walk(entry, subFolderItem);
+                } else if (entry instanceof File) {
+                    try {
+                        var item = app.project.importFile(new ImportOptions(entry));
+                        if (parentFolderItem) item.parentFolder = parentFolderItem;
+                        imported.push({ id: item.id, name: item.name });
+                    } catch (fileErr) {
+                        note = (note ? note + " " : "") + "Failed to import \"" + entry.name + "\": " + fileErr.toString();
+                    }
+                }
+            }
+        }
+
+        var rootFolderItem = app.project.items.addFolder(folder.name);
+        walk(folder, rootFolderItem);
+
+        var out = { status: "success", importedCount: imported.length, items: imported };
+        if (note) out.note = note;
+        return JSON.stringify(out);
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function replaceFootage(args) {
+    try {
+        var item = _findProjectItemByIdOrName(args && args.itemId, args && args.itemName);
+        if (!item) return JSON.stringify({ status: "error", error: "Project item not found (checked itemId and itemName)." });
+        if (!(item instanceof FootageItem)) return JSON.stringify({ status: "error", error: "Item \"" + item.name + "\" is not a footage item." });
+
+        var newPath = args && args.newPath;
+        if (!newPath) return JSON.stringify({ status: "error", error: "newPath is required." });
+        var newFile = new File(newPath);
+        if (!newFile.exists) return JSON.stringify({ status: "error", error: "Replacement file not found: " + newPath });
+
+        item.replace(newFile);
+        return JSON.stringify({ status: "success", message: "Replaced source for \"" + item.name + "\".", id: item.id, name: item.name });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function findMissingFootage(args) {
+    try {
+        var missing = [];
+        for (var i = 1; i <= app.project.numItems; i++) {
+            var item = app.project.item(i);
+            if (item instanceof FootageItem && item.footageMissing) {
+                var info = { id: item.id, name: item.name };
+                if (item.file) info.path = item.file.fsName;
+                missing.push(info);
+            }
+        }
+        return JSON.stringify({ status: "success", missingCount: missing.length, items: missing });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function collectFiles(args) {
+    try {
+        if (!app.project.file) {
+            return JSON.stringify({ status: "error", error: "Project must be saved before collecting files - call save-project first." });
+        }
+        var outputPath = args && args.outputPath;
+        if (!outputPath) return JSON.stringify({ status: "error", error: "outputPath is required." });
+
+        var outputFolder = new Folder(outputPath);
+        if (!outputFolder.exists && !outputFolder.create()) {
+            return JSON.stringify({ status: "error", error: "Could not create output folder: " + outputPath });
+        }
+
+        var includeFootage = (args.includeFootage === undefined || args.includeFootage === null) ? true : !!args.includeFootage;
+        var collected = [];
+        var note = null;
+
+        if (includeFootage) {
+            var footageFolder = new Folder(outputFolder.fsName + "/footage");
+            if (!footageFolder.exists) footageFolder.create();
+            for (var i = 1; i <= app.project.numItems; i++) {
+                var item = app.project.item(i);
+                if (item instanceof FootageItem && item.file) {
+                    try {
+                        var destPath = footageFolder.fsName + "/" + item.file.name;
+                        if (item.file.copy(destPath)) {
+                            collected.push(item.file.name);
+                        } else {
+                            note = (note ? note + " " : "") + "Failed to copy \"" + item.file.name + "\".";
+                        }
+                    } catch (copyErr) {
+                        note = (note ? note + " " : "") + "Failed to copy \"" + item.name + "\": " + copyErr.toString();
+                    }
+                }
+            }
+        }
+
+        // Copy the EXISTING saved project file into the output folder rather than
+        // calling app.project.save() on a new path - that would repoint the live
+        // project's file identity to the collected copy, which is a surprising side
+        // effect (a later plain "save" would then overwrite the copy, not the
+        // user's original file). See CONTEXT.md for the full rationale.
+        var projectDestPath = outputFolder.fsName + "/" + app.project.file.name;
+        var projectCopied = app.project.file.copy(projectDestPath);
+
+        var out = {
+            status: "success",
+            outputPath: outputFolder.fsName,
+            collectedFootageCount: collected.length,
+            collectedFootage: collected,
+            projectFileCopied: !!projectCopied
+        };
+        if (note) out.note = note;
+        return JSON.stringify(out);
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function reduceProject(args) {
+    try {
+        var confirm = !!(args && args.confirm === true);
+        if (!confirm) {
+            return JSON.stringify({ status: "error", error: "reduce-project permanently deletes unused project items; pass confirm:true to proceed." });
+        }
+        var compNames = (args && args.compNames) || [];
+        if (!compNames.length) {
+            return JSON.stringify({ status: "error", error: "compNames must contain at least one composition name." });
+        }
+
+        var comps = [];
+        for (var n = 0; n < compNames.length; n++) {
+            var found = null;
+            for (var i = 1; i <= app.project.numItems; i++) {
+                var it = app.project.item(i);
+                if (it instanceof CompItem && it.name === compNames[n]) { found = it; break; }
+            }
+            if (!found) return JSON.stringify({ status: "error", error: "Composition not found: " + compNames[n] });
+            comps.push(found);
+        }
+
+        app.project.reduceProject(comps);
+        return JSON.stringify({ status: "success", remainingItems: app.project.numItems });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
+}
+
+function organizeProjectItems(args) {
+    try {
+        var structure = (args && args.structure) || "type";
+        var organizedCount = 0;
+        var note = null;
+
+        if (structure === "type") {
+            var compsFolder = null, footageFolder = null, solidsFolder = null;
+            for (var i = 1; i <= app.project.numItems; i++) {
+                var item = app.project.item(i);
+                if (item instanceof FolderItem) continue;
+                if (item.parentFolder !== app.project.rootFolder) continue;
+                if (item instanceof CompItem) {
+                    if (!compsFolder) compsFolder = app.project.items.addFolder("Compositions");
+                    item.parentFolder = compsFolder;
+                    organizedCount++;
+                } else if (item instanceof FootageItem) {
+                    if (item.mainSource instanceof SolidSource) {
+                        if (!solidsFolder) solidsFolder = app.project.items.addFolder("Solids");
+                        item.parentFolder = solidsFolder;
+                    } else {
+                        if (!footageFolder) footageFolder = app.project.items.addFolder("Footage");
+                        item.parentFolder = footageFolder;
+                    }
+                    organizedCount++;
+                }
+            }
+        } else if (structure === "usage") {
+            var usedFolder = app.project.items.addFolder("Used");
+            var unusedFolder = app.project.items.addFolder("Unused");
+            for (var j = 1; j <= app.project.numItems; j++) {
+                var uitem = app.project.item(j);
+                if (uitem instanceof FolderItem) continue;
+                if (uitem.parentFolder !== app.project.rootFolder) continue;
+                uitem.parentFolder = (uitem.usedIn && uitem.usedIn.length > 0) ? usedFolder : unusedFolder;
+                organizedCount++;
+            }
+        } else if (structure === "custom") {
+            var customFolders = (args && args.customFolders) || [];
+            if (!customFolders.length) {
+                return JSON.stringify({ status: "error", error: "customFolders must contain at least one entry when structure is 'custom'." });
+            }
+            for (var c = 0; c < customFolders.length; c++) {
+                var spec = customFolders[c];
+                var folderItem = app.project.items.addFolder(spec.folderName);
+                var names = spec.itemNames || [];
+                var ids = spec.itemIds || [];
+                for (var ni = 0; ni < names.length; ni++) {
+                    var byName = _findProjectItemByIdOrName(null, names[ni]);
+                    if (byName) { byName.parentFolder = folderItem; organizedCount++; }
+                    else note = (note ? note + " " : "") + "Item not found: \"" + names[ni] + "\".";
+                }
+                for (var ii = 0; ii < ids.length; ii++) {
+                    var byId = _findProjectItemByIdOrName(ids[ii], null);
+                    if (byId) { byId.parentFolder = folderItem; organizedCount++; }
+                    else note = (note ? note + " " : "") + "Item id not found: " + ids[ii] + ".";
+                }
+            }
+        } else {
+            return JSON.stringify({ status: "error", error: "Unknown structure: " + structure + ". Use 'type', 'usage', or 'custom'." });
+        }
+
+        var out = { status: "success", structure: structure, organizedCount: organizedCount };
+        if (note) out.note = note;
+        return JSON.stringify(out);
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    }
 }
 
 function listCompositions() {
@@ -2886,9 +4673,18 @@ function setLayerMask(args) {
             throw new Error("Must provide either maskRect or maskPath with at least 3 points");
         }
 
+        // Tangents and open paths are both supported by AE's mask shapes -
+        // verified live (probe P8): "ADBE Mask Shape" round-trips inTangents/
+        // outTangents (to within ~3e-5; mask paths store at lower precision than
+        // shape-layer paths, which are exact) and accepts closed:false. This used
+        // to hardcode closed = true and never set tangents at all, so every mask
+        // it produced was a straight-segment polygon. Omitting the new args
+        // reproduces exactly the old behaviour.
         var myShape = new Shape();
         myShape.vertices = shapePoints;
-        myShape.closed = true;
+        if (args.maskInTangents !== undefined && args.maskInTangents !== null) { myShape.inTangents = args.maskInTangents; }
+        if (args.maskOutTangents !== undefined && args.maskOutTangents !== null) { myShape.outTangents = args.maskOutTangents; }
+        myShape.closed = (args.maskClosed === false) ? false : true;
 
         var masksGroup = _safeProp(layer, "ADBE Mask Parade", "Masks");
         if (!masksGroup) { throw new Error("This layer type cannot have masks."); }
@@ -2904,7 +4700,16 @@ function setLayerMask(args) {
             changed.push("newMask");
         }
         var pathProp = _safeProp(mask, "ADBE Mask Shape", "Mask Path");
-        if (pathProp) { pathProp.setValue(myShape); }
+        if (pathProp) {
+            // Mask paths are keyframable (probe P9), so an explicit time turns
+            // this into a mask-shape keyframe instead of a static value.
+            if (args.time !== undefined && args.time !== null) {
+                pathProp.setValueAtTime(args.time, myShape);
+                changed.push("maskPathKeyframe");
+            } else {
+                pathProp.setValue(myShape);
+            }
+        }
 
         var modes = { "none": MaskMode.NONE, "add": MaskMode.ADD, "subtract": MaskMode.SUBTRACT, "intersect": MaskMode.INTERSECT, "lighten": MaskMode.LIGHTEN, "darken": MaskMode.DARKEN, "difference": MaskMode.DIFFERENCE };
         if (modes[maskMode] !== undefined) { mask.maskMode = modes[maskMode]; changed.push("maskMode"); }
@@ -2914,6 +4719,278 @@ function setLayerMask(args) {
         if (args.maskName) { mask.name = args.maskName; changed.push("maskName"); }
 
         return JSON.stringify({ status: "success", message: "Mask set successfully", layer: { name: layer.name, index: layer.index }, mask: { name: mask.name, index: mask.propertyIndex, mode: maskMode, changedProperties: changed } }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// --- Shape-layer bezier path authoring ---------------------------------------
+//
+// Property chain for a freeform path (all matchNames verified live, AE 26.0x67):
+//   ShapeLayer
+//     -> "ADBE Root Vectors Group"   (Contents)
+//       -> "ADBE Vector Group"        (a group; add one per shape)
+//         -> "ADBE Vectors Group"     (that group's Contents)
+//           -> "ADBE Vector Shape - Group"  (Path 1 - the freeform path group)
+//             -> "ADBE Vector Shape"        (the writable Shape-valued Path property)
+//
+// A parametric shape ("ADBE Vector Shape - Rect"/"- Ellipse"/"- Star", what
+// createShapeLayer builds) has NO "ADBE Vector Shape" child - its children are
+// Shape Direction/Size/Position/Roundness (probe P7). There is no scripted
+// conversion from parametric to freeform, so a bezier path always needs its own
+// "ADBE Vector Shape - Group".
+
+// Turn an AE Shape into a plain JSON-serializable object.
+function _shapeToObj(sh) {
+    if (!sh) return null;
+    return {
+        vertices: sh.vertices,
+        inTangents: sh.inTangents,
+        outTangents: sh.outTangents,
+        closed: sh.closed,
+        numVertices: sh.vertices ? sh.vertices.length : 0
+    };
+}
+
+// Build an AE Shape from the normalized path data the server sends. The server
+// (src/lib/shape-path.ts) has already guaranteed the three arrays agree in
+// length - AE itself will not complain if they don't, it just zero-fills the
+// missing tangents silently (probe P4).
+function _objToShape(p) {
+    var sh = new Shape();
+    sh.vertices = p.vertices;
+    if (p.inTangents) { sh.inTangents = p.inTangents; }
+    if (p.outTangents) { sh.outTangents = p.outTangents; }
+    sh.closed = (p.closed === false) ? false : true;
+    return sh;
+}
+
+// Find the "ADBE Vector Shape" property inside a path group, or null if this
+// isn't a freeform path group at all (e.g. the caller's pathIndex points at a
+// Fill, a Stroke, or a parametric shape).
+function _vectorShapeProp(pathGroup) {
+    if (!pathGroup) return null;
+    var sh = null;
+    try { sh = pathGroup.property("ADBE Vector Shape"); } catch (e) { sh = null; }
+    if (!sh) { try { sh = pathGroup.property("Path"); } catch (e2) { sh = null; } }
+    return sh;
+}
+
+function setShapePath(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found. Provide compName or compIndex, or open a comp." });
+
+        var notes = [];
+        var layer = _resolveLayer(comp, args);
+        var createdLayer = false;
+        if (!layer) {
+            if (args.createLayer) {
+                layer = comp.layers.addShape();
+                if (args.layerName) { layer.name = args.layerName; }
+                createdLayer = true;
+            } else {
+                return JSON.stringify({ status: "error", message: "Layer not found. Provide layerIndex or layerName, or pass createLayer: true to add a new shape layer." });
+            }
+        }
+        if (!(layer instanceof ShapeLayer)) {
+            return JSON.stringify({ status: "error", message: "Layer '" + layer.name + "' is not a shape layer. Bezier paths on other layer types are masks - use set-layer-mask instead." });
+        }
+
+        var contents = _safeProp(layer, "ADBE Root Vectors Group", "Contents");
+        if (!contents) { throw new Error("Could not access the shape layer's Contents group."); }
+
+        // ---- Resolve (or create) the vector group -------------------------
+        var group, groupIndex, createdGroup = false;
+        if (args.groupIndex !== undefined && args.groupIndex !== null) {
+            if (args.groupIndex < 1 || args.groupIndex > contents.numProperties) {
+                throw new Error("groupIndex out of bounds: " + args.groupIndex + " (layer has " + contents.numProperties + " group(s)).");
+            }
+            groupIndex = args.groupIndex;
+            group = contents.property(groupIndex);
+        } else {
+            group = contents.addProperty("ADBE Vector Group");
+            groupIndex = group.propertyIndex;
+            createdGroup = true;
+        }
+        var gc = _safeProp(group, "ADBE Vectors Group", "Contents");
+        if (!gc) { throw new Error("Could not access the contents of group " + groupIndex + "."); }
+
+        // ---- Resolve (or create) the path group ---------------------------
+        var pathIndex, createdPath = false;
+        if (args.pathIndex !== undefined && args.pathIndex !== null) {
+            if (args.pathIndex < 1 || args.pathIndex > gc.numProperties) {
+                throw new Error("pathIndex out of bounds: " + args.pathIndex + " (group " + groupIndex + " has " + gc.numProperties + " item(s)).");
+            }
+            pathIndex = args.pathIndex;
+            if (!_vectorShapeProp(gc.property(pathIndex))) {
+                throw new Error("Item " + pathIndex + " in group " + groupIndex + " ('" + gc.property(pathIndex).name + "') is not a freeform path. Parametric shapes (Rect/Ellipse/Star), Fills and Strokes have no editable Path property; omit pathIndex to append a new path.");
+            }
+        } else {
+            pathIndex = gc.addProperty("ADBE Vector Shape - Group").propertyIndex;
+            createdPath = true;
+        }
+
+        // ---- Fill / stroke ------------------------------------------------
+        // Deliberately done BEFORE the Path property is resolved: adding any
+        // sibling to a group INVALIDATES property references obtained from it
+        // earlier ("ReferenceError: Object is invalid" - probe P5). Every
+        // addProperty on `gc` therefore happens first, and the Path is looked up
+        // fresh afterwards.
+        var hasFill = false, hasStroke = false;
+        for (var ci = 1; ci <= gc.numProperties; ci++) {
+            var mn = gc.property(ci).matchName;
+            if (mn === "ADBE Vector Graphic - Fill") hasFill = true;
+            if (mn === "ADBE Vector Graphic - Stroke") hasStroke = true;
+        }
+        if (args.fillColor !== undefined && args.fillColor !== null) {
+            var fillProp = hasFill ? null : gc.addProperty("ADBE Vector Graphic - Fill");
+            if (!fillProp) { for (var fi = 1; fi <= gc.numProperties; fi++) { if (gc.property(fi).matchName === "ADBE Vector Graphic - Fill") { fillProp = gc.property(fi); break; } } }
+            var fc = _safeProp(fillProp, "ADBE Vector Fill Color", "Color"); if (fc) fc.setValue(args.fillColor);
+            var fo = _safeProp(fillProp, "ADBE Vector Fill Opacity", "Opacity"); if (fo) fo.setValue(100);
+            hasFill = true;
+        }
+        if (args.strokeColor !== undefined && args.strokeColor !== null) {
+            var strokeProp = hasStroke ? null : gc.addProperty("ADBE Vector Graphic - Stroke");
+            if (!strokeProp) { for (var si = 1; si <= gc.numProperties; si++) { if (gc.property(si).matchName === "ADBE Vector Graphic - Stroke") { strokeProp = gc.property(si); break; } } }
+            var sc = _safeProp(strokeProp, "ADBE Vector Stroke Color", "Color"); if (sc) sc.setValue(args.strokeColor);
+            var sw = _safeProp(strokeProp, "ADBE Vector Stroke Width", "Stroke Width"); if (sw) sw.setValue(args.strokeWidth === undefined || args.strokeWidth === null ? 2 : args.strokeWidth);
+            var so = _safeProp(strokeProp, "ADBE Vector Stroke Opacity", "Opacity"); if (so) so.setValue(100);
+            hasStroke = true;
+        } else if (args.strokeWidth !== undefined && args.strokeWidth !== null && hasStroke) {
+            for (var swi = 1; swi <= gc.numProperties; swi++) {
+                if (gc.property(swi).matchName === "ADBE Vector Graphic - Stroke") {
+                    var swp = _safeProp(gc.property(swi), "ADBE Vector Stroke Width", "Stroke Width"); if (swp) swp.setValue(args.strokeWidth);
+                    break;
+                }
+            }
+        }
+
+        // A path group with neither a Fill nor a Stroke renders literally
+        // nothing (probe P10: the frame comes back empty). Rather than hand back
+        // a "success" the caller can't see, add a default white fill and say so.
+        var addedDefaultFill = false;
+        if (!hasFill && !hasStroke) {
+            var defFill = gc.addProperty("ADBE Vector Graphic - Fill");
+            var dfc = _safeProp(defFill, "ADBE Vector Fill Color", "Color"); if (dfc) dfc.setValue([1, 1, 1]);
+            var dfo = _safeProp(defFill, "ADBE Vector Fill Opacity", "Opacity"); if (dfo) dfo.setValue(100);
+            addedDefaultFill = true;
+            notes.push("Added a default white Fill: a path with no Fill and no Stroke renders nothing. Pass fillColor or strokeColor to control this.");
+        }
+
+        // ---- Now resolve the Path property, after every addProperty --------
+        var pathProp = _vectorShapeProp(gc.property(pathIndex));
+        if (!pathProp) { throw new Error("Could not access the Path property of item " + pathIndex + " in group " + groupIndex + "."); }
+
+        // ---- Write the path ------------------------------------------------
+        var keyframeResults = null;
+        if (args.keyframes && args.keyframes.length) {
+            keyframeResults = [];
+            for (var k = 0; k < args.keyframes.length; k++) {
+                var kf = args.keyframes[k];
+                try {
+                    pathProp.setValueAtTime(kf.time, _objToShape(kf));
+                    keyframeResults.push({ time: kf.time, numVertices: kf.vertices.length, status: "success" });
+                } catch (eKf) {
+                    keyframeResults.push({ time: kf.time, status: "error", message: eKf.toString() });
+                }
+            }
+        } else {
+            if (args.time !== undefined && args.time !== null) {
+                pathProp.setValueAtTime(args.time, _objToShape(args));
+            } else {
+                pathProp.setValue(_objToShape(args));
+            }
+        }
+
+        var current = null;
+        try { current = _shapeToObj(pathProp.value); } catch (eRead) { current = null; }
+
+        return JSON.stringify({
+            status: "success",
+            message: "Shape path set successfully",
+            layer: { name: layer.name, index: layer.index, created: createdLayer },
+            groupIndex: groupIndex,
+            pathIndex: pathIndex,
+            createdGroup: createdGroup,
+            createdPath: createdPath,
+            addedDefaultFill: addedDefaultFill,
+            numKeys: pathProp.numKeys,
+            isTimeVarying: pathProp.isTimeVarying,
+            keyframeResults: keyframeResults,
+            path: current,
+            notes: notes
+        }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+function getShapePath(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found. Provide compName or compIndex, or open a comp." });
+        var layer = _resolveLayer(comp, args);
+        if (!layer) return JSON.stringify({ status: "error", message: "Layer not found. Provide layerIndex or layerName." });
+        if (!(layer instanceof ShapeLayer)) {
+            return JSON.stringify({ status: "error", message: "Layer '" + layer.name + "' is not a shape layer." });
+        }
+        var contents = _safeProp(layer, "ADBE Root Vectors Group", "Contents");
+        if (!contents) { throw new Error("Could not access the shape layer's Contents group."); }
+
+        function readPath(shapeProp) {
+            var info = {
+                isTimeVarying: shapeProp.isTimeVarying,
+                numKeys: shapeProp.numKeys
+            };
+            if (shapeProp.numKeys > 0) {
+                info.keys = [];
+                for (var k = 1; k <= shapeProp.numKeys; k++) {
+                    var entry = _shapeToObj(shapeProp.keyValue(k));
+                    entry.time = shapeProp.keyTime(k);
+                    info.keys.push(entry);
+                }
+            }
+            info.value = _shapeToObj(shapeProp.value);
+            return info;
+        }
+
+        var wantGroup = (args.groupIndex !== undefined && args.groupIndex !== null) ? args.groupIndex : null;
+        var wantPath = (args.pathIndex !== undefined && args.pathIndex !== null) ? args.pathIndex : null;
+
+        var groups = [];
+        for (var gi = 1; gi <= contents.numProperties; gi++) {
+            if (wantGroup !== null && gi !== wantGroup) continue;
+            var g = contents.property(gi);
+            var entryG = { index: gi, name: g.name, matchName: g.matchName, paths: [], items: [] };
+            var gc = _safeProp(g, "ADBE Vectors Group", "Contents");
+            if (gc) {
+                for (var pi = 1; pi <= gc.numProperties; pi++) {
+                    var item = gc.property(pi);
+                    entryG.items.push({ index: pi, name: item.name, matchName: item.matchName });
+                    if (wantPath !== null && pi !== wantPath) continue;
+                    var sp = _vectorShapeProp(item);
+                    if (sp) {
+                        var p = readPath(sp);
+                        p.index = pi;
+                        p.name = item.name;
+                        entryG.paths.push(p);
+                    }
+                }
+            }
+            groups.push(entryG);
+        }
+
+        if (wantGroup !== null && groups.length === 0) {
+            return JSON.stringify({ status: "error", message: "groupIndex out of bounds: " + wantGroup + " (layer has " + contents.numProperties + " group(s))." }, null, 2);
+        }
+
+        return JSON.stringify({
+            status: "success",
+            layer: { name: layer.name, index: layer.index },
+            numGroups: contents.numProperties,
+            groups: groups
+        }, null, 2);
     } catch (error) {
         return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
     }
@@ -2969,6 +5046,195 @@ function setCompositionProperties(args) {
         if (args.frameRate !== undefined && args.frameRate !== null) { comp.frameRate = args.frameRate; changed.push("frameRate"); }
         if (args.width !== undefined && args.width !== null && args.height !== undefined && args.height !== null) { comp.width = args.width; comp.height = args.height; changed.push("dimensions"); }
         return JSON.stringify({ status: "success", composition: { name: comp.name, duration: comp.duration, frameRate: comp.frameRate, width: comp.width, height: comp.height }, changedProperties: changed }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// --- Layer/composition management (block #6) ---------------------------------
+
+function duplicateComposition(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        var newComp = comp.duplicate();
+        if (args.newName) { newComp.name = args.newName; }
+        return JSON.stringify({
+            status: "success",
+            message: "Composition duplicated successfully",
+            original: { name: comp.name, id: comp.id },
+            duplicate: { id: newComp.id, name: newComp.name, width: newComp.width, height: newComp.height, frameRate: newComp.frameRate, duration: newComp.duration }
+        }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+function deleteComposition(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        var deletedName = comp.name, deletedId = comp.id;
+        comp.remove();
+        return JSON.stringify({ status: "success", message: "Composition deleted successfully", deleted: { name: deletedName, id: deletedId } }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+function addLightLayer(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        var name = args.name || "Light";
+        var lightTypeMap = { "PARALLEL": LightType.PARALLEL, "SPOT": LightType.SPOT, "POINT": LightType.POINT, "AMBIENT": LightType.AMBIENT };
+        var lightType = lightTypeMap[args.type] || LightType.POINT;
+        var layer = comp.layers.addLight(name, [comp.width / 2, comp.height / 2]);
+        layer.lightType = lightType;
+        var lightOptions = layer.property("ADBE Light Options Group");
+        if (args.color && lightOptions) {
+            var colorProp = _safeProp(lightOptions, "ADBE Light Color", "Color");
+            if (colorProp) { colorProp.setValue(args.color); }
+        }
+        if (args.intensity !== undefined && args.intensity !== null && lightOptions) {
+            var intensityProp = _safeProp(lightOptions, "ADBE Light Intensity", "Intensity");
+            if (intensityProp) { intensityProp.setValue(args.intensity); }
+        }
+        return JSON.stringify({ status: "success", message: "Light layer added successfully", layer: { index: layer.index, name: layer.name, type: args.type || "POINT" } }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+function precomposeLayers(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        var layerIndices = args.layerIndices;
+        if (!layerIndices || !layerIndices.length) return JSON.stringify({ status: "error", message: "layerIndices (non-empty array) is required." });
+        if (!args.name) return JSON.stringify({ status: "error", message: "name is required." });
+        var moveAttributes = args.moveAttributes !== false;
+        // precompose() returns the new CompItem, NOT the replacement layer
+        // (confirmed live - reading .index/.source off the return value throws
+        // "TypeError: undefined is not an object", since CompItem has neither).
+        // The replacement layer is placed at the lowest index among the
+        // originally-selected layerIndices.
+        var newComp = comp.layers.precompose(layerIndices, args.name, moveAttributes);
+        var minIndex = Math.min.apply(null, layerIndices);
+        var precompLayer = comp.layer(minIndex);
+        return JSON.stringify({
+            status: "success",
+            message: "Layers precomposed successfully",
+            precomposedLayer: { index: precompLayer.index, name: precompLayer.name, sourceCompId: newComp.id, sourceCompName: newComp.name }
+        }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+function reorderEffects(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        var layer = _resolveLayer(comp, args);
+        if (!layer) return JSON.stringify({ status: "error", message: "Layer not found. Provide layerIndex or layerName." });
+        var effect = resolveEffectOnLayer(layer, args);
+        if (args.newIndex === undefined || args.newIndex === null) return JSON.stringify({ status: "error", message: "newIndex is required." });
+        // Capture the name before moveTo() - the `effect` reference is invalid
+        // to read from afterward (confirmed live: reading effect.name/.propertyIndex
+        // post-move throws "ReferenceError: Object is invalid").
+        var effectName = effect.name;
+        effect.moveTo(args.newIndex);
+        return JSON.stringify({ status: "success", message: "Effect reordered successfully", effect: { name: effectName, newIndex: args.newIndex } }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+function copyEffects(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        var sourceLayer = _resolveLayer(comp, { layerIndex: args.sourceLayerIndex, layerName: args.sourceLayerName });
+        if (!sourceLayer) return JSON.stringify({ status: "error", message: "Source layer not found. Provide sourceLayerIndex or sourceLayerName." });
+        var targetLayer = _resolveLayer(comp, { layerIndex: args.targetLayerIndex, layerName: args.targetLayerName });
+        if (!targetLayer) return JSON.stringify({ status: "error", message: "Target layer not found. Provide targetLayerIndex or targetLayerName." });
+
+        var sourceEffects = sourceLayer.property("ADBE Effect Parade");
+        var targetEffects = targetLayer.property("ADBE Effect Parade");
+        var copiedEffects = [];
+        var warnings = [];
+
+        var indices = (args.effectIndices && args.effectIndices.length) ? args.effectIndices : null;
+        var count = indices ? indices.length : (sourceEffects ? sourceEffects.numProperties : 0);
+
+        for (var i = 0; i < count; i++) {
+            var srcIndex = indices ? indices[i] : (i + 1);
+            var srcEffect = sourceEffects.property(srcIndex);
+            if (!srcEffect) { warnings.push("Source effect not found at index " + srcIndex); continue; }
+            var newEffect = targetEffects.addProperty(srcEffect.matchName);
+            if (!newEffect) { warnings.push("Could not add effect '" + srcEffect.name + "' to target layer"); continue; }
+            newEffect.name = srcEffect.name;
+            for (var p = 1; p <= srcEffect.numProperties; p++) {
+                try {
+                    var srcProp = srcEffect.property(p);
+                    if (srcProp.numKeys > 0 || srcProp.expressionEnabled) {
+                        warnings.push("Effect '" + srcEffect.name + "' property '" + srcProp.name + "' is keyframed/expression-driven - only its current static value was copied.");
+                    }
+                    var tgtProp = newEffect.property(srcProp.name);
+                    if (tgtProp && srcProp.canSetValue) { tgtProp.setValue(srcProp.value); }
+                } catch (eProp) {
+                    warnings.push("Effect '" + srcEffect.name + "' property at index " + p + " could not be copied: " + eProp.toString());
+                }
+            }
+            copiedEffects.push(newEffect.name);
+        }
+
+        return JSON.stringify({ status: "success", message: "Effects copied successfully", copiedEffects: copiedEffects, count: copiedEffects.length, warnings: warnings }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+function deleteMarker(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        var markerIndex = args.markerIndex;
+        if (markerIndex === undefined || markerIndex === null) return JSON.stringify({ status: "error", message: "markerIndex is required." });
+
+        var isLayerMarker = args.layerIndex !== undefined && args.layerIndex !== null || (args.layerName !== undefined && args.layerName !== null);
+        var markerProp, source, layer;
+        if (isLayerMarker) {
+            layer = _resolveLayer(comp, args);
+            if (!layer) return JSON.stringify({ status: "error", message: "Layer not found. Provide layerIndex or layerName." });
+            markerProp = layer.property("ADBE Marker");
+            source = "layer";
+        } else {
+            markerProp = comp.markerProperty;
+            source = "composition";
+        }
+
+        if (markerIndex < 1 || markerIndex > markerProp.numKeys) return JSON.stringify({ status: "error", message: "Marker index out of range." });
+        markerProp.removeKey(markerIndex);
+
+        var result = { status: "success", message: "Marker deleted successfully", source: source, deletedIndex: markerIndex };
+        if (layer) { result.layer = { name: layer.name, index: layer.index }; }
+        return JSON.stringify(result, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+function setWorkArea(args) {
+    try {
+        var comp = _resolveComp(args);
+        if (!comp) return JSON.stringify({ status: "error", message: "No composition found." });
+        if (args.start === undefined || args.start === null) return JSON.stringify({ status: "error", message: "start is required." });
+        if (args.duration === undefined || args.duration === null) return JSON.stringify({ status: "error", message: "duration is required." });
+        comp.workAreaStart = args.start;
+        comp.workAreaDuration = args.duration;
+        return JSON.stringify({ status: "success", message: "Work area set successfully", workAreaStart: comp.workAreaStart, workAreaDuration: comp.workAreaDuration }, null, 2);
     } catch (error) {
         return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
     }
@@ -3101,6 +5367,24 @@ function _importWithRetry(file) {
     throw lastErr;
 }
 
+// Wait for a just-written file to actually land on disk. saveFrameToPng() can
+// return before the file is readable (same Windows write-lock/flush lag as
+// _importWithRetry above, confirmed via diagnostic: file.exists was false
+// immediately after saveFrameToPng() returned, then true after a single 50ms
+// poll). Used by seeFrame(), which - unlike contact-sheet/match-reference -
+// hands the raw path back to Node instead of importing it itself, so it has
+// no retry loop to absorb the lag otherwise.
+function _waitForFileReady(file, timeoutMs) {
+    var waited = 0;
+    var step = 50;
+    var limit = (typeof timeoutMs === "number" && timeoutMs > 0) ? timeoutMs : 3000;
+    while (!file.exists && waited < limit) {
+        $.sleep(step);
+        waited += step;
+    }
+    return file.exists;
+}
+
 // see-frame: render one or more frames of a comp to PNG and return their paths so
 // the Node side can hand the actual pixels back to the model. Renders a downscaled
 // nested comp when maxWidth < comp.width, so AE performs the downscale before any
@@ -3117,6 +5401,10 @@ function seeFrame(args) {
 
         var dur = comp.duration;
         // Build the list of capture times (clamp into [0, duration]).
+        // frameNumbers are converted to seconds via the comp's OWN frameRate
+        // right here, before any clamping - this is the whole point of the
+        // param: the caller doesn't have to do frame/frameRate math (and
+        // risk an off-by-one on non-round rates like 23.976/29.97) themselves.
         var times = [];
         if (args && args.times && args.times.length) {
             for (var t = 0; t < args.times.length; t++) {
@@ -3125,6 +5413,17 @@ function seeFrame(args) {
                     if (tv < 0) tv = 0;
                     if (tv > dur) tv = dur;
                     times.push(tv);
+                }
+            }
+        }
+        if (args && args.frameNumbers && args.frameNumbers.length) {
+            for (var f = 0; f < args.frameNumbers.length; f++) {
+                var fn = args.frameNumbers[f];
+                if (typeof fn === "number" && !isNaN(fn)) {
+                    var ft = fn / comp.frameRate;
+                    if (ft < 0) ft = 0;
+                    if (ft > dur) ft = dur;
+                    times.push(ft);
                 }
             }
         }
@@ -3155,7 +5454,11 @@ function seeFrame(args) {
             _seeFrameSeq++;
             var path = folder + "/__mcp_seeframe_" + _seeFrameSeq + "_" + i + ".png";
             try {
-                target.saveFrameToPng(times[i], new File(path));
+                var pngFile = new File(path);
+                target.saveFrameToPng(times[i], pngFile);
+                if (!_waitForFileReady(pngFile, 3000)) {
+                    throw new Error("Timed out waiting for rendered PNG to appear on disk.");
+                }
                 frames.push({ time: times[i], path: path, w: target.width, h: target.height });
             } catch (fe) {
                 note = (note ? note + " " : "") + "Frame at t=" + times[i] + "s failed: " + fe.toString();
@@ -3584,7 +5887,8 @@ function startRender(args) {
 
 function executeCommand(command, args) {
     var result = "";
-    
+    var __cmdStartMs = (new Date()).getTime();
+
     logToPanel("Executing command: " + command);
     statusText.text = "Running: " + command;
     // panel.update() exists only on a floating Window, NOT on a dockable Panel
@@ -3605,7 +5909,11 @@ function executeCommand(command, args) {
         "manageRenderQueue": true,
         "seeFrame": true,
         "contactSheet": true,
-        "matchReference": true
+        "matchReference": true,
+        "createProject": true,
+        "openProject": true,
+        "saveProject": true,
+        "closeProject": true
     };
     var useUndoGroup = !READ_ONLY_COMMANDS[command] && !NO_UNDO_GROUP_COMMANDS[command];
     // Suppress any AE modal for the whole execution so a dialog can never block the
@@ -3614,7 +5922,9 @@ function executeCommand(command, args) {
     var dialogsSuppressed = false;
     try { app.beginSuppressDialogs(); dialogsSuppressed = true; } catch (sdErr) {}
     try {
-        logToPanel("Attempting to execute: " + command); // Log before switch
+        // Near-duplicate of the "Executing command" line above; only worth
+        // keeping when the user has asked for step-by-step detail.
+        logToPanel("Attempting to execute: " + command, true); // Log before switch
         if (useUndoGroup) { app.beginUndoGroup("MCP: " + command); }
         try {
         switch (command) {
@@ -3626,6 +5936,61 @@ function executeCommand(command, args) {
                 break;
             case "getLayerInfo":
                 result = getLayerInfo();
+                break;
+            case "createProject":
+                logToPanel("Calling createProject function...");
+                result = createProject(args);
+                logToPanel("Returned from createProject.");
+                break;
+            case "openProject":
+                logToPanel("Calling openProject function...");
+                result = openProject(args);
+                logToPanel("Returned from openProject.");
+                break;
+            case "saveProject":
+                logToPanel("Calling saveProject function...");
+                result = saveProject(args);
+                logToPanel("Returned from saveProject.");
+                break;
+            case "closeProject":
+                logToPanel("Calling closeProject function...");
+                result = closeProject(args);
+                logToPanel("Returned from closeProject.");
+                break;
+            case "importFootage":
+                logToPanel("Calling importFootage function...");
+                result = importFootage(args);
+                logToPanel("Returned from importFootage.");
+                break;
+            case "importFolder":
+                logToPanel("Calling importFolder function...");
+                result = importFolder(args);
+                logToPanel("Returned from importFolder.");
+                break;
+            case "replaceFootage":
+                logToPanel("Calling replaceFootage function...");
+                result = replaceFootage(args);
+                logToPanel("Returned from replaceFootage.");
+                break;
+            case "findMissingFootage":
+                logToPanel("Calling findMissingFootage function...");
+                result = findMissingFootage(args);
+                logToPanel("Returned from findMissingFootage.");
+                break;
+            case "collectFiles":
+                logToPanel("Calling collectFiles function...");
+                result = collectFiles(args);
+                logToPanel("Returned from collectFiles.");
+                break;
+            case "reduceProject":
+                logToPanel("Calling reduceProject function...");
+                result = reduceProject(args);
+                logToPanel("Returned from reduceProject.");
+                break;
+            case "organizeProjectItems":
+                logToPanel("Calling organizeProjectItems function...");
+                result = organizeProjectItems(args);
+                logToPanel("Returned from organizeProjectItems.");
                 break;
             case "createComposition":
                 logToPanel("Calling createComposition function...");
@@ -3666,6 +6031,96 @@ function executeCommand(command, args) {
                 logToPanel("Calling setLayerExpression function...");
                 result = setLayerExpression(args.compIndex, args.layerIndex, args.propertyName, args.expressionString);
                 logToPanel("Returned from setLayerExpression.");
+                break;
+            case "getExpression":
+                logToPanel("Calling getExpression function...");
+                result = getExpression(args);
+                logToPanel("Returned from getExpression.");
+                break;
+            case "enableExpression":
+                logToPanel("Calling enableExpression function...");
+                result = enableExpression(args);
+                logToPanel("Returned from enableExpression.");
+                break;
+            case "addExpressionControl":
+                logToPanel("Calling addExpressionControl function...");
+                result = addExpressionControl(args);
+                logToPanel("Returned from addExpressionControl.");
+                break;
+            case "linkProperties":
+                logToPanel("Calling linkProperties function...");
+                result = linkProperties(args);
+                logToPanel("Returned from linkProperties.");
+                break;
+            case "applyExpressionTemplate":
+                logToPanel("Calling applyExpressionTemplate function...");
+                result = applyExpressionTemplate(args);
+                logToPanel("Returned from applyExpressionTemplate.");
+                break;
+            case "batchSetExpression":
+                logToPanel("Calling batchSetExpression function...");
+                result = batchSetExpression(args);
+                logToPanel("Returned from batchSetExpression.");
+                break;
+            case "setTimeRemap":
+                logToPanel("Calling setTimeRemap function...");
+                result = setTimeRemap(args);
+                logToPanel("Returned from setTimeRemap.");
+                break;
+            case "getKeyframes":
+                logToPanel("Calling getKeyframes function...");
+                result = getKeyframes(args);
+                logToPanel("Returned from getKeyframes.");
+                break;
+            case "offsetKeyframes":
+                logToPanel("Calling offsetKeyframes function...");
+                result = offsetKeyframes(args);
+                logToPanel("Returned from offsetKeyframes.");
+                break;
+            case "scaleKeyframeTiming":
+                logToPanel("Calling scaleKeyframeTiming function...");
+                result = scaleKeyframeTiming(args);
+                logToPanel("Returned from scaleKeyframeTiming.");
+                break;
+            case "reverseKeyframes":
+                logToPanel("Calling reverseKeyframes function...");
+                result = reverseKeyframes(args);
+                logToPanel("Returned from reverseKeyframes.");
+                break;
+            case "copyKeyframes":
+                logToPanel("Calling copyKeyframes function...");
+                result = copyKeyframes(args);
+                logToPanel("Returned from copyKeyframes.");
+                break;
+            case "applyEasyEase":
+                logToPanel("Calling applyEasyEase function...");
+                result = applyEasyEase(args);
+                logToPanel("Returned from applyEasyEase.");
+                break;
+            case "createLowerThird":
+                logToPanel("Calling createLowerThird function...");
+                result = createLowerThird(args);
+                logToPanel("Returned from createLowerThird.");
+                break;
+            case "createTitleCard":
+                logToPanel("Calling createTitleCard function...");
+                result = createTitleCard(args);
+                logToPanel("Returned from createTitleCard.");
+                break;
+            case "createTransition":
+                logToPanel("Calling createTransition function...");
+                result = createTransition(args);
+                logToPanel("Returned from createTransition.");
+                break;
+            case "createLogoReveal":
+                logToPanel("Calling createLogoReveal function...");
+                result = createLogoReveal(args);
+                logToPanel("Returned from createLogoReveal.");
+                break;
+            case "createTextAnimator":
+                logToPanel("Calling createTextAnimator function...");
+                result = createTextAnimator(args);
+                logToPanel("Returned from createTextAnimator.");
                 break;
             case "applyEffect":
                 logToPanel("Calling applyEffect function...");
@@ -3808,6 +6263,16 @@ function executeCommand(command, args) {
                 result = setLayerMask(args);
                 logToPanel("Returned from setLayerMask.");
                 break;
+            case "setShapePath":
+                logToPanel("Calling setShapePath function...");
+                result = setShapePath(args);
+                logToPanel("Returned from setShapePath.");
+                break;
+            case "getShapePath":
+                logToPanel("Calling getShapePath function...");
+                result = getShapePath(args);
+                logToPanel("Returned from getShapePath.");
+                break;
             case "batchSetLayerProperties":
                 logToPanel("Calling batchSetLayerProperties function...");
                 result = batchSetLayerProperties(args);
@@ -3817,6 +6282,46 @@ function executeCommand(command, args) {
                 logToPanel("Calling setCompositionProperties function...");
                 result = setCompositionProperties(args);
                 logToPanel("Returned from setCompositionProperties.");
+                break;
+            case "duplicateComposition":
+                logToPanel("Calling duplicateComposition function...");
+                result = duplicateComposition(args);
+                logToPanel("Returned from duplicateComposition.");
+                break;
+            case "deleteComposition":
+                logToPanel("Calling deleteComposition function...");
+                result = deleteComposition(args);
+                logToPanel("Returned from deleteComposition.");
+                break;
+            case "addLightLayer":
+                logToPanel("Calling addLightLayer function...");
+                result = addLightLayer(args);
+                logToPanel("Returned from addLightLayer.");
+                break;
+            case "precomposeLayers":
+                logToPanel("Calling precomposeLayers function...");
+                result = precomposeLayers(args);
+                logToPanel("Returned from precomposeLayers.");
+                break;
+            case "reorderEffects":
+                logToPanel("Calling reorderEffects function...");
+                result = reorderEffects(args);
+                logToPanel("Returned from reorderEffects.");
+                break;
+            case "copyEffects":
+                logToPanel("Calling copyEffects function...");
+                result = copyEffects(args);
+                logToPanel("Returned from copyEffects.");
+                break;
+            case "deleteMarker":
+                logToPanel("Calling deleteMarker function...");
+                result = deleteMarker(args);
+                logToPanel("Returned from deleteMarker.");
+                break;
+            case "setWorkArea":
+                logToPanel("Calling setWorkArea function...");
+                result = setWorkArea(args);
+                logToPanel("Returned from setWorkArea.");
                 break;
             case "addToRenderQueue":
                 logToPanel("Calling addToRenderQueue function...");
@@ -3841,7 +6346,20 @@ function executeCommand(command, args) {
                     aeVersion: (app && app.version ? app.version : null),
                     bridgeFolder: getBridgeFolder().fsName,
                     project: (app.project && app.project.file ? app.project.file.name : "Untitled Project"),
-                    activeComp: (app.project && app.project.activeItem instanceof CompItem ? app.project.activeItem.name : null)
+                    activeComp: (app.project && app.project.activeItem instanceof CompItem ? app.project.activeItem.name : null),
+                    // Socket state, reported by the panel itself. check-bridge cannot
+                    // derive any of this from outside: an absent rendezvous file looks
+                    // IDENTICAL whether the network permission is off, the Socket
+                    // checkbox is unchecked, every port in the scan range was taken, or
+                    // the panel simply predates 1.12. Publishing it here is what turns
+                    // one indistinguishable symptom into distinct, actionable causes.
+                    // The permission is re-read live rather than reusing socketPermission
+                    // because that variable is only refreshed when a bind is attempted.
+                    socketListening: !!socketListener,
+                    socketPort: socketPort,
+                    socketStatus: socketStatus,
+                    networkPermission: isNetworkPermissionEnabled(),
+                    fileTransportEnabled: fileTransportEnabled
                 });
                 break;
             default:
@@ -3853,16 +6371,17 @@ function executeCommand(command, args) {
         // Pair with beginSuppressDialogs above. Pass false so AE does NOT replay any
         // suppressed alert (replaying would re-pop the very modal we are avoiding).
         if (dialogsSuppressed) { try { app.endSuppressDialogs(false); dialogsSuppressed = false; } catch (esd) {} }
-        logToPanel("Execution finished for: " + command); // Log after switch
-        logToPanel("Preparing to write result file...");
+        logToPanel("Execution finished for: " + command, true); // Log after switch
+        logToPanel("Preparing to write result file...", true);
         var resultString = (typeof result === 'string') ? result : JSON.stringify(result);
         try {
             var resultObj = JSON.parse(resultString);
             resultObj._responseTimestamp = new Date().toISOString();
             resultObj._commandExecuted = command;
             resultObj._commandId = currentCommandId;
+            resultObj._transport = currentTransport;
             resultString = JSON.stringify(resultObj, null, 2);
-            logToPanel("Added timestamp to result JSON for tracking freshness.");
+            logToPanel("Added timestamp to result JSON for tracking freshness.", true);
         } catch (parseError) {
             // Handler returned a non-JSON string. Wrap it in a JSON envelope that
             // still carries the tracking fields, otherwise the server can neither
@@ -3873,33 +6392,16 @@ function executeCommand(command, args) {
                 result: ("" + resultString),
                 _responseTimestamp: new Date().toISOString(),
                 _commandExecuted: command,
-                _commandId: currentCommandId
+                _commandId: currentCommandId,
+                _transport: currentTransport
             }, null, 2);
         }
-        
-        var resultFile = new File(getResultFilePath());
-        resultFile.encoding = "UTF-8"; 
-        logToPanel("Opening result file for writing...");
-        var opened = resultFile.open("w");
-        if (!opened) {
-            logToPanel("ERROR: Failed to open result file for writing: " + resultFile.fsName);
-            throw new Error("Failed to open result file for writing.");
-        }
-        logToPanel("Writing to result file...");
-        var written = resultFile.write(resultString);
-        if (!written) {
-             logToPanel("ERROR: Failed to write to result file (write returned false): " + resultFile.fsName);
-             
-        }
-        logToPanel("Closing result file...");
-        var closed = resultFile.close();
-         if (!closed) {
-             logToPanel("ERROR: Failed to close result file: " + resultFile.fsName);
-             
-        }
-        logToPanel("Result file write process complete.");
-        
-        logToPanel("Command completed successfully: " + command);
+
+        emitResult(resultString);
+
+        lastCommandName = command;
+        lastCommandMs = (new Date()).getTime() - __cmdStartMs;
+        logToPanel("Command completed successfully: " + command + " (" + lastCommandMs + " ms)");
         statusText.text = "Command completed: " + command;
         // The freshly written result file (carrying _commandId) is the signal the
         // server waits on; we deliberately do NOT write a status back into the
@@ -3910,13 +6412,15 @@ function executeCommand(command, args) {
         // would otherwise leave dialogs suppressed for later commands). Idempotent via
         // the dialogsSuppressed flag, so it is a safe no-op if already cleared.
         if (dialogsSuppressed) { try { app.endSuppressDialogs(false); dialogsSuppressed = false; } catch (esd2) {} }
+        lastCommandName = command;
+        lastCommandMs = (new Date()).getTime() - __cmdStartMs;
         var errorMsg = "ERROR in executeCommand for '" + command + "': " + error.toString() + (error.line ? " (line: " + error.line + ")" : "");
         logToPanel(errorMsg);
         statusText.text = "Error: " + error.toString();
-        
-        
+
+
         try {
-            logToPanel("Attempting to write ERROR to result file...");
+            logToPanel("Attempting to write ERROR to result file...", true);
             var errorResult = JSON.stringify({
                 status: "error",
                 command: command,
@@ -3929,17 +6433,11 @@ function executeCommand(command, args) {
                 // the real AE error). See index.ts waitForBridgeResult matching.
                 _commandExecuted: command,
                 _commandId: currentCommandId,
-                _responseTimestamp: new Date().toISOString()
+                _responseTimestamp: new Date().toISOString(),
+                _transport: currentTransport
             });
-            var errorFile = new File(getResultFilePath());
-            errorFile.encoding = "UTF-8";
-            if (errorFile.open("w")) {
-                errorFile.write(errorResult);
-                errorFile.close();
-                logToPanel("Successfully wrote ERROR to result file.");
-            } else {
-                 logToPanel("CRITICAL ERROR: Failed to open result file to write error!");
-            }
+            emitResult(errorResult);
+            logToPanel("Successfully emitted ERROR result.");
         } catch (writeError) {
              logToPanel("CRITICAL ERROR: Failed to write error to result file: " + writeError.toString());
         }
@@ -3949,13 +6447,103 @@ function executeCommand(command, args) {
 }
 
 
-function logToPanel(message) {
+/*
+ * Append one line to the ring buffer. Never touches the widget directly (see
+ * flushLogIfDue) so the per-call cost stays O(1) regardless of how long the
+ * panel has been open.
+ *
+ * `isChatter`, when true, marks a line as step-by-step detail rather than a
+ * state change or error: it is dropped entirely unless the Verbose log
+ * checkbox is on. This is an OPTIONAL second parameter so every pre-existing
+ * 1-argument logToPanel(msg) call site (across the rest of this file) keeps
+ * working with zero edits and stays visible by default. Only the handful of
+ * per-command file-write step lines this same change already touches are
+ * tagged; the switch statement's own per-handler logging is untouched.
+ */
+function logToPanel(message, isChatter) {
+    if (isChatter) {
+        var verboseOn = false;
+        try { verboseOn = !!(verboseCheckbox && verboseCheckbox.value); } catch (e) {}
+        if (!verboseOn) { return; }
+    }
     var timestamp = new Date().toLocaleTimeString();
-    logText.text = timestamp + ": " + message + "\n" + logText.text;
+    logLines.unshift(timestamp + ": " + message);
+    if (logLines.length > LOG_MAX_LINES) { logLines.length = LOG_MAX_LINES; }
+    logDirty = true;
+}
+
+/** Apply the ring buffer to the widget, ignoring the throttle window. */
+function forceFlushLog() {
+    try { logText.text = logLines.join("\n"); } catch (e) { return; }
+    logDirty = false;
+    lastLogFlushAt = (new Date()).getTime();
+}
+
+/** Apply the ring buffer to the widget, but only if LOG_FLUSH_MS has elapsed. */
+function flushLogIfDue() {
+    if (!logDirty) return;
+    var now = (new Date()).getTime();
+    if ((now - lastLogFlushAt) < LOG_FLUSH_MS) return;
+    forceFlushLog();
+}
+
+/*
+ * The single place a command result leaves the panel.
+ *
+ * When a socket is serving the current command the result goes back down that
+ * connection; otherwise it lands in the result file exactly as it always has.
+ * Routing through one function is what keeps all 83 command handlers, the
+ * 84-label switch, the undo logic and beginSuppressDialogs completely untouched
+ * by the transport change.
+ */
+function emitResult(resultString) {
+    if (currentResultSink) {
+        /*
+         * NDJSON framing needs exactly ONE line per frame, and the envelope is
+         * built with JSON.stringify(obj, null, 2), so it is full of real
+         * newline bytes. Worse, ExtendScript emits them even where a compact
+         * serializer would not: an empty array comes out as "[\n\n]" no matter
+         * what indent argument is passed, which is what truncated the first
+         * findMissingFootage result at "items":[ .
+         *
+         * Stripping raw CR/LF is safe and complete. In serialized JSON a raw
+         * 0x0A byte is ALWAYS insignificant whitespace between tokens: a
+         * newline inside a string value is escaped to the two characters
+         * backslash-n by every serializer here (see the esc() shim above), so
+         * it is never a 0x0A byte. Removing them therefore cannot corrupt a
+         * payload, only the indentation nobody reads on this path.
+         */
+        currentResultSink(("" + resultString).replace(/[\r\n]+/g, ""));
+        return;
+    }
+    var resultFile = new File(getResultFilePath());
+    resultFile.encoding = "UTF-8";
+    logToPanel("Opening result file for writing...", true);
+    var opened = resultFile.open("w");
+    if (!opened) {
+        logToPanel("ERROR: Failed to open result file for writing: " + resultFile.fsName);
+        throw new Error("Failed to open result file for writing.");
+    }
+    logToPanel("Writing to result file...", true);
+    var written = resultFile.write(resultString);
+    if (!written) {
+        logToPanel("ERROR: Failed to write to result file (write returned false): " + resultFile.fsName);
+    }
+    logToPanel("Closing result file...", true);
+    var closed = resultFile.close();
+    if (!closed) {
+        logToPanel("ERROR: Failed to close result file: " + resultFile.fsName);
+    }
+    logToPanel("Result file write process complete.", true);
 }
 
 
-function checkForCommands() {
+/*
+ * The scheduled task. Owns isChecking in a try/finally: before, one throw
+ * anywhere below left the flag set and wedged the bridge permanently, since
+ * every later tick returned early on `isChecking`.
+ */
+function bridgeTick() {
     // The repeating scheduled task can outlive the panel: when the panel is closed
     // its widgets are destroyed and become invalid. Touching one then throws
     // "Object is invalid" (and the modal blanks the reopened panel). So if our UI is
@@ -3964,12 +6552,53 @@ function checkForCommands() {
     try { autoOn = autoRunCheckbox.value; }
     catch (invalidWidget) {
         try { if ($.global.mcpCheckTaskId != null) app.cancelTask($.global.mcpCheckTaskId); } catch (e) {}
+        // A leaked LISTENING socket would hold the port against the next panel run.
+        try { stopSocketListener(); } catch (e2) {}
         return;
     }
     if (!autoOn || isChecking) return;
-    
+
     isChecking = true;
-    
+    var servedWork = false;
+    try {
+        tickCount++;
+        if (socketListener) {
+            // Probe S5: one poll is not enough. poll() can hand back null while
+            // another connection is still queued, so a burst needs several.
+            for (var i = 0; i < SOCKET_POLLS_PER_TICK; i++) {
+                if (serviceSocketOnce()) { servedWork = true; }
+            }
+        }
+        // Keep the file poll on its original 250ms cadence rather than 50ms:
+        // the socket is the fast path now, and this costs exactly what it did before.
+        if (fileTransportEnabled && (tickCount % FILE_CHECK_EVERY) === 0) {
+            checkForCommands();
+        }
+    } catch (tickError) {
+        try { logToPanel("Bridge tick error: " + tickError.toString()); } catch (e3) {}
+    } finally {
+        // Reset BEFORE refreshing the panel: updateTransportPanel() reads
+        // isChecking to decide whether Copy Diagnostics should be enabled, so
+        // reading it first would leave that button permanently disabled.
+        isChecking = false;
+        /*
+         * UI work is IDLE work. Writing a ScriptUI widget is slow enough to
+         * stretch the tick, and a tick that just served a command is very
+         * likely to be followed immediately by another one, so repainting here
+         * lands squarely between two back-to-back commands and shows up as
+         * per-command latency. Deferring to the next idle tick costs at most
+         * TICK_MS of staleness on a display nobody reads that fast.
+         */
+        if (!servedWork) {
+            try { updateTransportPanelIfDue(); } catch (e4) {}
+            try { flushLogIfDue(); } catch (e5) {}
+        }
+    }
+}
+
+
+function checkForCommands() {
+    var rawCommandId = "";
     try {
         var commandFile = new File(getCommandFilePath());
         if (commandFile.exists) {
@@ -3981,6 +6610,12 @@ function checkForCommands() {
             commandFile.close();
 
             if (content) {
+                // Recover the id BEFORE parsing, so a malformed command file can
+                // still be answered with a correlated error instead of leaving the
+                // server to burn its entire timeout on a command that never parsed.
+                var idMatch = content.match(/"commandId"\s*:\s*"([^"]*)"/);
+                if (idMatch) { rawCommandId = idMatch[1]; }
+
                 var commandData = (typeof JSON !== "undefined" && JSON.parse)
                     ? JSON.parse(content)
                     : eval("(" + content + ")");
@@ -3995,15 +6630,35 @@ function checkForCommands() {
                 if (commandKey && commandKey !== lastProcessedCommandId) {
                     lastProcessedCommandId = commandKey;
                     currentCommandId = commandData.commandId || "";
+                    currentTransport = "file";
+                    fileCommandCount++;
                     executeCommand(commandData.command, commandData.args || {});
                 }
             }
         }
     } catch (e) {
         logToPanel("Error checking for commands: " + e.toString());
+        // Previously this only logged, so a command file the panel could not read
+        // produced NO result at all and the caller waited out its full timeout with
+        // nothing to show for it. Answer with a correlated error instead.
+        if (rawCommandId && rawCommandId !== lastProcessedCommandId) {
+            lastProcessedCommandId = rawCommandId;
+            try {
+                currentCommandId = rawCommandId;
+                currentTransport = "file";
+                emitResult(JSON.stringify({
+                    status: "error",
+                    error: "The bridge panel could not read this command: " + e.toString(),
+                    _commandExecuted: "",
+                    _commandId: rawCommandId,
+                    _responseTimestamp: new Date().toISOString(),
+                    _transport: "file"
+                }));
+            } catch (emitError) {
+                logToPanel("CRITICAL: could not emit the read-failure result: " + emitError.toString());
+            }
+        }
     }
-    
-    isChecking = false;
 }
 
 
@@ -4037,24 +6692,204 @@ function startCommandChecker() {
     // destroyed widgets) and duplicates accumulate. $.global survives the re-run, so
     // it is where we stash the live task id to find and kill the stale one.
     try { if ($.global.mcpCheckTaskId != null) app.cancelTask($.global.mcpCheckTaskId); } catch (e) {}
-    $.global.mcpCheckTaskId = app.scheduleTask("checkForCommands()", checkInterval, true);
+    // With a listener up we tick fast so accepts are picked up in ~25ms average;
+    // without one there is nothing to accept, so stay on the original cadence.
+    var interval = socketListener ? TICK_MS : checkInterval;
+    $.global.mcpCheckTaskId = app.scheduleTask("bridgeTick()", interval, true);
 }
 
 
-var checkButton = panel.add("button", undefined, "Check for Commands Now");
+/*
+ * Refresh every Transport status line from current state. Called after every
+ * button/checkbox action (so feedback is immediate) and once per tick from
+ * bridgeTick's finally (so background changes, like a command completing,
+ * still show up without the user touching anything).
+ */
+function updateTransportPanel() {
+    try {
+        // Assign only when the text actually differs. A redundant ScriptUI
+        // widget write still costs a repaint, and most ticks change nothing.
+        var socketLine = socketListener
+            ? "Socket:        LISTENING  127.0.0.1:" + socketPort
+            : "Socket:        OFF (" + socketStatus + ")";
+        if (transportSocketText.text !== socketLine) { transportSocketText.text = socketLine; }
+
+        var permLine = "Permission:    " + (socketPermission ? "ENABLED" : "DISABLED");
+        if (transportPermissionText.text !== permLine) { transportPermissionText.text = permLine; }
+
+        var fileLine = "File fallback: " + (fileTransportEnabled ? "ON " : "OFF ") + getBridgeFolder().fsName;
+        if (transportFileText.text !== fileLine) { transportFileText.text = fileLine; }
+
+        var statsLine = socketCommandCount + " socket / " + fileCommandCount + " file" +
+            (lastCommandName ? "  |  last " + lastCommandName + " " + lastCommandMs + " ms" : "");
+        if (transportStatsText.text !== statsLine) { transportStatsText.text = statsLine; }
+
+        var errLine = "errors " + socketErrorCount + " | rejected " + socketRejectCount;
+        if (transportErrText.text !== errLine) { transportErrText.text = errLine; }
+
+        // The diagnostics modal reads the same globals a running command is
+        // mutating, so it stays disabled until the tick settles.
+        var canCopy = !isChecking;
+        if (copyDiagButton.enabled !== canCopy) { copyDiagButton.enabled = canCopy; }
+    } catch (e) {
+        /* widgets are gone if the panel was closed since the last tick */
+    }
+}
+
+/** Refresh the Transport panel, but only if PANEL_UPDATE_MS has elapsed. */
+function updateTransportPanelIfDue() {
+    var now = (new Date()).getTime();
+    if ((now - lastPanelUpdateAt) < PANEL_UPDATE_MS) return;
+    lastPanelUpdateAt = now;
+    updateTransportPanel();
+}
+
+/** Plain text for the "Copy diagnostics" modal (ScriptUI has no clipboard API). */
+function buildDiagnosticsText() {
+    var lines = [];
+    lines.push("AE MCP Bridge diagnostics");
+    lines.push("bridgeVersion: " + BRIDGE_VERSION);
+    lines.push("aeVersion: " + app.version);
+    lines.push("bridgeFolder: " + getBridgeFolder().fsName);
+    lines.push("");
+    lines.push(socketListener
+        ? "socket: LISTENING 127.0.0.1:" + socketPort
+        : "socket: OFF (" + socketStatus + ")");
+    lines.push("permission: " + (socketPermission ? "ENABLED" : "DISABLED"));
+    lines.push("fileFallback: " + (fileTransportEnabled ? "ON" : "OFF"));
+    lines.push("commandsServed: " + socketCommandCount + " socket, " + fileCommandCount + " file");
+    lines.push("errors: " + socketErrorCount + "  rejected: " + socketRejectCount);
+    lines.push("lastCommand: " + (lastCommandName || "(none yet)") + (lastCommandName ? " (" + lastCommandMs + " ms)" : ""));
+    lines.push("autoRun: " + (autoRunCheckbox.value ? "ON" : "OFF"));
+    return lines.join("\n");
+}
+
+applyPortButton.onClick = function() {
+    var raw = (portField.text || "").replace(/^\s+|\s+$/g, "");
+    var newPort = parseInt(raw, 10);
+    if (!raw.length || isNaN(newPort) || newPort < 1 || newPort > 65535 || String(newPort) !== raw) {
+        portErrorText.text = "Port must be a whole number between 1 and 65535.";
+        return;
+    }
+    portErrorText.text = "";
+    try { app.settings.saveSetting("MCPBridge", "port", String(newPort)); } catch (e) {}
+    stopSocketListener();
+    if (startSocketListener(newPort)) {
+        socketCheckbox.value = true;
+        logToPanel("Port set to " + socketPort + "; listener restarted.");
+    } else {
+        portErrorText.text = "Could not bind port " + newPort + " (" + socketStatus + ").";
+        logToPanel("Could not bind port " + newPort + " (" + socketStatus + ").");
+    }
+    startCommandChecker();
+    updateTransportPanel();
+    forceFlushLog();
+};
+
+restartListenerButton.onClick = function() {
+    var preferred = socketPort || getPreferredSocketPort();
+    stopSocketListener();
+    if (startSocketListener(preferred)) {
+        socketCheckbox.value = true;
+        logToPanel("Listener restarted on port " + socketPort + ".");
+    } else {
+        logToPanel("Restart failed (" + socketStatus + ").");
+    }
+    startCommandChecker();
+    updateTransportPanel();
+    forceFlushLog();
+};
+
+socketCheckbox.onClick = function() {
+    // Guard against silently cutting off the bridge entirely: if the file
+    // transport is also off, refuse and say why rather than leave the user
+    // with no visible way for any command to ever reach AE.
+    if (!socketCheckbox.value && !fileTransportEnabled) {
+        socketCheckbox.value = true;
+        logToPanel("Cannot disable Socket while File is disabled: at least one transport must stay enabled.");
+        forceFlushLog();
+        return;
+    }
+    if (socketCheckbox.value) {
+        if (startSocketListener(getPreferredSocketPort())) {
+            logToPanel("Socket transport enabled on port " + socketPort + ".");
+        } else {
+            logToPanel("Could not enable the socket transport (" + socketStatus + ").");
+            socketCheckbox.value = false;
+        }
+    } else {
+        stopSocketListener();
+        socketStatus = "disabled in the panel";
+        logToPanel("Socket transport disabled; using the file transport only.");
+    }
+    startCommandChecker();
+    updateTransportPanel();
+    forceFlushLog();
+};
+
+fileCheckbox.onClick = function() {
+    if (!fileCheckbox.value && !socketListener) {
+        fileCheckbox.value = true;
+        logToPanel("Cannot disable File while Socket is off: at least one transport must stay enabled.");
+        forceFlushLog();
+        return;
+    }
+    fileTransportEnabled = fileCheckbox.value;
+    logToPanel("File transport " + (fileTransportEnabled ? "enabled." : "disabled."));
+    updateTransportPanel();
+    forceFlushLog();
+};
+
 checkButton.onClick = function() {
     logToPanel("Manually checking for commands");
     checkForCommands();
+    updateTransportPanel();
+    forceFlushLog();
+};
+
+copyDiagButton.onClick = function() {
+    if (isChecking) return; // also enforced via .enabled in updateTransportPanel
+    var diagWin = new Window("dialog", "Bridge Diagnostics");
+    diagWin.orientation = "column";
+    diagWin.alignChildren = ["fill", "fill"];
+    // Not readonly: ScriptUI has no clipboard API, so select-all + Ctrl/Cmd-C
+    // inside a plain edittext is the only copy path available.
+    var diagText = diagWin.add("edittext", undefined, buildDiagnosticsText(), { multiline: true, scrolling: true });
+    diagText.preferredSize = [480, 300];
+    var closeButton = diagWin.add("button", undefined, "Close");
+    closeButton.onClick = function() { diagWin.close(); };
+    diagWin.show();
+};
+
+clearLogButton.onClick = function() {
+    logLines = [];
+    forceFlushLog();
 };
 
 
-logToPanel("MCP Bridge Auto started");
+logToPanel("MCP Bridge Auto " + BRIDGE_VERSION + " started");
 logToPanel("Command file: " + getCommandFilePath());
 statusText.text = "Ready - Auto-run is " + (autoRunCheckbox.value ? "ON" : "OFF");
 
 
 initLastProcessedCommand();
+// Bind BEFORE scheduling, so startCommandChecker knows which tick rate to use.
+// A failure here is not fatal: the file transport keeps working exactly as it
+// did before, which is the whole point of keeping it.
+var initialPort = getPreferredSocketPort();
+portField.text = String(initialPort || SOCKET_PORT_BASE);
+if (startSocketListener(initialPort)) {
+    logToPanel("Socket transport listening on port " + socketPort);
+    socketCheckbox.value = true;
+    portField.text = String(socketPort);
+} else {
+    logToPanel("Socket transport unavailable (" + socketStatus + "); using the file transport.");
+    socketCheckbox.value = false;
+}
+fileCheckbox.value = fileTransportEnabled;
 startCommandChecker();
+updateTransportPanel();
+forceFlushLog();
 
 
 if (panel instanceof Window) {
@@ -4066,9 +6901,10 @@ if (panel instanceof Window) {
     // Docked Panel path (Window > mcp-bridge-auto.jsx) - never call .show()/.center().
     panel.layout.layout(true);
     // Give the layout a shrink floor so a narrow dock doesn't collapse to "blank"
-    // (logText has a fixed 200px height; a docked panel won't auto-size to content).
+    // (logText has a fixed height; a docked panel won't auto-size to content).
+    // Raised from [220,160] to [240,300] to fit the Transport panel's controls.
     if (panel.children && panel.children.length) {
-        panel.minimumSize = [220, 160];
+        panel.minimumSize = [240, 300];
     }
     panel.layout.resize();
     panel.onResizing = panel.onResize = function () { this.layout.resize(); };
