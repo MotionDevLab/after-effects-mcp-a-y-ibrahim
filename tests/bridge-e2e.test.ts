@@ -15,6 +15,7 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 import * as fs from "fs";
+import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 import { fileURLToPath } from "url";
@@ -136,6 +137,9 @@ class FakeAE {
           body._responseTimestamp = new Date().toISOString();
           body._commandExecuted = cmd.command;
           body._commandId = cmd.commandId;
+          // The real panel stamps the transport in the same block as _commandId,
+          // so an old panel that omits one omits the other.
+          body._transport = "file";
         }
         fs.writeFileSync(path.join(this.dir, "ae_mcp_result.json"), JSON.stringify(body, null, 2), {
           encoding: "utf8",
@@ -151,8 +155,13 @@ class FakeAE {
     this.timer = null;
   }
 
-  /** A well formed ping reply from a panel claiming `version`. */
-  pingAs(version: string): void {
+  /**
+   * A well formed ping reply from a panel claiming `version`. `extra` carries
+   * the socket fields a bridge >= 1.12 reports about itself; omitting them
+   * simulates an older panel, which must leave check-bridge's panelReported null
+   * rather than letting it invent a state.
+   */
+  pingAs(version: string, extra: Record<string, unknown> = {}): void {
     this.responder = () => ({
       status: "success",
       pong: true,
@@ -161,6 +170,152 @@ class FakeAE {
       bridgeFolder: this.dir,
       project: "SIMULATED Project.aep",
       activeComp: "SIM Comp 1",
+      ...extra,
+    });
+  }
+}
+
+/**
+ * Fake After Effects panel over the SOCKET transport: a real TCP server plus the
+ * rendezvous file that advertises it, speaking the same NDJSON protocol as
+ * mcp-bridge-auto.jsx (ACK first, then the result, then close).
+ *
+ * It binds port 0 and publishes whatever the OS hands out, so a run never
+ * collides with a real After Effects panel holding 47800-47815 on the same
+ * machine. That is also why the port is read back from the listener rather than
+ * assumed: the rendezvous file has to name the port actually bound, which is the
+ * whole reason the file exists.
+ */
+class FakeSocketAE {
+  port = 0;
+  token = "0123456789abcdef0123456789abcdef";
+  bridgeVersion = "";
+  protocolVersion = 1;
+  responder: (cmd: any) => Record<string, unknown> = () => ({ status: "success" });
+  seen: any[] = [];
+
+  private server: net.Server | null = null;
+
+  constructor(private readonly dir: string) {}
+
+  start(): Promise<void> {
+    return new Promise((resolve) => {
+      const srv = net.createServer((conn) => {
+        conn.setEncoding("utf8");
+        let buf = "";
+        conn.on("error", () => {
+          /* the client destroys the socket once it has its result */
+        });
+        conn.on("data", (d: string) => {
+          buf += d;
+          const nl = buf.indexOf("\n");
+          if (nl < 0) return;
+          const line = buf.slice(0, nl);
+          buf = "";
+
+          let cmd: any;
+          try {
+            cmd = JSON.parse(line);
+          } catch {
+            conn.end();
+            return;
+          }
+          // Refuse BEFORE acknowledging, exactly like the panel, because that
+          // ordering is what makes the server's file fallback safe here.
+          if (cmd.token !== this.token) {
+            conn.write(
+              JSON.stringify({ _ack: 0, error: "unauthorized", commandId: cmd.commandId }) + "\n",
+            );
+            conn.end();
+            return;
+          }
+          this.seen.push(cmd);
+          conn.write(
+            JSON.stringify({
+              _ack: 1,
+              commandId: cmd.commandId,
+              bridgeVersion: this.bridgeVersion,
+            }) + "\n",
+          );
+
+          const body: any = this.responder(cmd) || {};
+          body._responseTimestamp = new Date().toISOString();
+          body._commandExecuted = cmd.command;
+          body._commandId = cmd.commandId;
+          body._transport = "socket";
+          conn.write(JSON.stringify(body) + "\n");
+          conn.end();
+        });
+      });
+      srv.listen(0, "127.0.0.1", () => {
+        this.port = (srv.address() as net.AddressInfo).port;
+        this.server = srv;
+        this.writeRendezvous();
+        resolve();
+      });
+    });
+  }
+
+  get rendezvousPath(): string {
+    return path.join(this.dir, `ae_bridge_port_${this.port}.json`);
+  }
+
+  /** Publish the rendezvous file, optionally with a token that does not match. */
+  writeRendezvous(token: string = this.token): void {
+    fs.writeFileSync(
+      this.rendezvousPath,
+      JSON.stringify({
+        v: this.protocolVersion,
+        port: this.port,
+        token,
+        bridgeVersion: this.bridgeVersion,
+        aeVersion: "26.0x67 (SOCKET SIM)",
+        boundAt: new Date().toISOString(),
+        project: "SOCKET Project.aep",
+      }),
+    );
+  }
+
+  removeRendezvous(): void {
+    try {
+      fs.unlinkSync(this.rendezvousPath);
+    } catch {
+      /* already gone */
+    }
+  }
+
+  /** Close the listener but LEAVE the rendezvous file: a panel the user closed. */
+  closeListener(): Promise<void> {
+    return new Promise((resolve) => {
+      if (!this.server) return resolve();
+      this.server.close(() => resolve());
+      this.server = null;
+    });
+  }
+
+  async stop(): Promise<void> {
+    await this.closeListener();
+    this.removeRendezvous();
+  }
+
+  pingAs(version: string, extra: Record<string, unknown> = {}): void {
+    this.responder = () => ({
+      status: "success",
+      pong: true,
+      bridgeVersion: version,
+      aeVersion: "26.0x67 (SOCKET SIM)",
+      bridgeFolder: this.dir,
+      // Deliberately NOT the project name in the rendezvous file: the panel has
+      // "opened a different project" since it bound, and check-bridge must
+      // report the live one.
+      project: "REOPENED Project.aep",
+      activeComp: "SOCKET Comp 1",
+      socketListening: true,
+      socketPort: this.port,
+      socketStatus: "listening",
+      networkPermission: true,
+      fileTransportEnabled: true,
+      ...extra,
     });
   }
 }
@@ -222,6 +377,17 @@ describe("server startup", () => {
   });
 });
 
+// MUST stay ahead of every describe that runs a command: the moment one
+// succeeds the server has a cached result, and this file-reading path becomes
+// unreachable for the rest of the process.
+describe("get-results with nothing cached yet", () => {
+  it("falls back to the result file when the server has run no command", async () => {
+    const r = await client.callTool("get-results", {});
+    expect(r.parsed.error).toMatch(/No results file found/i);
+    expect(r.parsed._source).toBeUndefined();
+  }, 20000);
+});
+
 describe("check-bridge", () => {
   it("reports a clear failure when no panel answers", async () => {
     ae.enabled = false;
@@ -254,6 +420,39 @@ describe("check-bridge", () => {
     expect(r.parsed.versionWarning).toBeNull();
     expect(r.parsed.aeVersion).toMatch(/SIMULATED/);
     expect(r.parsed.project).toMatch(/SIMULATED/);
+    // A panel answering over files with no rendezvous file published: the
+    // socket is unusable, but everything works, so `ok` stays true.
+    expect(r.parsed.socket.problem).toBe("no-rendezvous");
+    expect(r.parsed.socket.selectedPort).toBeNull();
+    expect(r.parsed.socket.allListeners).toEqual([]);
+    expect(r.parsed.socket.hint).toMatch(/mcp-bridge-auto/);
+  }, 20000);
+
+  it("leaves panelReported null for a panel too old to report its socket", async () => {
+    // The old panel says nothing about sockets, so check-bridge must not invent
+    // a state for it, and must not read a missing networkPermission as "off".
+    ae.pingAs("1.11.0-mcp-enhanced");
+    const r = await client.callTool("check-bridge", {});
+    expect(r.parsed.socket.panelReported).toBeNull();
+    expect(r.parsed.socket.problem).toBe("no-rendezvous");
+  }, 20000);
+
+  it("names the network permission as the cause when the panel reports it off", async () => {
+    // Without the panel saying so this is indistinguishable from "no panel
+    // open", "Socket checkbox unchecked" and "every port taken", which is the
+    // whole reason ping reports it.
+    ae.pingAs(EXPECTED_VERSION, {
+      socketListening: false,
+      socketPort: 0,
+      socketStatus: "permission disabled",
+      networkPermission: false,
+      fileTransportEnabled: true,
+    });
+    const r = await client.callTool("check-bridge", {});
+    expect(r.parsed.ok).toBe(true);
+    expect(r.parsed.socket.problem).toBe("permission-disabled");
+    expect(r.parsed.socket.hint).toMatch(/Allow Scripts to Write Files and Access Network/);
+    expect(r.parsed.socket.panelReported.listening).toBe(false);
   }, 20000);
 
   it("warns, but still reports ok, when the panel is an older version", async () => {
@@ -342,4 +541,172 @@ describe("concurrency", () => {
     const ids = ae.seen.map((c) => c.commandId);
     expect(new Set(ids).size).toBe(ids.length);
   });
+});
+
+// Everything below publishes a real listener into the same bridge folder, so it
+// runs last: once a rendezvous file exists the server prefers the socket, and
+// the file-transport describes above would no longer be testing the file path.
+describe("socket transport", () => {
+  let sock: FakeSocketAE;
+
+  beforeAll(async () => {
+    sock = new FakeSocketAE(dir);
+    sock.bridgeVersion = EXPECTED_VERSION;
+    sock.pingAs(EXPECTED_VERSION);
+    await sock.start();
+    // The FILE panel has to answer ping too: several tests below break the
+    // socket on purpose and then assert that the fallback still works.
+    ae.pingAs(EXPECTED_VERSION);
+  });
+
+  afterAll(async () => {
+    await sock?.stop();
+  });
+
+  it("reports a healthy socket, and says so only when commands really use it", async () => {
+    const r = await client.callTool("check-bridge", {});
+    expect(r.parsed.ok).toBe(true);
+    expect(r.parsed.socket.problem).toBeNull();
+    expect(r.parsed.socket.hint).toBeNull();
+    expect(r.parsed.socket.selectedPort).toBe(sock.port);
+    // problem:null must mean the tools ACTUALLY use the socket, not merely that
+    // a listener answered a probe. The panel stamps this field itself.
+    expect(r.parsed.transportInUse).toBe("socket");
+    expect(r.parsed.socket.mode).toBe("auto");
+
+    expect(r.parsed.socket.allListeners).toHaveLength(1);
+    const only = r.parsed.socket.allListeners[0];
+    expect(only.port).toBe(sock.port);
+    expect(only.selected).toBe(true);
+    expect(only.reachable).toBe(true);
+    expect(only.problem).toBeNull();
+    expect(only.aeVersion).toMatch(/SOCKET SIM/);
+    // The live ping wins over the rendezvous file's bind-time snapshot, which
+    // still says "SOCKET Project.aep".
+    expect(only.project).toBe("REOPENED Project.aep");
+  }, 20000);
+
+  it("routes commands over the socket, never touching the command file", async () => {
+    const before = ae.seen.length;
+    sock.responder = (cmd) => ({ status: "success", echo: cmd.args.script });
+    const r = await client.callTool("execute-script", {
+      script: "SOCKET_MARKER",
+      timeoutMs: 8000,
+    });
+    expect(r.parsed.echo).toBe("SOCKET_MARKER");
+    expect(r.parsed._transport).toBe("socket");
+    // The file panel must not have seen it: a command served on both transports
+    // would be executed twice.
+    expect(ae.seen.length).toBe(before);
+  }, 20000);
+
+  it("get-results returns the socket result, which was never written to a file", async () => {
+    // The decisive case for C7: on the socket there IS no result file, so the
+    // old implementation would have returned a stale file-transport result here.
+    const r = await client.callTool("get-results", {});
+    expect(r.parsed.echo).toBe("SOCKET_MARKER");
+    expect(r.parsed._source).toBe("server-memory");
+    expect(r.parsed._transport).toBe("socket");
+    expect(typeof r.parsed._ageMs).toBe("number");
+    const onDisk = JSON.parse(fs.readFileSync(path.join(dir, "ae_mcp_result.json"), "utf8"));
+    expect(onDisk.echo).not.toBe("SOCKET_MARKER");
+  }, 20000);
+
+  it("run-bridge-test returns its result instead of telling the caller to poll", async () => {
+    sock.responder = () => ({ status: "success", effectsApplied: 3 });
+    const r = await client.callTool("run-bridge-test", {});
+    expect(r.isError).toBe(false);
+    expect(r.parsed.effectsApplied).toBe(3);
+    expect(r.parsed._commandExecuted).toBe("bridgeTestEffects");
+    expect(r.text).not.toMatch(/has been queued/);
+  }, 40000);
+
+  it("classifies a rejected token, and still delivers the command over files", async () => {
+    sock.pingAs(EXPECTED_VERSION);
+    sock.writeRendezvous("a-token-the-panel-does-not-know");
+    try {
+      const r = await client.callTool("check-bridge", {});
+      expect(r.parsed.socket.problem).toBe("token-rejected");
+      expect(r.parsed.socket.allListeners[0].reachable).toBe(false);
+      // A refusal happens BEFORE the panel dispatches, so retrying over files
+      // cannot double-execute. check-bridge reads this from canFallbackFrom,
+      // the same function sendBridgeCommand uses.
+      expect(r.parsed.socket.allListeners[0].wouldFallBackToFile).toBe(true);
+      // And it really does fall back: the health check itself came back over
+      // the file transport while the socket was reporting token-rejected.
+      expect(r.parsed.ok).toBe(true);
+      expect(r.parsed.transportInUse).toBe("file");
+    } finally {
+      sock.writeRendezvous();
+    }
+  }, 20000);
+
+  it("classifies a closed panel that left its rendezvous file behind", async () => {
+    sock.pingAs(EXPECTED_VERSION);
+    await sock.closeListener();
+    try {
+      const r = await client.callTool("check-bridge", {});
+      expect(r.parsed.socket.problem).toBe("connection-refused");
+      expect(r.parsed.socket.allListeners[0].reachable).toBe(false);
+      expect(r.parsed.socket.allListeners[0].wouldFallBackToFile).toBe(true);
+      expect(r.parsed.socket.hint).toMatch(new RegExp(String(sock.port)));
+      // The stale file is NOT deleted: it is minutes old, and a panel that is
+      // merely restarting must not have its rendezvous pulled out from under it.
+      expect(fs.existsSync(sock.rendezvousPath)).toBe(true);
+    } finally {
+      sock.removeRendezvous();
+      await sock.start();
+      sock.pingAs(EXPECTED_VERSION);
+    }
+  }, 20000);
+
+  it("reports a listener whose protocol version this server cannot speak", async () => {
+    sock.pingAs(EXPECTED_VERSION);
+    fs.writeFileSync(
+      sock.rendezvousPath,
+      JSON.stringify({
+        v: 99,
+        port: sock.port,
+        token: sock.token,
+        bridgeVersion: "2.0.0-future",
+        aeVersion: "27.0 (FUTURE)",
+        boundAt: new Date().toISOString(),
+        project: "FUTURE.aep",
+      }),
+    );
+    try {
+      const r = await client.callTool("check-bridge", {});
+      // The file it wrote is unreadable to us, but reporting "no listener" would
+      // send the user off reinstalling a panel that is newer, not broken.
+      expect(r.parsed.socket.problem).toBe("protocol-mismatch");
+      expect(r.parsed.socket.selectedPort).toBeNull();
+      expect(r.parsed.socket.allListeners[0].protocolVersion).toBe(99);
+      expect(r.parsed.socket.allListeners[0].reachable).toBeNull();
+      expect(r.parsed.socket.hint).toMatch(/newer bridge protocol/);
+    } finally {
+      sock.writeRendezvous();
+    }
+  }, 20000);
+
+  it("lists two listeners and targets the lowest port", async () => {
+    sock.pingAs(EXPECTED_VERSION);
+    const second = new FakeSocketAE(dir);
+    second.bridgeVersion = EXPECTED_VERSION;
+    second.pingAs(EXPECTED_VERSION);
+    await second.start();
+    try {
+      const r = await client.callTool("check-bridge", {});
+      expect(r.parsed.socket.allListeners).toHaveLength(2);
+      const lowest = Math.min(sock.port, second.port);
+      expect(r.parsed.socket.selectedPort).toBe(lowest);
+      // Both are probed, so the user can see the instance they are NOT talking
+      // to is alive rather than guessing why commands land in the wrong AE.
+      for (const l of r.parsed.socket.allListeners) {
+        expect(l.reachable).toBe(true);
+        expect(l.selected).toBe(l.port === lowest);
+      }
+    } finally {
+      await second.stop();
+    }
+  }, 20000);
 });

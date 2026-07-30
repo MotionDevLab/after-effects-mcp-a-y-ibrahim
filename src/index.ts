@@ -32,9 +32,12 @@ import {
   readTransportMode,
   readPinnedPort,
   shouldRediscover,
+  PROTOCOL_VERSION,
+  SOCKET_PORT_BASE,
+  SOCKET_PORT_TRIES,
   type Rendezvous,
 } from "./lib/bridge-socket.js";
-import { sendOverSocket, type SendPhase } from "./lib/bridge-socket-client.js";
+import { sendOverSocket, canFallbackFrom, type SendPhase } from "./lib/bridge-socket-client.js";
 import { collectPresetFiles } from "./lib/preset-scan.js";
 import { resolvePathInput, assertMorphCompatible } from "./lib/shape-path.js";
 import { analyzeWavBuffer, WavAnalysis } from "./lib/wav.js";
@@ -105,6 +108,12 @@ let lastBridgeResult: { raw: string; transport: "socket" | "file"; at: number } 
  * throws: a half-written or hand-mangled file is simply not a listener, which
  * the caller already has to tolerate because the panel can die between
  * publishing the file and binding the port.
+ *
+ * Files whose protocol version we do NOT speak are returned too, rather than
+ * being dropped here. Selection filters them out (see discoverNow), but
+ * check-bridge has to be able to say "a newer panel is listening on 47800 and
+ * this server is too old for it" instead of the flatly wrong "no listener
+ * found", which would send the user off reinstalling a panel that is fine.
  */
 function readAllRendezvous(): Rendezvous[] {
   const found: Rendezvous[] = [];
@@ -121,7 +130,7 @@ function readAllRendezvous(): Rendezvous[] {
     if (port === null) continue;
     try {
       const parsed = parseRendezvous(fs.readFileSync(path.join(dir, name), "utf8"), port);
-      if (parsed && isSupportedRendezvous(parsed)) found.push(parsed);
+      if (parsed) found.push(parsed);
     } catch {
       /* unreadable or mid-write: skip it, discovery runs again in REDISCOVER_MS */
     }
@@ -130,18 +139,32 @@ function readAllRendezvous(): Rendezvous[] {
 }
 
 /**
+ * Re-read the bridge folder right now and refresh the cache, returning both the
+ * full listener list and the one we would talk to. check-bridge needs the list
+ * and must never report a selection up to REDISCOVER_MS out of date; every other
+ * caller goes through maybeDiscover and gets the cached answer.
+ */
+function discoverNow(): { listeners: Rendezvous[]; selected: Rendezvous | null } {
+  const listeners = readAllRendezvous();
+  const selected = selectRendezvous(
+    listeners.filter(isSupportedRendezvous),
+    transportState.pinnedPort,
+  );
+  transportState.lastDiscoveryAt = Date.now();
+  transportState.rendezvous = selected;
+  return { listeners, selected };
+}
+
+/**
  * The listener to talk to, cached for REDISCOVER_MS. The cache is what keeps a
  * closed panel cheap: it costs one wasted connection refusal every 5 seconds
  * rather than a directory scan plus a refusal on every single command.
  */
 function maybeDiscover(): Rendezvous | null {
-  const now = Date.now();
-  if (!shouldRediscover(transportState.lastDiscoveryAt, now)) {
+  if (!shouldRediscover(transportState.lastDiscoveryAt, Date.now())) {
     return transportState.rendezvous;
   }
-  transportState.lastDiscoveryAt = now;
-  transportState.rendezvous = selectRendezvous(readAllRendezvous(), transportState.pinnedPort);
-  return transportState.rendezvous;
+  return discoverNow().selected;
 }
 
 /**
@@ -163,6 +186,103 @@ function noteSocketFailure(target: Rendezvous, phase: SendPhase): void {
     console.error(`Removed stale bridge rendezvous file for port ${target.port}.`);
   } catch {
     /* already gone, or not ours to remove */
+  }
+}
+
+/**
+ * Why the socket transport is not usable, as check-bridge reports it.
+ *
+ * The plan sketched six states; these eleven are what the SendPhase/reason pairs
+ * actually distinguish, and each one has a DIFFERENT fix. Collapsing them would
+ * throw away the entire point of the socket transport's diagnostics: today all
+ * of "panel not open", "wrong AE instance", "AE busy" and "permission off"
+ * arrive as one indistinguishable timeout.
+ *
+ * `null` means, and must only mean, that the tools really would use the socket.
+ */
+type SocketProblem =
+  | null
+  /** AE_MCP_BRIDGE_TRANSPORT=file. The kill switch is on; we never even look. */
+  | "transport-disabled"
+  /** The panel says Allow Scripts to Write Files and Access Network is off. */
+  | "permission-disabled"
+  /** Nothing published a rendezvous file: no panel open, or a panel older than 1.12. */
+  | "no-rendezvous"
+  /** AE_MCP_BRIDGE_PORT names a port no listener published. */
+  | "pinned-port-not-found"
+  /** The listener speaks a protocol version this server does not. */
+  | "protocol-mismatch"
+  /** The published port refuses: the panel that wrote the file is gone. */
+  | "connection-refused"
+  /** Could not connect for some other reason, e.g. a firewall dropping the SYN. */
+  | "connect-failed"
+  /** The panel refused our token, so the rendezvous file we read is not its own. */
+  | "token-rejected"
+  /** Connected, but nothing identified itself as the bridge: AE busy, or a foreign process. */
+  | "no-acknowledgement"
+  /** Our bridge ACKed and then did not answer: After Effects is busy. */
+  | "acknowledged-no-result";
+
+/**
+ * Turn a failed socket attempt into the problem check-bridge reports.
+ *
+ * This has to agree with sendBridgeCommand's view of the SAME phase, or
+ * check-bridge would describe a bridge in a state the tools do not actually see.
+ * The mapping is deliberately conservative: anything that proves the peer is our
+ * panel (it ACKed) is reported as a busy panel, and anything that does not is
+ * reported as "we could not identify what is on that port".
+ */
+function classifySocketFailure(phase: SendPhase, reason: string): SocketProblem {
+  switch (phase) {
+    case "connect":
+      // ECONNREFUSED (and an immediate close) means the port is simply closed,
+      // which is the ordinary "panel was shut down" case and needs no firewall
+      // advice. Anything else did not get a clean refusal, so something is
+      // swallowing the connection.
+      return reason === "ECONNREFUSED" || reason === "closed"
+        ? "connection-refused"
+        : "connect-failed";
+    case "auth":
+      if (reason === "unauthorized") return "token-rejected";
+      if (reason === "protocol-mismatch") return "protocol-mismatch";
+      return "no-acknowledgement";
+    case "ack":
+      return "no-acknowledgement";
+    default:
+      // io / deadline. Both happen only AFTER a valid ACK, so the peer IS our
+      // panel and the same reasoning that forbids a fallback retry applies here.
+      return "acknowledged-no-result";
+  }
+}
+
+/** What to actually do about a SocketProblem. One concrete next step each. */
+function socketProblemHint(
+  problem: SocketProblem,
+  ctx: { port?: number; pinnedPort: number | null },
+): string | null {
+  switch (problem) {
+    case null:
+      return null;
+    case "transport-disabled":
+      return "AE_MCP_BRIDGE_TRANSPORT=file is set, so this server uses the slower file transport only. Unset it (or set it to 'auto') and restart the MCP client to use the socket.";
+    case "permission-disabled":
+      return "In After Effects, enable Edit > Preferences > Scripting & Expressions > Allow Scripts to Write Files and Access Network, then FULLY restart After Effects. Commands still work over the file transport meanwhile, just slower.";
+    case "no-rendezvous":
+      return "No panel published a listener. Open Window > mcp-bridge-auto.jsx, check that its Socket checkbox is ticked, and confirm the panel's Transport section shows LISTENING. A panel older than 1.12 has no socket at all: run `npm run install-bridge` and reopen it. Commands still work over the file transport meanwhile.";
+    case "pinned-port-not-found":
+      return `AE_MCP_BRIDGE_PORT=${ctx.pinnedPort} pins this server to one port and no panel is listening there. Set the panel's Port field to ${ctx.pinnedPort} and press Apply, or unset the variable to use the lowest listening port automatically.`;
+    case "protocol-mismatch":
+      return "The panel speaks a newer bridge protocol than this server. Update the MCP server package (this is the reverse of the usual mismatch: the panel is ahead, not behind).";
+    case "connection-refused":
+      return `Nothing is listening on port ${ctx.port}; the panel that published it is gone. Reopen Window > mcp-bridge-auto.jsx, or press Restart listener in the panel. The stale rendezvous file is cleaned up automatically once it is a day old.`;
+    case "connect-failed":
+      return `Port ${ctx.port} neither answered nor refused, which usually means a firewall is dropping the connection. Allow loopback TCP on ports ${SOCKET_PORT_BASE}-${SOCKET_PORT_BASE + SOCKET_PORT_TRIES - 1} for After Effects, or set AE_MCP_BRIDGE_TRANSPORT=file to stay on the file transport.`;
+    case "token-rejected":
+      return `The process on port ${ctx.port} rejected the token in the rendezvous file, so the two do not belong together. Press Restart listener in the panel to republish, or delete ae_bridge_port_${ctx.port}.json from the bridge folder if another program owns that port.`;
+    case "no-acknowledgement":
+      return `Something is listening on port ${ctx.port} but did not identify itself as the bridge. Either After Effects is busy (rendering, or a modal dialog is open, which also blocks the panel's timer) or another program has taken that port. Check After Effects first, then press Restart listener to move to a free port.`;
+    case "acknowledged-no-result":
+      return "The panel acknowledged the health check and then did not answer, which means After Effects is busy: a render, a long script, or a modal dialog waiting for a click. Nothing is broken; wait for it to finish.";
   }
 }
 
@@ -435,7 +555,14 @@ async function sendBridgeCommand(
       });
     }
     const raw = await waitForBridgeResult(command, timeoutMs, pollMs, id);
-    lastBridgeResult = { raw, transport: "file", at: Date.now() };
+    // Cache only what After Effects actually returned. waitForBridgeResult
+    // synthesizes bridgeTimeoutResult() when nothing answered, and caching that
+    // would make get-results report a timeout as "the last result" while
+    // discarding the last real one, which is precisely the result a user runs
+    // get-results to recover after a command appeared to hang.
+    if (raw !== bridgeTimeoutResult(command)) {
+      lastBridgeResult = { raw, transport: "file", at: Date.now() };
+    }
     return raw;
   });
 }
@@ -568,12 +695,61 @@ server.tool(
   },
 );
 
+/** How old an in-memory result may be before get-results says so. */
+const RESULT_FRESH_MS = 30 * 1000;
+
+/**
+ * Stamp the cached result with where it came from and how old it is.
+ *
+ * The annotation is additive and never overwrites a field the panel already
+ * set: the panel stamps its own `_transport` on every result, and on the socket
+ * transport that stamp is the more authoritative of the two. A non-JSON result
+ * is passed through byte for byte, exactly as the file path has always done.
+ */
+function annotateCachedResult(
+  cached: { raw: string; transport: "socket" | "file"; at: number },
+  now: number,
+): string {
+  const ageMs = now - cached.at;
+  let parsed: any;
+  try {
+    parsed = JSON.parse(cached.raw);
+  } catch {
+    return cached.raw;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return cached.raw;
+
+  parsed._source = "server-memory";
+  parsed._ageMs = ageMs;
+  if (parsed._transport === undefined) parsed._transport = cached.transport;
+  if (ageMs > RESULT_FRESH_MS) {
+    // Deliberately NOT phrased as a malfunction. On the file transport a result
+    // older than 30s meant the panel had probably stopped writing; a cached
+    // result older than 30s just means no command has run recently, which is
+    // the normal state of an idle session.
+    parsed._note = `This is the result of the last command, which finished ${Math.round(ageMs / 1000)}s ago. Nothing has run since.`;
+  }
+  return JSON.stringify(parsed, null, 2);
+}
+
 server.tool(
   "get-results",
-  "Get results from the last script executed in After Effects",
+  "Get the result of the last command this server sent to After Effects. Works on both transports: the socket returns results in-band, so there is no result file to read.",
   {},
   async () => {
     try {
+      // The socket transport hands the result straight back over the connection
+      // and never writes ae_mcp_result.json, so reading that file would return
+      // whatever the last FILE-transport command left behind, which on a healthy
+      // socket session can be hours stale or absent entirely. The in-memory
+      // cache is the only correct source once the socket is in use.
+      //
+      // The file read is still the right fallback rather than dead code: a
+      // freshly started server that attaches to a session someone else's server
+      // already ran has an empty cache but a perfectly good result file.
+      if (lastBridgeResult) {
+        return bridgeToolResult(annotateCachedResult(lastBridgeResult, Date.now()));
+      }
       const result = readResultsFromTempFile();
       return bridgeToolResult(result);
     } catch (error) {
@@ -660,13 +836,14 @@ To use this integration with After Effects, follow these steps:
    - The panel will automatically check for commands every few seconds
 
 4. **Run scripts through MCP**
-   - Use the \`run-script\` tool to queue a command
-   - The Auto panel will detect and run the command automatically
-   - Results will be saved to a temp file
+   - Use the \`run-script\` tool to run a command
+   - The panel picks it up and runs it automatically
+   - The tool waits for the command and returns its result directly
 
-5. **Get results through MCP**
-   - After a command is executed, use the \`get-results\` tool
-   - This will retrieve the results from After Effects
+5. **Get results again through MCP**
+   - \`get-results\` re-reads the result of the last command
+   - You do not need it in normal use, since every tool already returns its
+     own result; it is for recovering a result you lost track of
 
 Available scripts:
 - getProjectInfo: Information about the current project
@@ -2929,34 +3106,25 @@ To apply the "cinematic-look" template:
 
 server.tool(
   "run-bridge-test",
-  "Run the bridge test effects script to verify communication and apply test effects",
+  "Run the bridge test effects script to verify communication and apply test effects. Returns the test result directly.",
   {},
   async () => {
     try {
-      // Fire-and-forget queue (results fetched later via get-results); still run
-      // it through the mutex so it can't clobber a concurrent command's slot.
-      await bridgeMutex(async () => {
-        clearResultsFile();
-        writeCommandFile("bridgeTestEffects", {});
-      });
-
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              `Bridge test effects command has been queued.\n` +
-              `Please ensure the "MCP Bridge Auto" panel is open in After Effects.\n` +
-              `Use the "get-results" tool after a few seconds to check for the test results.`,
-          },
-        ],
-      };
+      // This used to queue the command and tell the caller to fetch the result
+      // later with get-results. That shape was a workaround for file-transport
+      // latency, and it cost the tool every safety property the normal path has:
+      // no id correlation, no timeout synthesis, no isError classification, and
+      // a silent failure whenever the panel was not open. It was also the only
+      // caller that reached around sendBridgeCommand into bridgeMutex directly.
+      // 30s because the test applies real effects, which is slower than a query.
+      const result = await sendBridgeCommand("bridgeTestEffects", {}, 30000, 250);
+      return bridgeToolResult(result);
     } catch (error) {
       return {
         content: [
           {
             type: "text",
-            text: `Error queuing bridge test command: ${String(error)}`,
+            text: `Error running the bridge test command: ${String(error)}`,
           },
         ],
         isError: true,
@@ -3815,19 +3983,201 @@ server.tool(
 // BRIDGE_VERSION in src/scripts/mcp-bridge-auto.jsx. check-bridge warns on mismatch.
 const EXPECTED_BRIDGE_VERSION = "1.12.0-mcp-socket";
 
+/**
+ * Deadline for one listener probe. It must comfortably exceed ACK_TIMEOUT_MS
+ * (1500ms), otherwise the total deadline fires first and every unresponsive port
+ * would be misreported as a deadline rather than as the missing ACK it is.
+ */
+const SOCKET_PROBE_TIMEOUT_MS = 2500;
+
+/** One rendezvous file, and what actually happened when we talked to its port. */
+interface ListenerReport {
+  port: number;
+  /** True for the listener this server would send commands to. */
+  selected: boolean;
+  protocolVersion: number;
+  bridgeVersion: string;
+  aeVersion: string;
+  project: string;
+  boundAt: string;
+  /** null when the port was deliberately not probed. */
+  reachable: boolean | null;
+  problem: SocketProblem;
+  detail: string | null;
+  /**
+   * Whether a real command failing this way would be retried over the file
+   * transport. Read from canFallbackFrom, the same function sendBridgeCommand
+   * uses, so this report cannot drift from the behavior it describes.
+   */
+  wouldFallBackToFile: boolean;
+}
+
+/**
+ * Send a real `ping` to one listener. Probing rather than merely reading the
+ * rendezvous file is the point: the file only proves a panel once bound that
+ * port, not that anything is still there, and a dead port is exactly the case
+ * users hit after closing a panel.
+ *
+ * `ping` is read-only and cheap, so probing every listener (not just the
+ * selected one) is safe even with two After Effects instances open.
+ */
+async function probeListener(
+  r: Rendezvous,
+  isSelected: boolean,
+  probe: boolean,
+): Promise<ListenerReport> {
+  const base = {
+    port: r.port,
+    selected: isSelected,
+    protocolVersion: r.v,
+    bridgeVersion: r.bridgeVersion,
+    aeVersion: r.aeVersion,
+    project: r.project,
+    boundAt: r.boundAt,
+  };
+
+  if (!isSupportedRendezvous(r)) {
+    return {
+      ...base,
+      reachable: null,
+      problem: "protocol-mismatch",
+      detail: `The rendezvous file declares protocol v${r.v}; this server speaks v${PROTOCOL_VERSION}. Not contacted.`,
+      wouldFallBackToFile: true,
+    };
+  }
+  if (!probe) {
+    return {
+      ...base,
+      reachable: null,
+      problem: "transport-disabled",
+      detail: "AE_MCP_BRIDGE_TRANSPORT=file, so no socket was opened.",
+      wouldFallBackToFile: true,
+    };
+  }
+
+  const sent = await sendOverSocket({
+    port: r.port,
+    token: r.token,
+    commandId: nextCommandId(),
+    command: "ping",
+    args: {},
+    timeoutMs: SOCKET_PROBE_TIMEOUT_MS,
+  });
+
+  if (sent.ok) {
+    // Prefer what the panel says NOW over what its rendezvous file recorded when
+    // it bound. The file is a snapshot taken once, so a user who has opened a
+    // different project since then would be shown the wrong one, and telling two
+    // After Effects instances apart is the entire reason this field is reported.
+    let live: any = null;
+    try {
+      live = JSON.parse(sent.raw);
+    } catch {
+      /* opaque result: keep the rendezvous file's values */
+    }
+    const str = (v: unknown, fallback: string): string =>
+      typeof v === "string" && v.length > 0 ? v : fallback;
+    return {
+      ...base,
+      aeVersion: str(live?.aeVersion, base.aeVersion),
+      project: str(live?.project, base.project),
+      reachable: true,
+      problem: null,
+      detail: `Answered in ${sent.totalMs} ms.`,
+      wouldFallBackToFile: false,
+    };
+  }
+  return {
+    ...base,
+    reachable: false,
+    problem: classifySocketFailure(sent.phase, sent.reason),
+    detail: sent.error,
+    wouldFallBackToFile: canFallbackFrom(sent.phase),
+  };
+}
+
 server.tool(
   "check-bridge",
-  "Health check: verify the After Effects MCP Bridge panel is open and responding, report its version, the AE version, the shared bridge folder, and the open project/active comp. Run this FIRST when anything times out or behaves oddly. If it reports a version mismatch, re-run `npm run install-bridge` and restart After Effects.",
+  "Health check: verify the After Effects MCP Bridge panel is open and responding, report its version, the AE version, the shared bridge folder, the open project/active comp, and the state of the socket transport (every listening panel, which one is targeted, and exactly why the socket is unusable if it is). Run this FIRST when anything times out or behaves oddly. If it reports a version mismatch, re-run `npm run install-bridge` and restart After Effects.",
   {},
   async () => {
     try {
+      // Read the bridge folder fresh rather than through the 5s discovery cache:
+      // check-bridge exists to describe this instant, and a cached selection
+      // could name a panel the user closed four seconds ago.
+      const { listeners, selected } = discoverNow();
+      const socketEnabled = transportState.mode !== "file";
+
+      // Probe in parallel so N stale listeners cost one timeout, not N.
+      const allListeners = await Promise.all(
+        listeners.map((r) =>
+          probeListener(r, selected !== null && r.port === selected.port, socketEnabled),
+        ),
+      );
+      allListeners.sort((a, b) => a.port - b.port);
+      const selectedReport = allListeners.find((x) => x.selected) ?? null;
+
+      // Then go through the normal path, so what is reported below is what the
+      // other 80-odd tools would actually experience, not a parallel guess.
+      const pingStartedAt = Date.now();
       const raw = await sendBridgeCommand("ping", {}, 5000, 200);
+      const pingMs = Date.now() - pingStartedAt;
       let parsed: any = null;
       try {
         parsed = JSON.parse(raw);
       } catch {
         /* not JSON */
       }
+
+      // What the panel says about its own socket. Only a bridge >= 1.12 reports
+      // this; an older one leaves it null rather than pretending to know.
+      const panelSocket =
+        parsed && typeof parsed.socketStatus === "string"
+          ? {
+              listening: parsed.socketListening === true,
+              port: typeof parsed.socketPort === "number" ? parsed.socketPort : null,
+              status: parsed.socketStatus,
+              networkPermission: parsed.networkPermission === true,
+              fileTransportEnabled: parsed.fileTransportEnabled !== false,
+            }
+          : null;
+
+      const supported = listeners.filter(isSupportedRendezvous);
+      let socketProblem: SocketProblem;
+      if (!socketEnabled) {
+        socketProblem = "transport-disabled";
+      } else if (selectedReport) {
+        socketProblem = selectedReport.problem;
+      } else if (listeners.length > 0 && supported.length === 0) {
+        socketProblem = "protocol-mismatch";
+      } else if (supported.length > 0) {
+        // Listeners exist and are all usable, yet none was selected: the only
+        // way that happens is a pin naming a port none of them bound.
+        socketProblem = "pinned-port-not-found";
+      } else {
+        socketProblem = "no-rendezvous";
+      }
+      // The permission is the ROOT cause when it is off: no permission means no
+      // listener, which means no rendezvous file. Reporting the symptom would
+      // send the user to reinstall a panel that is working correctly.
+      if (socketProblem === "no-rendezvous" && panelSocket && !panelSocket.networkPermission) {
+        socketProblem = "permission-disabled";
+      }
+
+      const socket = {
+        mode: transportState.mode,
+        pinnedPort: transportState.pinnedPort,
+        /** null means, and only means, that commands really are using the socket. */
+        problem: socketProblem,
+        hint: socketProblemHint(socketProblem, {
+          port: selectedReport?.port ?? panelSocket?.port ?? undefined,
+          pinnedPort: transportState.pinnedPort,
+        }),
+        selectedPort: selected?.port ?? null,
+        /** Straight from the panel; null for a bridge older than 1.12. */
+        panelReported: panelSocket,
+        allListeners,
+      };
 
       if (!parsed || parsed.pong !== true) {
         // Capability probe (not just a version-string check): the id-matcher only
@@ -3867,6 +4217,11 @@ server.tool(
                     ? "Reload the current panel: run `npm run install-bridge`, then FULLY quit and reopen After Effects, reopen Window > mcp-bridge-auto.jsx, and restart the MCP client. (The version string alone is unreliable - a stale panel can still report the right version.)"
                     : "Open After Effects and open the panel via Window > mcp-bridge-auto.jsx (keep it open). Ensure 'Allow Scripts to Write Files and Access Network' is enabled. Also confirm the AE_MCP_BRIDGE_DIR env var (if set) matches on both sides.",
                   expectedBridgeVersion: EXPECTED_BRIDGE_VERSION,
+                  bridgeFolder: getAETempDir(),
+                  // Even with no panel answering, the socket report is the most
+                  // useful thing here: "connection-refused on 47800" names the
+                  // cause that the bare timeout above never could.
+                  socket,
                   raw,
                 },
                 null,
@@ -3896,6 +4251,11 @@ server.tool(
                 bridgeFolder: parsed.bridgeFolder,
                 project: parsed.project,
                 activeComp: parsed.activeComp,
+                // Which transport this very health check travelled over, stamped
+                // by the panel itself. null from a bridge older than 1.12.
+                transportInUse: typeof parsed._transport === "string" ? parsed._transport : null,
+                pingMs,
+                socket,
               },
               null,
               2,

@@ -3799,7 +3799,9 @@ function writeRendezvousFile(port, token) {
             bridgeVersion: BRIDGE_VERSION,
             aeVersion: app.version,
             boundAt: new Date().toISOString(),
-            project: (app.project && app.project.file) ? app.project.file.name : ""
+            // Same wording as the ping reply, so check-bridge shows one value
+            // whether it read this file or asked the panel directly.
+            project: (app.project && app.project.file) ? app.project.file.name : "Untitled Project"
         }));
         f.close();
         return true;
@@ -3834,6 +3836,10 @@ function stopSocketListener() {
     socketListener = null;
     socketPort = 0;
     socketToken = "";
+    // Leaving the previous status in place would make the panel (and the ping
+    // report check-bridge reads) claim "listening" after the listener is gone.
+    // Callers that stop in order to restart overwrite this immediately.
+    socketStatus = "stopped";
 }
 
 // The port the user pinned in the panel, or 0. Probe S10: app.settings round
@@ -6340,7 +6346,20 @@ function executeCommand(command, args) {
                     aeVersion: (app && app.version ? app.version : null),
                     bridgeFolder: getBridgeFolder().fsName,
                     project: (app.project && app.project.file ? app.project.file.name : "Untitled Project"),
-                    activeComp: (app.project && app.project.activeItem instanceof CompItem ? app.project.activeItem.name : null)
+                    activeComp: (app.project && app.project.activeItem instanceof CompItem ? app.project.activeItem.name : null),
+                    // Socket state, reported by the panel itself. check-bridge cannot
+                    // derive any of this from outside: an absent rendezvous file looks
+                    // IDENTICAL whether the network permission is off, the Socket
+                    // checkbox is unchecked, every port in the scan range was taken, or
+                    // the panel simply predates 1.12. Publishing it here is what turns
+                    // one indistinguishable symptom into distinct, actionable causes.
+                    // The permission is re-read live rather than reusing socketPermission
+                    // because that variable is only refreshed when a bind is attempted.
+                    socketListening: !!socketListener,
+                    socketPort: socketPort,
+                    socketStatus: socketStatus,
+                    networkPermission: isNetworkPermissionEnabled(),
+                    fileTransportEnabled: fileTransportEnabled
                 });
                 break;
             default:
@@ -6800,6 +6819,7 @@ socketCheckbox.onClick = function() {
         }
     } else {
         stopSocketListener();
+        socketStatus = "disabled in the panel";
         logToPanel("Socket transport disabled; using the file transport only.");
     }
     startCommandChecker();
