@@ -232,6 +232,40 @@ export function isAckLine(line: string, commandId?: string): boolean {
   return true;
 }
 
+/**
+ * What the panel may send BEFORE it dispatches a command: either the ACK, or a
+ * refusal. Both are terminal for the pre-dispatch phase, and both prove nothing
+ * executed, which is what makes the file fallback safe from here.
+ */
+export type ControlLine = { kind: "ack" } | { kind: "reject"; reason: string } | { kind: "other" };
+
+/**
+ * Classify the first line the peer sends back.
+ *
+ * A refusal is `{"_ack":0,"error":"<reason>"}`, where the reason is one of
+ * `unauthorized` (token mismatch), `bad-request` (unparseable command line) or
+ * `protocol-mismatch` (unsupported `v`). Anything else, including an ACK
+ * carrying somebody else's command id, is `other`: whatever is on that port is
+ * not our bridge, and the caller should stop talking to it.
+ */
+export function classifyControlLine(line: string, commandId: string): ControlLine {
+  let parsed: any;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return { kind: "other" };
+  }
+  if (!parsed || typeof parsed !== "object") return { kind: "other" };
+  if (parsed._ack === 1) {
+    return parsed.commandId === commandId ? { kind: "ack" } : { kind: "other" };
+  }
+  if (parsed._ack === 0) {
+    const reason = typeof parsed.error === "string" && parsed.error ? parsed.error : "rejected";
+    return { kind: "reject", reason };
+  }
+  return { kind: "other" };
+}
+
 /** Incremental NDJSON reader over raw TCP chunks. */
 export interface FrameReader {
   /** Feed one chunk; returns every complete line it completed, in order. */
