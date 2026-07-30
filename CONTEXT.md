@@ -1539,3 +1539,67 @@ file is the only workable design.
 **Cleanup** verified: the listener closes and port 47800 is immediately
 rebindable, so the probe leaves no zombie socket. The probe also registers an
 abort handler that releases the listener if a step throws.
+
+## SPEC: bridge panel Transport UI — IMPLEMENTED and verified 2026-07-30
+
+Redesigned the mcp-bridge-auto.jsx panel to surface the socket transport added
+in C4/C5: a "Transport" group showing live socket/permission/file-fallback
+status, per-transport command counters, last-command latency, error/reject
+counts, a Port field with Apply and Restart listener, per-transport enable
+checkboxes, and a Copy Diagnostics modal (ScriptUI has no clipboard API, so
+this is a non-readonly edittext the user selects and copies manually).
+
+Two bugs found only by live use of the finished UI, both fixed here:
+
+**Copy Diagnostics was permanently disabled.** `bridgeTick`'s `finally` block
+called `updateTransportPanel()` (which sets `copyDiagButton.enabled =
+!isChecking`) BEFORE resetting `isChecking = false`, so the button always read
+`isChecking === true` and never re-enabled. Fixed by resetting `isChecking`
+first, then refreshing the panel.
+
+**Socket latency regressed from ~88ms to ~140ms average** after the panel
+redesign landed, confirmed by manual-tests/transport-select-test.mjs and
+isolated with a raw-socket phase breakdown (manual-tests/_lat.mjs, not
+committed - connect/ack/exec broken out separately). The breakdown showed
+`exec` staying at ~1ms (command execution itself was never the cost) while
+`ack` carried the entire regression, which said the delay was in AE noticing
+the pending connection, not in running the command.
+
+Two contributing causes, both real, in order of what was tried:
+
+1. `updateTransportPanel()` rewrote five ScriptUI widgets on every 50ms tick
+   (20x/second) regardless of whether anything changed. Fixed with a 250ms
+   throttle (`updateTransportPanelIfDue`) and per-field change checks so a
+   widget is only touched when its text actually differs. This alone did not
+   fix the regression (avg stayed ~140-145ms), but is still correct: UI writes
+   are idle-time work, not per-command work, so this landed anyway. Also
+   deferred both `updateTransportPanelIfDue()` and `flushLogIfDue()` to only
+   run on a tick that served NO command (`servedWork` guard in `bridgeTick`),
+   since a redraw sandwiched between two back-to-back commands measures as
+   command latency even though it did no useful work for that command.
+
+2. **The real cause, confirmed by a direct A/B measurement: After Effects
+   throttles `app.scheduleTask` when its window is not focused.** With the AE
+   window unfocused, raw `ack` time (time from TCP connect to the panel's ACK
+   line) averaged ~140ms against a requested 50ms tick. With the AE window
+   focused, the SAME probe against the SAME running panel averaged ~44-46ms -
+   right at the requested tick rate. Six consecutive samples in each state,
+   no code changed between them; only window focus changed. This is a platform
+   behavior of After Effects' idle-task scheduler, not a bug in this bridge,
+   and nothing in mcp-bridge-auto.jsx can reduce it further: `scheduleTask`
+   is the only repeating-execution primitive ExtendScript offers.
+
+   Practical consequence: socket latency is ~45-50ms with AE focused and
+   ~140ms with AE backgrounded. Both are still faster than the file
+   transport's 250-367ms measured under the same unfocused condition in the
+   same test run, so backgrounding AE does not erase the benefit of the
+   socket transport, it just reduces the win from roughly 5-8x to roughly
+   2-3x. This is worth a one-line mention in user-facing docs (C8) so nobody
+   files "socket transport is slower than expected" as a bug when AE is
+   simply not the focused window.
+
+Verified live against After Effects 26.0x67: `manual-tests/socket-smoke-test.mjs`
+(protocol-level, unchanged by this UI work) and `manual-tests/transport-select-test.mjs`
+(server-level) both pass; 249 automated tests pass; `npm run typecheck` and
+`npx eslint src tests` are clean (one expected warning: `lastBridgeResult` in
+`src/index.ts` is written in C5 but not read until C7 wires up `get-results`).

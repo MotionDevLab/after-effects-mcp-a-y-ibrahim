@@ -3542,15 +3542,71 @@ panel.spacing = 10;
 panel.margins = 16;
 var statusText = panel.add("statictext", undefined, "Waiting for commands...");
 statusText.alignment = ["fill", "top"];
+// (Dockable panels DO work on AE 2025/2026 with the correct ScriptUI pattern below,
+// so the old "floating window only" warning was removed.)
+
+// --- Transport panel: status lines + controls, all in one group so a narrow
+// dock wraps rows instead of clipping them (each row is its own "row" group). ---
+var transportPanel = panel.add("panel", undefined, "Transport");
+transportPanel.orientation = "column";
+transportPanel.alignChildren = ["fill", "top"];
+transportPanel.spacing = 6;
+transportPanel.margins = 10;
+
+var transportSocketText = transportPanel.add("statictext", undefined, "Socket: starting...");
+transportSocketText.alignment = ["fill", "top"];
+var transportPermissionText = transportPanel.add("statictext", undefined, "Permission: checking...");
+transportPermissionText.alignment = ["fill", "top"];
+var transportFileText = transportPanel.add("statictext", undefined, "File fallback: ON");
+transportFileText.alignment = ["fill", "top"];
+var transportStatsText = transportPanel.add("statictext", undefined, "0 socket / 0 file");
+transportStatsText.alignment = ["fill", "top"];
+var transportErrText = transportPanel.add("statictext", undefined, "errors 0 | rejected 0");
+transportErrText.alignment = ["fill", "top"];
+
+var portRow = transportPanel.add("group");
+portRow.orientation = "row";
+portRow.alignChildren = ["left", "center"];
+portRow.add("statictext", undefined, "Port:");
+var portField = portRow.add("edittext", undefined, String(SOCKET_PORT_BASE));
+portField.characters = 6;
+var applyPortButton = portRow.add("button", undefined, "Apply");
+var restartListenerButton = portRow.add("button", undefined, "Restart listener");
+
+// Error placement: shown immediately below the field it concerns rather than
+// only in the log at the bottom, which is easy to miss. Empty when there is
+// nothing wrong; never removed from the layout (that would reflow every other
+// row each time it toggled).
+var portErrorText = transportPanel.add("statictext", undefined, "");
+portErrorText.alignment = ["fill", "top"];
+
+var checkboxRow = transportPanel.add("group");
+checkboxRow.orientation = "row";
+checkboxRow.alignChildren = ["left", "center"];
+var autoRunCheckbox = checkboxRow.add("checkbox", undefined, "Auto-run commands");
+autoRunCheckbox.value = true;
+var socketCheckbox = checkboxRow.add("checkbox", undefined, "Socket");
+socketCheckbox.value = true;
+var fileCheckbox = checkboxRow.add("checkbox", undefined, "File");
+fileCheckbox.value = true;
+
+var buttonRow = transportPanel.add("group");
+buttonRow.orientation = "row";
+buttonRow.alignChildren = ["left", "center"];
+var checkButton = buttonRow.add("button", undefined, "Check now");
+var copyDiagButton = buttonRow.add("button", undefined, "Copy diagnostics");
+var clearLogButton = buttonRow.add("button", undefined, "Clear log");
+
+var verboseCheckbox = transportPanel.add("checkbox", undefined, "Verbose log");
+verboseCheckbox.value = false;
+
 var logPanel = panel.add("panel", undefined, "Command Log");
 logPanel.orientation = "column";
 logPanel.alignChildren = ["fill", "fill"];
 var logText = logPanel.add("edittext", undefined, "", {multiline: true, readonly: true});
-logText.preferredSize.height = 200;
-// (Dockable panels DO work on AE 2025/2026 with the correct ScriptUI pattern below,
-// so the old "floating window only" warning was removed.)
-var autoRunCheckbox = panel.add("checkbox", undefined, "Auto-run commands");
-autoRunCheckbox.value = true;
+// Reduced from 200 to pay for the Transport controls above without growing
+// the panel's default height.
+logText.preferredSize.height = 160;
 // How often the panel checks for a new command, in ms. Lowered from 500 to 250
 // to halve per-command latency; the per-check work is tiny (a file existence
 // check), so the CPU cost is negligible and rendering quality is unaffected.
@@ -3591,6 +3647,33 @@ var socketCommandCount = 0;
 var fileCommandCount = 0;
 var socketRejectCount = 0;
 var socketErrorCount = 0;
+var lastCommandName = "";
+var lastCommandMs = 0;
+// Unlike AE_MCP_BRIDGE_TRANSPORT on the Node side, the panel's Socket checkbox
+// is a runtime toggle: unchecking it actually closes the listener and removes
+// the rendezvous file (see its onClick below), so Node sees an instant refusal
+// rather than sitting out an ACK timeout against a socket nobody is servicing.
+// socketListener's presence IS that state; there is no separate flag. The File
+// checkbox has no listener to close, so it is a plain gate read in bridgeTick.
+var fileTransportEnabled = true;
+
+// --- log ring buffer ---------------------------------------------------
+// logToPanel used to prepend onto the FULL accumulated text on every call, so
+// its cost grew without bound over a long session (O(n) per call across
+// however many thousand lines had ever been logged). A fixed-size ring buffer
+// plus a throttled flush bounds both the memory and the widget-redraw cost
+// regardless of session length or tick rate.
+var LOG_MAX_LINES = 200;
+var LOG_FLUSH_MS = 200;
+var logLines = []; // newest first
+var logDirty = false;
+var lastLogFlushAt = 0;
+// Repainting the Transport status lines is throttled for the same reason the
+// log is: at TICK_MS=50 an unthrottled refresh rewrites five ScriptUI widgets
+// 20 times a second, which measurably slowed command round trips (141ms vs
+// 88ms average). Nothing here changes faster than a human can read anyway.
+var PANEL_UPDATE_MS = 250;
+var lastPanelUpdateAt = 0;
 // Dedup key for the last command we acted on. We deduplicate by the server-issued
 // commandId instead of mutating a "status" field inside the shared command file:
 // the Node server also writes that file, so an AE-side read-modify-write would race
@@ -5798,7 +5881,8 @@ function startRender(args) {
 
 function executeCommand(command, args) {
     var result = "";
-    
+    var __cmdStartMs = (new Date()).getTime();
+
     logToPanel("Executing command: " + command);
     statusText.text = "Running: " + command;
     // panel.update() exists only on a floating Window, NOT on a dockable Panel
@@ -5832,7 +5916,9 @@ function executeCommand(command, args) {
     var dialogsSuppressed = false;
     try { app.beginSuppressDialogs(); dialogsSuppressed = true; } catch (sdErr) {}
     try {
-        logToPanel("Attempting to execute: " + command); // Log before switch
+        // Near-duplicate of the "Executing command" line above; only worth
+        // keeping when the user has asked for step-by-step detail.
+        logToPanel("Attempting to execute: " + command, true); // Log before switch
         if (useUndoGroup) { app.beginUndoGroup("MCP: " + command); }
         try {
         switch (command) {
@@ -6266,8 +6352,8 @@ function executeCommand(command, args) {
         // Pair with beginSuppressDialogs above. Pass false so AE does NOT replay any
         // suppressed alert (replaying would re-pop the very modal we are avoiding).
         if (dialogsSuppressed) { try { app.endSuppressDialogs(false); dialogsSuppressed = false; } catch (esd) {} }
-        logToPanel("Execution finished for: " + command); // Log after switch
-        logToPanel("Preparing to write result file...");
+        logToPanel("Execution finished for: " + command, true); // Log after switch
+        logToPanel("Preparing to write result file...", true);
         var resultString = (typeof result === 'string') ? result : JSON.stringify(result);
         try {
             var resultObj = JSON.parse(resultString);
@@ -6276,7 +6362,7 @@ function executeCommand(command, args) {
             resultObj._commandId = currentCommandId;
             resultObj._transport = currentTransport;
             resultString = JSON.stringify(resultObj, null, 2);
-            logToPanel("Added timestamp to result JSON for tracking freshness.");
+            logToPanel("Added timestamp to result JSON for tracking freshness.", true);
         } catch (parseError) {
             // Handler returned a non-JSON string. Wrap it in a JSON envelope that
             // still carries the tracking fields, otherwise the server can neither
@@ -6294,7 +6380,9 @@ function executeCommand(command, args) {
 
         emitResult(resultString);
 
-        logToPanel("Command completed successfully: " + command);
+        lastCommandName = command;
+        lastCommandMs = (new Date()).getTime() - __cmdStartMs;
+        logToPanel("Command completed successfully: " + command + " (" + lastCommandMs + " ms)");
         statusText.text = "Command completed: " + command;
         // The freshly written result file (carrying _commandId) is the signal the
         // server waits on; we deliberately do NOT write a status back into the
@@ -6305,13 +6393,15 @@ function executeCommand(command, args) {
         // would otherwise leave dialogs suppressed for later commands). Idempotent via
         // the dialogsSuppressed flag, so it is a safe no-op if already cleared.
         if (dialogsSuppressed) { try { app.endSuppressDialogs(false); dialogsSuppressed = false; } catch (esd2) {} }
+        lastCommandName = command;
+        lastCommandMs = (new Date()).getTime() - __cmdStartMs;
         var errorMsg = "ERROR in executeCommand for '" + command + "': " + error.toString() + (error.line ? " (line: " + error.line + ")" : "");
         logToPanel(errorMsg);
         statusText.text = "Error: " + error.toString();
-        
-        
+
+
         try {
-            logToPanel("Attempting to write ERROR to result file...");
+            logToPanel("Attempting to write ERROR to result file...", true);
             var errorResult = JSON.stringify({
                 status: "error",
                 command: command,
@@ -6338,9 +6428,44 @@ function executeCommand(command, args) {
 }
 
 
-function logToPanel(message) {
+/*
+ * Append one line to the ring buffer. Never touches the widget directly (see
+ * flushLogIfDue) so the per-call cost stays O(1) regardless of how long the
+ * panel has been open.
+ *
+ * `isChatter`, when true, marks a line as step-by-step detail rather than a
+ * state change or error: it is dropped entirely unless the Verbose log
+ * checkbox is on. This is an OPTIONAL second parameter so every pre-existing
+ * 1-argument logToPanel(msg) call site (across the rest of this file) keeps
+ * working with zero edits and stays visible by default. Only the handful of
+ * per-command file-write step lines this same change already touches are
+ * tagged; the switch statement's own per-handler logging is untouched.
+ */
+function logToPanel(message, isChatter) {
+    if (isChatter) {
+        var verboseOn = false;
+        try { verboseOn = !!(verboseCheckbox && verboseCheckbox.value); } catch (e) {}
+        if (!verboseOn) { return; }
+    }
     var timestamp = new Date().toLocaleTimeString();
-    logText.text = timestamp + ": " + message + "\n" + logText.text;
+    logLines.unshift(timestamp + ": " + message);
+    if (logLines.length > LOG_MAX_LINES) { logLines.length = LOG_MAX_LINES; }
+    logDirty = true;
+}
+
+/** Apply the ring buffer to the widget, ignoring the throttle window. */
+function forceFlushLog() {
+    try { logText.text = logLines.join("\n"); } catch (e) { return; }
+    logDirty = false;
+    lastLogFlushAt = (new Date()).getTime();
+}
+
+/** Apply the ring buffer to the widget, but only if LOG_FLUSH_MS has elapsed. */
+function flushLogIfDue() {
+    if (!logDirty) return;
+    var now = (new Date()).getTime();
+    if ((now - lastLogFlushAt) < LOG_FLUSH_MS) return;
+    forceFlushLog();
 }
 
 /*
@@ -6374,23 +6499,23 @@ function emitResult(resultString) {
     }
     var resultFile = new File(getResultFilePath());
     resultFile.encoding = "UTF-8";
-    logToPanel("Opening result file for writing...");
+    logToPanel("Opening result file for writing...", true);
     var opened = resultFile.open("w");
     if (!opened) {
         logToPanel("ERROR: Failed to open result file for writing: " + resultFile.fsName);
         throw new Error("Failed to open result file for writing.");
     }
-    logToPanel("Writing to result file...");
+    logToPanel("Writing to result file...", true);
     var written = resultFile.write(resultString);
     if (!written) {
         logToPanel("ERROR: Failed to write to result file (write returned false): " + resultFile.fsName);
     }
-    logToPanel("Closing result file...");
+    logToPanel("Closing result file...", true);
     var closed = resultFile.close();
     if (!closed) {
         logToPanel("ERROR: Failed to close result file: " + resultFile.fsName);
     }
-    logToPanel("Result file write process complete.");
+    logToPanel("Result file write process complete.", true);
 }
 
 
@@ -6415,24 +6540,40 @@ function bridgeTick() {
     if (!autoOn || isChecking) return;
 
     isChecking = true;
+    var servedWork = false;
     try {
         tickCount++;
         if (socketListener) {
             // Probe S5: one poll is not enough. poll() can hand back null while
             // another connection is still queued, so a burst needs several.
             for (var i = 0; i < SOCKET_POLLS_PER_TICK; i++) {
-                serviceSocketOnce();
+                if (serviceSocketOnce()) { servedWork = true; }
             }
         }
         // Keep the file poll on its original 250ms cadence rather than 50ms:
         // the socket is the fast path now, and this costs exactly what it did before.
-        if ((tickCount % FILE_CHECK_EVERY) === 0) {
+        if (fileTransportEnabled && (tickCount % FILE_CHECK_EVERY) === 0) {
             checkForCommands();
         }
     } catch (tickError) {
         try { logToPanel("Bridge tick error: " + tickError.toString()); } catch (e3) {}
     } finally {
+        // Reset BEFORE refreshing the panel: updateTransportPanel() reads
+        // isChecking to decide whether Copy Diagnostics should be enabled, so
+        // reading it first would leave that button permanently disabled.
         isChecking = false;
+        /*
+         * UI work is IDLE work. Writing a ScriptUI widget is slow enough to
+         * stretch the tick, and a tick that just served a command is very
+         * likely to be followed immediately by another one, so repainting here
+         * lands squarely between two back-to-back commands and shows up as
+         * per-command latency. Deferring to the next idle tick costs at most
+         * TICK_MS of staleness on a display nobody reads that fast.
+         */
+        if (!servedWork) {
+            try { updateTransportPanelIfDue(); } catch (e4) {}
+            try { flushLogIfDue(); } catch (e5) {}
+        }
     }
 }
 
@@ -6539,10 +6680,170 @@ function startCommandChecker() {
 }
 
 
-var checkButton = panel.add("button", undefined, "Check for Commands Now");
+/*
+ * Refresh every Transport status line from current state. Called after every
+ * button/checkbox action (so feedback is immediate) and once per tick from
+ * bridgeTick's finally (so background changes, like a command completing,
+ * still show up without the user touching anything).
+ */
+function updateTransportPanel() {
+    try {
+        // Assign only when the text actually differs. A redundant ScriptUI
+        // widget write still costs a repaint, and most ticks change nothing.
+        var socketLine = socketListener
+            ? "Socket:        LISTENING  127.0.0.1:" + socketPort
+            : "Socket:        OFF (" + socketStatus + ")";
+        if (transportSocketText.text !== socketLine) { transportSocketText.text = socketLine; }
+
+        var permLine = "Permission:    " + (socketPermission ? "ENABLED" : "DISABLED");
+        if (transportPermissionText.text !== permLine) { transportPermissionText.text = permLine; }
+
+        var fileLine = "File fallback: " + (fileTransportEnabled ? "ON " : "OFF ") + getBridgeFolder().fsName;
+        if (transportFileText.text !== fileLine) { transportFileText.text = fileLine; }
+
+        var statsLine = socketCommandCount + " socket / " + fileCommandCount + " file" +
+            (lastCommandName ? "  |  last " + lastCommandName + " " + lastCommandMs + " ms" : "");
+        if (transportStatsText.text !== statsLine) { transportStatsText.text = statsLine; }
+
+        var errLine = "errors " + socketErrorCount + " | rejected " + socketRejectCount;
+        if (transportErrText.text !== errLine) { transportErrText.text = errLine; }
+
+        // The diagnostics modal reads the same globals a running command is
+        // mutating, so it stays disabled until the tick settles.
+        var canCopy = !isChecking;
+        if (copyDiagButton.enabled !== canCopy) { copyDiagButton.enabled = canCopy; }
+    } catch (e) {
+        /* widgets are gone if the panel was closed since the last tick */
+    }
+}
+
+/** Refresh the Transport panel, but only if PANEL_UPDATE_MS has elapsed. */
+function updateTransportPanelIfDue() {
+    var now = (new Date()).getTime();
+    if ((now - lastPanelUpdateAt) < PANEL_UPDATE_MS) return;
+    lastPanelUpdateAt = now;
+    updateTransportPanel();
+}
+
+/** Plain text for the "Copy diagnostics" modal (ScriptUI has no clipboard API). */
+function buildDiagnosticsText() {
+    var lines = [];
+    lines.push("AE MCP Bridge diagnostics");
+    lines.push("bridgeVersion: " + BRIDGE_VERSION);
+    lines.push("aeVersion: " + app.version);
+    lines.push("bridgeFolder: " + getBridgeFolder().fsName);
+    lines.push("");
+    lines.push(socketListener
+        ? "socket: LISTENING 127.0.0.1:" + socketPort
+        : "socket: OFF (" + socketStatus + ")");
+    lines.push("permission: " + (socketPermission ? "ENABLED" : "DISABLED"));
+    lines.push("fileFallback: " + (fileTransportEnabled ? "ON" : "OFF"));
+    lines.push("commandsServed: " + socketCommandCount + " socket, " + fileCommandCount + " file");
+    lines.push("errors: " + socketErrorCount + "  rejected: " + socketRejectCount);
+    lines.push("lastCommand: " + (lastCommandName || "(none yet)") + (lastCommandName ? " (" + lastCommandMs + " ms)" : ""));
+    lines.push("autoRun: " + (autoRunCheckbox.value ? "ON" : "OFF"));
+    return lines.join("\n");
+}
+
+applyPortButton.onClick = function() {
+    var raw = (portField.text || "").replace(/^\s+|\s+$/g, "");
+    var newPort = parseInt(raw, 10);
+    if (!raw.length || isNaN(newPort) || newPort < 1 || newPort > 65535 || String(newPort) !== raw) {
+        portErrorText.text = "Port must be a whole number between 1 and 65535.";
+        return;
+    }
+    portErrorText.text = "";
+    try { app.settings.saveSetting("MCPBridge", "port", String(newPort)); } catch (e) {}
+    stopSocketListener();
+    if (startSocketListener(newPort)) {
+        socketCheckbox.value = true;
+        logToPanel("Port set to " + socketPort + "; listener restarted.");
+    } else {
+        portErrorText.text = "Could not bind port " + newPort + " (" + socketStatus + ").";
+        logToPanel("Could not bind port " + newPort + " (" + socketStatus + ").");
+    }
+    startCommandChecker();
+    updateTransportPanel();
+    forceFlushLog();
+};
+
+restartListenerButton.onClick = function() {
+    var preferred = socketPort || getPreferredSocketPort();
+    stopSocketListener();
+    if (startSocketListener(preferred)) {
+        socketCheckbox.value = true;
+        logToPanel("Listener restarted on port " + socketPort + ".");
+    } else {
+        logToPanel("Restart failed (" + socketStatus + ").");
+    }
+    startCommandChecker();
+    updateTransportPanel();
+    forceFlushLog();
+};
+
+socketCheckbox.onClick = function() {
+    // Guard against silently cutting off the bridge entirely: if the file
+    // transport is also off, refuse and say why rather than leave the user
+    // with no visible way for any command to ever reach AE.
+    if (!socketCheckbox.value && !fileTransportEnabled) {
+        socketCheckbox.value = true;
+        logToPanel("Cannot disable Socket while File is disabled: at least one transport must stay enabled.");
+        forceFlushLog();
+        return;
+    }
+    if (socketCheckbox.value) {
+        if (startSocketListener(getPreferredSocketPort())) {
+            logToPanel("Socket transport enabled on port " + socketPort + ".");
+        } else {
+            logToPanel("Could not enable the socket transport (" + socketStatus + ").");
+            socketCheckbox.value = false;
+        }
+    } else {
+        stopSocketListener();
+        logToPanel("Socket transport disabled; using the file transport only.");
+    }
+    startCommandChecker();
+    updateTransportPanel();
+    forceFlushLog();
+};
+
+fileCheckbox.onClick = function() {
+    if (!fileCheckbox.value && !socketListener) {
+        fileCheckbox.value = true;
+        logToPanel("Cannot disable File while Socket is off: at least one transport must stay enabled.");
+        forceFlushLog();
+        return;
+    }
+    fileTransportEnabled = fileCheckbox.value;
+    logToPanel("File transport " + (fileTransportEnabled ? "enabled." : "disabled."));
+    updateTransportPanel();
+    forceFlushLog();
+};
+
 checkButton.onClick = function() {
     logToPanel("Manually checking for commands");
     checkForCommands();
+    updateTransportPanel();
+    forceFlushLog();
+};
+
+copyDiagButton.onClick = function() {
+    if (isChecking) return; // also enforced via .enabled in updateTransportPanel
+    var diagWin = new Window("dialog", "Bridge Diagnostics");
+    diagWin.orientation = "column";
+    diagWin.alignChildren = ["fill", "fill"];
+    // Not readonly: ScriptUI has no clipboard API, so select-all + Ctrl/Cmd-C
+    // inside a plain edittext is the only copy path available.
+    var diagText = diagWin.add("edittext", undefined, buildDiagnosticsText(), { multiline: true, scrolling: true });
+    diagText.preferredSize = [480, 300];
+    var closeButton = diagWin.add("button", undefined, "Close");
+    closeButton.onClick = function() { diagWin.close(); };
+    diagWin.show();
+};
+
+clearLogButton.onClick = function() {
+    logLines = [];
+    forceFlushLog();
 };
 
 
@@ -6555,12 +6856,20 @@ initLastProcessedCommand();
 // Bind BEFORE scheduling, so startCommandChecker knows which tick rate to use.
 // A failure here is not fatal: the file transport keeps working exactly as it
 // did before, which is the whole point of keeping it.
-if (startSocketListener(getPreferredSocketPort())) {
+var initialPort = getPreferredSocketPort();
+portField.text = String(initialPort || SOCKET_PORT_BASE);
+if (startSocketListener(initialPort)) {
     logToPanel("Socket transport listening on port " + socketPort);
+    socketCheckbox.value = true;
+    portField.text = String(socketPort);
 } else {
     logToPanel("Socket transport unavailable (" + socketStatus + "); using the file transport.");
+    socketCheckbox.value = false;
 }
+fileCheckbox.value = fileTransportEnabled;
 startCommandChecker();
+updateTransportPanel();
+forceFlushLog();
 
 
 if (panel instanceof Window) {
@@ -6572,9 +6881,10 @@ if (panel instanceof Window) {
     // Docked Panel path (Window > mcp-bridge-auto.jsx) - never call .show()/.center().
     panel.layout.layout(true);
     // Give the layout a shrink floor so a narrow dock doesn't collapse to "blank"
-    // (logText has a fixed 200px height; a docked panel won't auto-size to content).
+    // (logText has a fixed height; a docked panel won't auto-size to content).
+    // Raised from [220,160] to [240,300] to fit the Transport panel's controls.
     if (panel.children && panel.children.length) {
-        panel.minimumSize = [220, 160];
+        panel.minimumSize = [240, 300];
     }
     panel.layout.resize();
     panel.onResizing = panel.onResize = function () { this.layout.resize(); };
