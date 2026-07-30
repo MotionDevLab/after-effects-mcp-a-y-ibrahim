@@ -1427,3 +1427,115 @@ coordinate-space finding (P6), the curve genuinely curving (P3), and the
 fill-required finding (P10) - screenshots inspected directly during
 development. Real project ("Comp 1", 3 layers) reopened and confirmed
 unchanged at the end of both the probe and the full test run.
+
+## SPEC: socket bridge transport, Phase 0 probe — MEASURED and verified 2026-07-30
+
+Feasibility probe for replacing the file-polling bridge with a TCP socket
+transport. Run with `node manual-tests/socket-probe.mjs` against live After
+Effects 26.0x67 on Windows 11 with the MCP Bridge Auto panel open. All twelve
+questions answered, all assertions passing. These are measurements, not
+assumptions, and the ones that contradict the plan are called out.
+
+`docs/ARCHITECTURE.md:7-9` claims ExtendScript "cannot open a socket". That is
+false and must be corrected: the Socket object exists and does everything the
+transport needs.
+
+**S1 Socket exists.** `typeof Socket === "function"`, constructs without
+throwing. Default `encoding` is **"ASCII"** (the plan guessed BINARY) and
+default `timeout` is 10 seconds. `for (var k in s)` enumerates NOTHING, so the
+object's members are not introspectable. There is no `localPort` member, which
+is what kills ephemeral ports (see S12).
+
+**S2 listen() works, and its encoding argument is a trap.** `listen(47800)`
+returns true and leaves `encoding` set to **"UTF-8"**. But `listen(port,
+"UTF-8")` also returns true and leaves `encoding` at **"ASCII"** — passing the
+encoding argument does the opposite of what it looks like. Never use the 2-arg
+form; set `conn.encoding = "UTF-8"` explicitly on each accepted connection.
+
+**S3 HARD GATE, BAD RESULT: listen() binds a WILDCARD address.** netstat shows
+`0.0.0.0:47800` and `[::]:47800` LISTENING. `listen()` takes no interface
+argument, so this is not configurable. A TCP connect to this machine's own
+non-loopback address (Wi-Fi, 10.112.95.27) also succeeded. Caveat on that
+second signal: Windows loops traffic to a local IP internally, so a same-host
+connect does not prove a REMOTE host can reach the port — that depends on the
+host firewall. The bind itself is unambiguous from netstat regardless.
+
+Consequence: the bridge exposes unbounded `eval` (mcp-bridge-auto.jsx:5383) and
+`startRender` on an all-interfaces port. The token is therefore MANDATORY, not
+optional, and SECURITY.md must document the residual exposure and recommend an
+inbound block rule for 47800-47815.
+
+**S4 The peer address is NOT readable.** `conn.host` on an accepted connection
+is the empty string (`"host" in conn` is true, the value is useless). AE cannot
+reject non-loopback peers itself, which removes the mitigation the plan hoped
+for and leaves the token as the only barrier. Since ExtendScript has no CSPRNG,
+be honest in SECURITY.md: the token restores parity with the file transport
+(any local process running as the user can already write `ae_command.json`) and
+claims nothing more.
+
+**S5 HARD GATE PASSED: poll() is non-blocking.** 20 consecutive polls take
+0-1ms total, 0.05ms each. An idle poll returns exactly `null`. The 50ms tick is
+safe.
+
+Two related findings that cost real debugging time and will bite the panel:
+
+- **poll() can return null while another connection is still queued.** The poll
+  map over 20 calls read `c.c.................` with two pending connections
+  separated by an idle poll. A "drain until null" loop therefore does NOT empty
+  the backlog. The panel's tick must not treat one null as proof there is no
+  pending work; poll a bounded few times per tick, and any drain needs several
+  consecutive idle polls.
+- **A connection nobody accepts stays in the backlog indefinitely.** Probe
+  connections that connected and hung up were still sitting there several steps
+  later, with `connected=true` and `eof=true`.
+
+**S6 readln() returns a full 256KB line** in 3ms, no truncation. No chunked
+read is needed on the AE side.
+
+**S7 Chunked writes are fast; large strings are the real hazard.** 1MB written
+as 32 x 32KB chunks took 5-6ms and every byte arrived (1048577 received).
+`write()` returns the byte count it took (32768 for a 32KB block).
+
+The first version of this probe built a 4MB string in ExtendScript by doubling
+and handed it to a single `conn.write()`. That froze After Effects hard enough
+to require a force quit. The freeze is in string construction plus one huge
+write, not in the socket. Keep the 32KB chunked `writeSocketLine` loop, and
+never build a multi-megabyte string in ExtendScript.
+
+**S8 Use the 2-arg getPrefAsLong, and do NOT gate on havePref.**
+`getPrefAsLong("Main Pref Section", "Pref_SCRIPTING_FILE_NETWORK_SECURITY")`
+returns 1 when the permission is enabled. The 3-arg
+`PREF_Type_MACHINE_INDEPENDENT` form THROWS ("could not be found in the
+preferences"). `"Main Pref Section v2"` also returns 1. `havePref(...)` returns
+**false** even though the 2-arg read works, so a havePref guard would wrongly
+conclude the permission is absent.
+
+**S9 A second listen() on a bound port returns false**, it does not throw
+(`socket.error` reads "I/O error"). A falsy check is enough for the port scan;
+keep the try/catch anyway.
+
+**S10 app.settings round-trips, $.getenv does not see the client's env.**
+`saveSetting("MCPBridge","port","47899")` reads back exactly, so the in-panel
+Port field can persist without a file. All three of `AE_MCP_BRIDGE_PORT`,
+`AE_MCP_BRIDGE_TRANSPORT` and `AE_MCP_BRIDGE_DIR` read back **null** inside AE,
+because After Effects is not launched from the MCP client's environment. This
+independently confirms the plan's decision: port rendezvous MUST be a file, an
+env var shared by both sides cannot work.
+
+**S11 HARD GATE PASSED: connections survive a blocking command.** After a
+6043ms hard `$.sleep` with zero yielding (strictly harsher than `rq.render()`,
+which may pump internally), a connection made ~1.2s into the block was still in
+the accept backlog, its buffered command line was intact ("DURING_BLOCK"), the
+reply reached the client, and the listener was still usable. The plan's
+blocking-command design holds: during a long render no socket call is in
+progress, so per-operation timeouts are correct and the only trap is Node's
+idle-based `socket.setTimeout`.
+
+**S12 Ephemeral ports are not viable.** `listen(0)` returns true, but there is
+no `localPort` member and `host` is empty, so AE can never learn which port it
+got. Deterministic base 47800 plus a 16-port scan plus a published rendezvous
+file is the only workable design.
+
+**Cleanup** verified: the listener closes and port 47800 is immediately
+rebindable, so the probe leaves no zombie socket. The probe also registers an
+abort handler that releases the listener if a step throws.
