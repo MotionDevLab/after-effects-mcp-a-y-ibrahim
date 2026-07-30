@@ -239,12 +239,12 @@ with no audio involved at all.
   this tool's own data-series-specific logic (sorting, range auto-detection, point
   construction from `values`+`interval`).
 
-Current bridge protocol: `1.10.0-mcp-enhanced` (kept in sync between `BRIDGE_VERSION` in
+Current bridge protocol: `1.12.0-mcp-socket` (kept in sync between `BRIDGE_VERSION` in
 the `.jsx`, `EXPECTED_BRIDGE_VERSION` in `index.ts`, and the version quoted in both
 READMEs' "first test" section; `check-bridge` warns on a `BRIDGE_VERSION`/
 `EXPECTED_BRIDGE_VERSION` mismatch but the README copies aren't checked by anything -
 grep for the old version string across `README.md`/`README.ar.md`/`ENHANCEMENTS.md`
-when bumping it, this has gone stale twice already).
+when bumping it, this has gone stale three times now).
 
 ## Activate the changes (after pulling/building this fork)
 
@@ -282,9 +282,20 @@ Then:
   is a residual not defended against here.
 - Layer/comp targeting in the older tools is by **1-based index** (shifts when layers
   are reordered). Prefer `execute-script` with stable `layer.id` for fragile multi-step work.
-- The file-polling bridge has a real architectural ceiling (per-command latency, no
-  streaming). Replacing it with a socket/UXP panel would remove that ceiling but is a
-  large, risky rewrite - not attempted here.
+- **Done, no longer a limitation as of 1.12.0:** the bridge now prefers a TCP socket
+  transport (loopback, one connection per command) and falls back to the original
+  file-polling transport automatically whenever the socket is unavailable - an old
+  panel, the network permission disabled, or `AE_MCP_BRIDGE_TRANSPORT=file`. Socket
+  round-trip latency measured against live After Effects 26.0x67: ~45-50ms with the
+  AE window focused, ~140ms backgrounded (After Effects throttles its internal task
+  scheduler when unfocused, which is a platform behavior, not a bridge limitation -
+  see `CONTEXT.md`), both well under the file transport's 250-367ms measured the
+  same way. There is still no server-push streaming: each command is still one
+  request/response round trip, just no longer gated by a fixed poll interval. See
+  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and
+  [`SECURITY.md`](SECURITY.md) for the socket's residual exposure (it binds all
+  interfaces, not only loopback, because ExtendScript's `Socket.listen()` has no
+  interface argument).
 - `animate-to-audio`'s keyframe math (curve shaping, smoothing, peak detection ->
   keyframe timing) is unit-tested directly and was additionally exercised against a
   real ffmpeg-generated audio file end-to-end outside the test suite, but the

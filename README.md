@@ -69,7 +69,11 @@ claude mcp add AfterEffectsMCP node /absolute/path/to/after-effects-mcp/build/in
 ```
 
 **First test:** ask your client to _“check the After Effects bridge”_. It should report
-`bridgeVersion: 1.10.0-mcp-enhanced` and `versionMatch: true`.
+`bridgeVersion: 1.12.0-mcp-socket` and `versionMatch: true`. If it also reports
+`socket.problem: null`, the panel opened a real TCP listener and commands are
+running over it instead of the slower file-polling fallback - see
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how the two transports work
+and [`SECURITY.md`](SECURITY.md) for what the socket does and does not expose.
 
 > 💡 If you edit the server, re‑run `npm run build`, then restart the MCP client.
 > If you edit the bridge, also re‑run `npm run install-bridge` and restart After Effects.
