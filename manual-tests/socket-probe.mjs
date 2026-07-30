@@ -431,6 +431,28 @@ if (s3?.bindsWildcard) {
   failures++;
 }
 
+// S3's reachability probes connect and hang up without AE ever accepting them,
+// so they are left sitting in the OS accept backlog. Drain them, or the very
+// next poll() returns one and S5's "nothing pending" premise is false.
+await probe(
+  "drainAfterS3",
+  `
+var s = $.global.__probeListener;
+if (!s) { return { error: "no listener from S2" }; }
+// NOT "poll until null": poll() can return null while another connection is
+// still queued behind it, so a single null is not proof the backlog is empty.
+// Require several consecutive idle polls, with a short sleep between them.
+var drained = 0;
+var idleRun = 0;
+for (var i = 0; i < 60 && idleRun < 6; i++) {
+  var c = s.poll();
+  if (c) { drained++; idleRun = 0; try { c.close(); } catch (e) {} }
+  else { idleRun++; $.sleep(10); }
+}
+return { drained: drained, idleRun: idleRun };
+`,
+);
+
 // =====================================================================
 // S5 - HARD GATE: is poll() non-blocking with nothing pending?
 // =====================================================================
@@ -441,20 +463,62 @@ var out = {};
 var s = $.global.__probeListener;
 if (!s) { return { error: "no listener from S2" }; }
 var t0 = (new Date()).getTime();
-var results = [];
+var accepted = 0;
+var map = "";
+out.idleSeen = false;
 for (var i = 0; i < 20; i++) {
   var c = s.poll();
-  results.push(c === null ? "null" : "conn");
-  if (c) { try { c.close(); } catch (e) {} }
+  if (c) {
+    // A real pending connection. Record what it looks like so a stray one is
+    // distinguishable from a quirk of poll() itself.
+    map += "c";
+    if (accepted === 0) {
+      out.connTypeof = typeof c;
+      try { out.connConnected = c.connected; } catch (e1) {}
+      try { out.connEof = c.eof; } catch (e2) {}
+      try { out.connHost = c.host; } catch (e3) {}
+    }
+    accepted++;
+    try { c.close(); } catch (e4) {}
+  } else {
+    // What an IDLE poll actually hands back. The panel's tick depends on this,
+    // and a strict "!== null" check would be wrong if it is undefined.
+    map += ".";
+    if (!out.idleSeen) {
+      out.idleSeen = true;
+      out.idleTypeof = typeof c;
+      out.idleIsNull = (c === null);
+      out.idleIsUndefined = (c === undefined);
+    }
+  }
 }
+out.pollMap = map;
 out.elapsedMsFor20Polls = (new Date()).getTime() - t0;
-out.allNull = true;
-for (var j = 0; j < results.length; j++) { if (results[j] !== "null") out.allNull = false; }
+out.acceptedWhileIdle = accepted;
+out.allNull = (accepted === 0);
 out.perPollMs = out.elapsedMsFor20Polls / 20;
 return out;
 `,
 );
-assert(s5?.allNull === true, "S5: poll() returns null when nothing is pending");
+assert(
+  s5?.allNull === true,
+  `S5: poll() yields nothing when idle (accepted ${s5?.acceptedWhileIdle} unexpected connections)`,
+);
+note(`S5: poll map over 20 calls (c=connection, .=idle): ${s5?.pollMap}`);
+if (s5?.acceptedWhileIdle > 0) {
+  note(
+    `S5: the unexpected connection was typeof=${s5?.connTypeof} connected=${s5?.connConnected} eof=${s5?.connEof} host=${JSON.stringify(s5?.connHost)}`,
+  );
+}
+assert(
+  s5?.idleSeen === true,
+  `S5: at least one poll was genuinely idle (typeof=${s5?.idleTypeof}, ===null: ${s5?.idleIsNull}, ===undefined: ${s5?.idleIsUndefined})`,
+);
+if (s5?.idleSeen && s5?.idleIsNull === false) {
+  console.log(
+    `!!! S5: idle poll() does NOT return null (it is ${s5?.idleTypeof}). The panel MUST use a truthiness check, never "!== null".`,
+  );
+}
 assert(
   typeof s5?.elapsedMsFor20Polls === "number" && s5.elapsedMsFor20Polls < 200,
   `S5: 20 polls took ${s5?.elapsedMsFor20Polls}ms (${s5?.perPollMs}ms each) - must be non-blocking for a 50ms tick`,
@@ -838,7 +902,11 @@ console.log(
   `S3  bind interface : ${s3?.bindsWildcard ? "WILDCARD - token MANDATORY, update SECURITY.md" : s3?.bindsLoopback ? "loopback only" : "INCONCLUSIVE"}`,
 );
 console.log(
-  `S5  poll() non-blocking : ${s5?.allNull === true && s5?.elapsedMsFor20Polls < 200 ? "YES" : "NO - 50ms tick is unsafe"}`,
+  `S5  poll() non-blocking : ${
+    s5?.elapsedMsFor20Polls < 200 && s5?.idleSeen
+      ? `YES (${s5.perPollMs}ms per poll; an idle poll returns ${s5.idleIsNull ? "null" : s5.idleTypeof})`
+      : "NO - 50ms tick is unsafe"
+  }`,
 );
 console.log(
   `S11 survives blocking   : ${s11.ae?.connectionSurvivedBlock === true ? "YES" : "NO - blocking-render design is wrong"}`,
