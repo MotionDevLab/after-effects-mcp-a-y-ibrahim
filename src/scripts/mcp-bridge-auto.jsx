@@ -3555,8 +3555,42 @@ autoRunCheckbox.value = true;
 // to halve per-command latency; the per-check work is tiny (a file existence
 // check), so the CPU cost is negligible and rendering quality is unaffected.
 var checkInterval = 250;
+// The tick now serves BOTH transports. Socket accept latency drops from ~125ms
+// average to ~25ms, while the file poll stays on exactly its old 250ms cadence
+// (every 5th 50ms tick), so the file path's cost is unchanged. If the listener
+// cannot bind we fall back to a plain 250ms tick, since there is nothing to
+// accept and the extra wakeups would buy nothing.
+var TICK_MS = 50;
+var FILE_CHECK_EVERY = 5;
+var tickCount = 0;
 var isChecking = false;
 var currentCommandId = "";
+
+// --- socket transport state -------------------------------------------------
+var SOCKET_PORT_BASE = 47800;
+var SOCKET_PORT_TRIES = 16;
+var SOCKET_PROTOCOL_VERSION = 1;
+// Probe S7: a 32KB chunked write loop moves 1MB in ~5ms, while building and
+// writing one multi-megabyte string freezes After Effects hard enough to need a
+// force quit. Never write a whole large result in a single call.
+var SOCKET_CHUNK = 32768;
+// Probe S5: poll() can return null while ANOTHER connection is still queued
+// behind it, so a single poll per tick does not drain a burst.
+var SOCKET_POLLS_PER_TICK = 4;
+var socketListener = null;
+var socketPort = 0;
+var socketToken = "";
+var socketStatus = "not started";
+var socketPermission = false;
+// Set for the duration of a socket-served command. executeCommand's result
+// writes go here instead of to the result file, which is the ONLY change the 83
+// command handlers are exposed to.
+var currentResultSink = null;
+var currentTransport = "file";
+var socketCommandCount = 0;
+var fileCommandCount = 0;
+var socketRejectCount = 0;
+var socketErrorCount = 0;
 // Dedup key for the last command we acted on. We deduplicate by the server-issued
 // commandId instead of mutating a "status" field inside the shared command file:
 // the Node server also writes that file, so an AE-side read-modify-write would race
@@ -3564,7 +3598,7 @@ var currentCommandId = "";
 // command under concurrent/rapid tool dispatch). The server matches results purely
 // by _commandId, so AE never needs to write the command file at all.
 var lastProcessedCommandId = "";
-var BRIDGE_VERSION = "1.11.0-mcp-enhanced";
+var BRIDGE_VERSION = "1.12.0-mcp-socket";
 // Pure read-only commands: they never mutate the project, so we skip the undo
 // group for them (no empty "MCP: ping" entries cluttering Edit > Undo History).
 var READ_ONLY_COMMANDS = {
@@ -3618,6 +3652,264 @@ function getCommandFilePath() {
 }
 function getResultFilePath() {
     return getBridgeFolder().fsName + "/ae_mcp_result.json";
+}
+
+// ===========================================================================
+// Socket transport
+//
+// After Effects LISTENS and the Node server connects once per command, because
+// poll() is the only non-blocking primitive ExtendScript has and it exists only
+// on the listening side. Every constant and guard below is backed by a live
+// measurement recorded in CONTEXT.md ("socket bridge transport, Phase 0 probe").
+// ===========================================================================
+
+function getRendezvousPath(port) {
+    return getBridgeFolder().fsName + "/ae_bridge_port_" + port + ".json";
+}
+
+// Probe S8: the 2-arg form reads this correctly, the 3-arg
+// PREF_Type_MACHINE_INDEPENDENT form THROWS, and havePref() returns false even
+// when the value is readable. So: 2-arg only, and never gate on havePref.
+function isNetworkPermissionEnabled() {
+    try {
+        return app.preferences.getPrefAsLong(
+            "Main Pref Section", "Pref_SCRIPTING_FILE_NETWORK_SECURITY") === 1;
+    } catch (e) {
+        return false;
+    }
+}
+
+/*
+ * A per-session token, published in the rendezvous file next to the port.
+ *
+ * Be honest about what this is: ExtendScript has no CSPRNG, so it is a nuisance
+ * barrier and a protocol tag, NOT authentication. It exists because probe S3
+ * found listen() binds 0.0.0.0 with no way to ask for loopback, and probe S4
+ * found the accepted connection's host is an empty string so we cannot reject a
+ * non-loopback peer either. Any local process running as this user can already
+ * write ae_command.json today, so the token restores parity with the file
+ * transport and claims nothing beyond that. See SECURITY.md.
+ */
+function makeSocketToken() {
+    var hex = "0123456789abcdef";
+    var out = "";
+    var seed = (new Date()).getTime();
+    try { seed += Math.floor($.hiresTimer); } catch (e) {}
+    for (var i = 0; i < 32; i++) {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        var a = Math.floor(Math.random() * 16);
+        var b = Math.floor(seed / 65536) % 16;
+        out += hex.charAt((a ^ b) & 15);
+    }
+    return out;
+}
+
+function writeRendezvousFile(port, token) {
+    try {
+        var f = new File(getRendezvousPath(port));
+        f.encoding = "UTF-8";
+        if (!f.open("w")) { return false; }
+        f.write(JSON.stringify({
+            v: SOCKET_PROTOCOL_VERSION,
+            port: port,
+            token: token,
+            bridgeVersion: BRIDGE_VERSION,
+            aeVersion: app.version,
+            boundAt: new Date().toISOString(),
+            project: (app.project && app.project.file) ? app.project.file.name : ""
+        }));
+        f.close();
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+function removeRendezvousFile(port) {
+    try {
+        var f = new File(getRendezvousPath(port));
+        if (f.exists) { f.remove(); }
+    } catch (e) {}
+}
+
+/*
+ * Close any listener this panel (or a previous run of it) left bound.
+ *
+ * A leaked LISTENING socket is worse than the leaked scheduled task the
+ * mcpCheckTaskId pattern already guards against, because it holds the port and
+ * the next panel run would bind 47801 instead. $.global is the only state that
+ * survives a panel close and reopen, so that is where the handle lives.
+ */
+function stopSocketListener() {
+    try {
+        if ($.global.mcpSocketListener) { $.global.mcpSocketListener.close(); }
+    } catch (e) {}
+    $.global.mcpSocketListener = null;
+    var stalePort = $.global.mcpSocketPort;
+    if (stalePort) { removeRendezvousFile(stalePort); }
+    $.global.mcpSocketPort = 0;
+    socketListener = null;
+    socketPort = 0;
+    socketToken = "";
+}
+
+// The port the user pinned in the panel, or 0. Probe S10: app.settings round
+// trips reliably, while $.getenv sees NONE of the AE_MCP_BRIDGE_* variables
+// inside AE (it is not launched from the MCP client's environment), which is
+// also why the rendezvous has to be a file rather than a shared env var.
+function getPreferredSocketPort() {
+    try {
+        if (app.settings.haveSetting("MCPBridge", "port")) {
+            var v = parseInt(app.settings.getSetting("MCPBridge", "port"), 10);
+            if (v > 0 && v < 65536) { return v; }
+        }
+    } catch (e) {}
+    return 0;
+}
+
+function startSocketListener(preferredPort) {
+    stopSocketListener();
+    socketPermission = isNetworkPermissionEnabled();
+    if (!socketPermission) {
+        socketStatus = "permission disabled";
+        return false;
+    }
+
+    var ports = [];
+    if (preferredPort > 0 && preferredPort < 65536) { ports.push(preferredPort); }
+    for (var i = 0; i < SOCKET_PORT_TRIES; i++) {
+        var p = SOCKET_PORT_BASE + i;
+        var seen = false;
+        for (var j = 0; j < ports.length; j++) { if (ports[j] === p) { seen = true; } }
+        if (!seen) { ports.push(p); }
+    }
+
+    for (var k = 0; k < ports.length; k++) {
+        var s = new Socket();
+        var bound = false;
+        // Probe S9: a second listen() on a taken port returns FALSE rather than
+        // throwing, but keep the try/catch anyway; this file is never linted.
+        try { bound = s.listen(ports[k]); } catch (e) { bound = false; }
+        if (bound) {
+            // Probe S2: plain listen(port) leaves encoding at UTF-8 but
+            // listen(port, "UTF-8") leaves it at ASCII, so the 2-arg form does
+            // the opposite of what it looks like. Never use it, and set the
+            // encoding explicitly rather than trusting either.
+            s.encoding = "UTF-8";
+            socketListener = s;
+            socketPort = ports[k];
+            socketToken = makeSocketToken();
+            $.global.mcpSocketListener = s;
+            $.global.mcpSocketPort = socketPort;
+            if (!writeRendezvousFile(socketPort, socketToken)) {
+                socketStatus = "bound " + socketPort + " but could not publish rendezvous";
+                return true;
+            }
+            socketStatus = "listening";
+            return true;
+        }
+        try { s.close(); } catch (e2) {}
+    }
+    socketStatus = "no free port in " + SOCKET_PORT_BASE + "-" + (SOCKET_PORT_BASE + SOCKET_PORT_TRIES - 1);
+    return false;
+}
+
+// Probe S7: write() returns the byte count it accepted, and 32 x 32KB chunks
+// move 1MB in ~5ms. Chunking is not an optimization here, it is what keeps a
+// large result from wedging the application.
+function writeSocketLine(conn, line) {
+    var text = line + "\n";
+    var pos = 0;
+    while (pos < text.length) {
+        var piece = text.substr(pos, SOCKET_CHUNK);
+        var wrote;
+        try { wrote = conn.write(piece); } catch (e) { return false; }
+        if (wrote === false) { return false; }
+        pos += piece.length;
+    }
+    return true;
+}
+
+function rejectConnection(conn, reason, commandId) {
+    socketRejectCount++;
+    try {
+        writeSocketLine(conn, JSON.stringify({
+            _ack: 0, error: reason, commandId: commandId || ""
+        }));
+    } catch (e) {}
+    try { conn.close(); } catch (e2) {}
+}
+
+/*
+ * Accept at most one connection and serve at most one command on it.
+ *
+ * The ACK is written BEFORE dispatching to executeCommand. That single ordering
+ * decision is what lets a ten minute render coexist with the server's 1.5s
+ * liveness check, and it is the evidence that makes the server's file fallback
+ * provably safe: no ACK means nothing ran, so a retry cannot double-execute a
+ * deleteLayer. Do not move it below the dispatch.
+ */
+function serviceSocketOnce() {
+    if (!socketListener) { return false; }
+    var conn = null;
+    try { conn = socketListener.poll(); } catch (e) { socketErrorCount++; return false; }
+    if (!conn) { return false; }
+
+    try {
+        // Probe S1: a fresh socket's encoding defaults to ASCII, not BINARY and
+        // not UTF-8. Arabic and every other non-ASCII payload depends on this line.
+        conn.encoding = "UTF-8";
+        // Bounds readln() and each individual write(). It does NOT bound
+        // executeCommand, which is exactly why a long render is safe.
+        conn.timeout = 30;
+
+        var line = conn.readln();
+        if (!line) { rejectConnection(conn, "bad-request", ""); return true; }
+
+        var req = null;
+        try { req = JSON.parse(line); } catch (pe) { req = null; }
+        if (!req || typeof req.command !== "string") {
+            rejectConnection(conn, "bad-request", (req && req.commandId) || "");
+            return true;
+        }
+        if (req.v !== SOCKET_PROTOCOL_VERSION) {
+            rejectConnection(conn, "protocol-mismatch", req.commandId || "");
+            return true;
+        }
+        if (!socketToken || req.token !== socketToken) {
+            rejectConnection(conn, "unauthorized", req.commandId || "");
+            return true;
+        }
+
+        writeSocketLine(conn, JSON.stringify({
+            _ack: 1,
+            commandId: req.commandId || "",
+            bridgeVersion: BRIDGE_VERSION
+        }));
+
+        currentCommandId = req.commandId || "";
+        // Claim the id on the file path too, so a command that arrives over the
+        // socket can never also be replayed out of ae_command.json.
+        if (currentCommandId) { lastProcessedCommandId = currentCommandId; }
+        currentTransport = "socket";
+        currentResultSink = function (resultString) {
+            writeSocketLine(conn, resultString);
+        };
+        try {
+            executeCommand(req.command, req.args || {});
+        } finally {
+            currentResultSink = null;
+            currentTransport = "file";
+        }
+        socketCommandCount++;
+        try { conn.close(); } catch (ec) {}
+        return true;
+    } catch (e) {
+        socketErrorCount++;
+        try { logToPanel("Socket error: " + e.toString()); } catch (e2) {}
+        try { conn.close(); } catch (e3) {}
+        return true;
+    }
 }
 function getProjectInfo() {
     var project = app.project;
@@ -5982,6 +6274,7 @@ function executeCommand(command, args) {
             resultObj._responseTimestamp = new Date().toISOString();
             resultObj._commandExecuted = command;
             resultObj._commandId = currentCommandId;
+            resultObj._transport = currentTransport;
             resultString = JSON.stringify(resultObj, null, 2);
             logToPanel("Added timestamp to result JSON for tracking freshness.");
         } catch (parseError) {
@@ -5994,32 +6287,13 @@ function executeCommand(command, args) {
                 result: ("" + resultString),
                 _responseTimestamp: new Date().toISOString(),
                 _commandExecuted: command,
-                _commandId: currentCommandId
+                _commandId: currentCommandId,
+                _transport: currentTransport
             }, null, 2);
         }
-        
-        var resultFile = new File(getResultFilePath());
-        resultFile.encoding = "UTF-8"; 
-        logToPanel("Opening result file for writing...");
-        var opened = resultFile.open("w");
-        if (!opened) {
-            logToPanel("ERROR: Failed to open result file for writing: " + resultFile.fsName);
-            throw new Error("Failed to open result file for writing.");
-        }
-        logToPanel("Writing to result file...");
-        var written = resultFile.write(resultString);
-        if (!written) {
-             logToPanel("ERROR: Failed to write to result file (write returned false): " + resultFile.fsName);
-             
-        }
-        logToPanel("Closing result file...");
-        var closed = resultFile.close();
-         if (!closed) {
-             logToPanel("ERROR: Failed to close result file: " + resultFile.fsName);
-             
-        }
-        logToPanel("Result file write process complete.");
-        
+
+        emitResult(resultString);
+
         logToPanel("Command completed successfully: " + command);
         statusText.text = "Command completed: " + command;
         // The freshly written result file (carrying _commandId) is the signal the
@@ -6050,17 +6324,11 @@ function executeCommand(command, args) {
                 // the real AE error). See index.ts waitForBridgeResult matching.
                 _commandExecuted: command,
                 _commandId: currentCommandId,
-                _responseTimestamp: new Date().toISOString()
+                _responseTimestamp: new Date().toISOString(),
+                _transport: currentTransport
             });
-            var errorFile = new File(getResultFilePath());
-            errorFile.encoding = "UTF-8";
-            if (errorFile.open("w")) {
-                errorFile.write(errorResult);
-                errorFile.close();
-                logToPanel("Successfully wrote ERROR to result file.");
-            } else {
-                 logToPanel("CRITICAL ERROR: Failed to open result file to write error!");
-            }
+            emitResult(errorResult);
+            logToPanel("Successfully emitted ERROR result.");
         } catch (writeError) {
              logToPanel("CRITICAL ERROR: Failed to write error to result file: " + writeError.toString());
         }
@@ -6075,8 +6343,59 @@ function logToPanel(message) {
     logText.text = timestamp + ": " + message + "\n" + logText.text;
 }
 
+/*
+ * The single place a command result leaves the panel.
+ *
+ * When a socket is serving the current command the result goes back down that
+ * connection; otherwise it lands in the result file exactly as it always has.
+ * Routing through one function is what keeps all 83 command handlers, the
+ * 84-label switch, the undo logic and beginSuppressDialogs completely untouched
+ * by the transport change.
+ */
+function emitResult(resultString) {
+    if (currentResultSink) {
+        // The file-transport format is pretty-printed (JSON.stringify(...,
+        // null, 2)) with real embedded newline bytes. NDJSON framing requires
+        // exactly one line per frame, so sent as-is this would fragment into
+        // several bogus lines under the client's byte-0x0A frame reader.
+        // Collapse to compact single-line JSON before it goes on the wire.
+        try {
+            currentResultSink(JSON.stringify(JSON.parse(resultString)));
+        } catch (e) {
+            // Not valid JSON (should not happen; executeCommand always wraps
+            // non-JSON results). Send as-is rather than lose the result.
+            currentResultSink(resultString);
+        }
+        return;
+    }
+    var resultFile = new File(getResultFilePath());
+    resultFile.encoding = "UTF-8";
+    logToPanel("Opening result file for writing...");
+    var opened = resultFile.open("w");
+    if (!opened) {
+        logToPanel("ERROR: Failed to open result file for writing: " + resultFile.fsName);
+        throw new Error("Failed to open result file for writing.");
+    }
+    logToPanel("Writing to result file...");
+    var written = resultFile.write(resultString);
+    if (!written) {
+        logToPanel("ERROR: Failed to write to result file (write returned false): " + resultFile.fsName);
+    }
+    logToPanel("Closing result file...");
+    var closed = resultFile.close();
+    if (!closed) {
+        logToPanel("ERROR: Failed to close result file: " + resultFile.fsName);
+    }
+    logToPanel("Result file write process complete.");
+}
 
-function checkForCommands() {
+
+/*
+ * The scheduled task. Owns isChecking in a try/finally: before, one throw
+ * anywhere below left the flag set and wedged the bridge permanently, since
+ * every later tick returned early on `isChecking`.
+ */
+function bridgeTick() {
     // The repeating scheduled task can outlive the panel: when the panel is closed
     // its widgets are destroyed and become invalid. Touching one then throws
     // "Object is invalid" (and the modal blanks the reopened panel). So if our UI is
@@ -6085,12 +6404,37 @@ function checkForCommands() {
     try { autoOn = autoRunCheckbox.value; }
     catch (invalidWidget) {
         try { if ($.global.mcpCheckTaskId != null) app.cancelTask($.global.mcpCheckTaskId); } catch (e) {}
+        // A leaked LISTENING socket would hold the port against the next panel run.
+        try { stopSocketListener(); } catch (e2) {}
         return;
     }
     if (!autoOn || isChecking) return;
-    
+
     isChecking = true;
-    
+    try {
+        tickCount++;
+        if (socketListener) {
+            // Probe S5: one poll is not enough. poll() can hand back null while
+            // another connection is still queued, so a burst needs several.
+            for (var i = 0; i < SOCKET_POLLS_PER_TICK; i++) {
+                serviceSocketOnce();
+            }
+        }
+        // Keep the file poll on its original 250ms cadence rather than 50ms:
+        // the socket is the fast path now, and this costs exactly what it did before.
+        if ((tickCount % FILE_CHECK_EVERY) === 0) {
+            checkForCommands();
+        }
+    } catch (tickError) {
+        try { logToPanel("Bridge tick error: " + tickError.toString()); } catch (e3) {}
+    } finally {
+        isChecking = false;
+    }
+}
+
+
+function checkForCommands() {
+    var rawCommandId = "";
     try {
         var commandFile = new File(getCommandFilePath());
         if (commandFile.exists) {
@@ -6102,6 +6446,12 @@ function checkForCommands() {
             commandFile.close();
 
             if (content) {
+                // Recover the id BEFORE parsing, so a malformed command file can
+                // still be answered with a correlated error instead of leaving the
+                // server to burn its entire timeout on a command that never parsed.
+                var idMatch = content.match(/"commandId"\s*:\s*"([^"]*)"/);
+                if (idMatch) { rawCommandId = idMatch[1]; }
+
                 var commandData = (typeof JSON !== "undefined" && JSON.parse)
                     ? JSON.parse(content)
                     : eval("(" + content + ")");
@@ -6116,15 +6466,35 @@ function checkForCommands() {
                 if (commandKey && commandKey !== lastProcessedCommandId) {
                     lastProcessedCommandId = commandKey;
                     currentCommandId = commandData.commandId || "";
+                    currentTransport = "file";
+                    fileCommandCount++;
                     executeCommand(commandData.command, commandData.args || {});
                 }
             }
         }
     } catch (e) {
         logToPanel("Error checking for commands: " + e.toString());
+        // Previously this only logged, so a command file the panel could not read
+        // produced NO result at all and the caller waited out its full timeout with
+        // nothing to show for it. Answer with a correlated error instead.
+        if (rawCommandId && rawCommandId !== lastProcessedCommandId) {
+            lastProcessedCommandId = rawCommandId;
+            try {
+                currentCommandId = rawCommandId;
+                currentTransport = "file";
+                emitResult(JSON.stringify({
+                    status: "error",
+                    error: "The bridge panel could not read this command: " + e.toString(),
+                    _commandExecuted: "",
+                    _commandId: rawCommandId,
+                    _responseTimestamp: new Date().toISOString(),
+                    _transport: "file"
+                }));
+            } catch (emitError) {
+                logToPanel("CRITICAL: could not emit the read-failure result: " + emitError.toString());
+            }
+        }
     }
-    
-    isChecking = false;
 }
 
 
@@ -6158,7 +6528,10 @@ function startCommandChecker() {
     // destroyed widgets) and duplicates accumulate. $.global survives the re-run, so
     // it is where we stash the live task id to find and kill the stale one.
     try { if ($.global.mcpCheckTaskId != null) app.cancelTask($.global.mcpCheckTaskId); } catch (e) {}
-    $.global.mcpCheckTaskId = app.scheduleTask("checkForCommands()", checkInterval, true);
+    // With a listener up we tick fast so accepts are picked up in ~25ms average;
+    // without one there is nothing to accept, so stay on the original cadence.
+    var interval = socketListener ? TICK_MS : checkInterval;
+    $.global.mcpCheckTaskId = app.scheduleTask("bridgeTick()", interval, true);
 }
 
 
@@ -6169,12 +6542,20 @@ checkButton.onClick = function() {
 };
 
 
-logToPanel("MCP Bridge Auto started");
+logToPanel("MCP Bridge Auto " + BRIDGE_VERSION + " started");
 logToPanel("Command file: " + getCommandFilePath());
 statusText.text = "Ready - Auto-run is " + (autoRunCheckbox.value ? "ON" : "OFF");
 
 
 initLastProcessedCommand();
+// Bind BEFORE scheduling, so startCommandChecker knows which tick rate to use.
+// A failure here is not fatal: the file transport keeps working exactly as it
+// did before, which is the whole point of keeping it.
+if (startSocketListener(getPreferredSocketPort())) {
+    logToPanel("Socket transport listening on port " + socketPort);
+} else {
+    logToPanel("Socket transport unavailable (" + socketStatus + "); using the file transport.");
+}
 startCommandChecker();
 
 

@@ -620,7 +620,10 @@ server.tool(
   "Import a file into the After Effects project as footage.",
   {
     filePath: z.string().describe("Absolute path to the file to import."),
-    name: z.string().optional().describe("Optional name to give the imported item (defaults to the file name)."),
+    name: z
+      .string()
+      .optional()
+      .describe("Optional name to give the imported item (defaults to the file name)."),
     sequence: z
       .boolean()
       .optional()
@@ -673,7 +676,12 @@ server.tool(
   "Replace a project item's source file with a different file, keeping the same item " +
     "(and all its usages in compositions) in place. Target the item by itemId or itemName.",
   {
-    itemId: z.number().int().positive().optional().describe("Project item id (from getProjectInfo/inspect-comp)."),
+    itemId: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("Project item id (from getProjectInfo/inspect-comp)."),
     itemName: z.string().optional().describe("Project item name (alternative to itemId)."),
     newPath: z.string().describe("Absolute path to the replacement file."),
   },
@@ -714,7 +722,9 @@ server.tool(
     "path is never changed by this - it copies the existing saved .aep file rather than " +
     "saving a new one, so requires the project to already be saved.",
   {
-    outputPath: z.string().describe("Absolute path to the output folder (created if it doesn't exist)."),
+    outputPath: z
+      .string()
+      .describe("Absolute path to the output folder (created if it doesn't exist)."),
     includeFootage: z
       .boolean()
       .optional()
@@ -747,7 +757,9 @@ server.tool(
       .describe("Names of the composition(s) whose dependencies should be kept."),
     confirm: z
       .boolean()
-      .describe("Required, no default. Must be true to proceed - this permanently deletes unused project items."),
+      .describe(
+        "Required, no default. Must be true to proceed - this permanently deletes unused project items.",
+      ),
   },
   async (params) => {
     try {
@@ -777,8 +789,16 @@ server.tool(
       .array(
         z.object({
           folderName: z.string().describe("Name of the folder to create."),
-          itemNames: z.array(z.string()).optional().describe("Project item names to move into this folder."),
-          itemIds: z.array(z.number().int()).optional().describe("Project item ids to move into this folder (alternative/addition to itemNames)."),
+          itemNames: z
+            .array(z.string())
+            .optional()
+            .describe("Project item names to move into this folder."),
+          itemIds: z
+            .array(z.number().int())
+            .optional()
+            .describe(
+              "Project item ids to move into this folder (alternative/addition to itemNames).",
+            ),
         }),
       )
       .optional()
@@ -959,7 +979,9 @@ const CompIdentifierSchema = {
     .int()
     .positive()
     .optional()
-    .describe("1-based index among compositions only (the Nth comp in the project), if compName is omitted."),
+    .describe(
+      "1-based index among compositions only (the Nth comp in the project), if compName is omitted.",
+    ),
 };
 
 /**
@@ -975,7 +997,11 @@ const PathGeneratorSchema = z
       type: z.literal("roundedRect"),
       width: z.number().positive(),
       height: z.number().positive(),
-      radius: z.number().min(0).optional().describe("Corner radius; clamped to half the shorter side."),
+      radius: z
+        .number()
+        .min(0)
+        .optional()
+        .describe("Corner radius; clamped to half the shorter side."),
       center: Vec2Schema.optional(),
     }),
     z.object({
@@ -989,15 +1015,25 @@ const PathGeneratorSchema = z
       points: z.number().int().min(3).describe("Number of sides."),
       radius: z.number().positive(),
       center: Vec2Schema.optional(),
-      rotation: z.number().optional().describe("Clockwise degrees; 0 puts the first vertex straight up."),
+      rotation: z
+        .number()
+        .optional()
+        .describe("Clockwise degrees; 0 puts the first vertex straight up."),
     }),
     z.object({
       type: z.literal("star"),
-      points: z.number().int().min(3).describe("Number of star points; the path gets twice this many vertices."),
+      points: z
+        .number()
+        .int()
+        .min(3)
+        .describe("Number of star points; the path gets twice this many vertices."),
       outerRadius: z.number().positive(),
       innerRadius: z.number().positive(),
       center: Vec2Schema.optional(),
-      rotation: z.number().optional().describe("Clockwise degrees; 0 puts the first outer point straight up."),
+      rotation: z
+        .number()
+        .optional()
+        .describe("Clockwise degrees; 0 puts the first outer point straight up."),
     }),
   ])
   .describe("Build the path from a shape generator instead of explicit vertices.");
@@ -1007,7 +1043,9 @@ const PathShapeSchema = {
     .array(Vec2Schema)
     .min(2)
     .optional()
-    .describe("Path vertices as [x,y] pairs, in LAYER space (origin = the layer's anchor point), y positive DOWN."),
+    .describe(
+      "Path vertices as [x,y] pairs, in LAYER space (origin = the layer's anchor point), y positive DOWN.",
+    ),
   inTangents: z
     .array(Vec2Schema)
     .optional()
@@ -1101,7 +1139,9 @@ server.tool(
   "Read a property's current expression, whether it's enabled, and any expression error.",
   {
     ...LayerIdentifierSchema,
-    propertyName: z.string().describe("Name of the property to read (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+    propertyName: z
+      .string()
+      .describe("Name of the property to read (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
   },
   async (parameters) => {
     try {
@@ -1122,7 +1162,9 @@ server.tool(
     "(unlike setLayerExpression, which requires supplying or clearing the actual text).",
   {
     ...LayerIdentifierSchema,
-    propertyName: z.string().describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+    propertyName: z
+      .string()
+      .describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
     enabled: z.boolean().describe("Whether the expression should be enabled."),
   },
   async (parameters) => {
@@ -1150,7 +1192,10 @@ server.tool(
       .enum(["slider", "color", "point", "checkbox", "dropdown", "angle", "layer"])
       .describe("Type of control effect to add."),
     controlName: z.string().describe("Name to give the new effect."),
-    defaultValue: z.any().optional().describe("Initial value for the control (ignored for dropdown - see note above)."),
+    defaultValue: z
+      .any()
+      .optional()
+      .describe("Initial value for the control (ignored for dropdown - see note above)."),
   },
   async (parameters) => {
     try {
@@ -1172,15 +1217,27 @@ server.tool(
     "it's a hand-written expression, same-comp only, and breaks if the target layer/property " +
     "is later renamed or deleted.",
   {
-    compIndex: z.number().int().positive().describe("1-based index of the composition (both layers must be in this comp)."),
-    sourceLayerIndex: z.number().int().positive().describe("1-based index of the layer whose property will follow the target."),
-    sourceProperty: z.string().describe("Name of the property to set the expression on (e.g., 'Position')."),
+    compIndex: z
+      .number()
+      .int()
+      .positive()
+      .describe("1-based index of the composition (both layers must be in this comp)."),
+    sourceLayerIndex: z
+      .number()
+      .int()
+      .positive()
+      .describe("1-based index of the layer whose property will follow the target."),
+    sourceProperty: z
+      .string()
+      .describe("Name of the property to set the expression on (e.g., 'Position')."),
     targetLayerIndex: z.number().int().positive().describe("1-based index of the layer to follow."),
     targetProperty: z.string().describe("Name of the property to follow on the target layer."),
     offset: z
       .union([z.number(), z.array(z.number())])
       .optional()
-      .describe("Optional value added to the target's value (a single number or an array matching the property's dimensions)."),
+      .describe(
+        "Optional value added to the target's value (a single number or an array matching the property's dimensions).",
+      ),
   },
   async (parameters) => {
     try {
@@ -1201,8 +1258,12 @@ server.tool(
     "(loopOut), time (time remapping/speed), bounce, inertia, or overshoot.",
   {
     ...LayerIdentifierSchema,
-    propertyName: z.string().describe("Name of the property to apply the expression to (e.g., 'Position', 'Rotation')."),
-    template: z.enum(["wiggle", "loop", "time", "bounce", "inertia", "overshoot"]).describe("Which template to apply."),
+    propertyName: z
+      .string()
+      .describe("Name of the property to apply the expression to (e.g., 'Position', 'Rotation')."),
+    template: z
+      .enum(["wiggle", "loop", "time", "bounce", "inertia", "overshoot"])
+      .describe("Which template to apply."),
     params: z
       .record(z.union([z.string(), z.number()]))
       .optional()
@@ -1279,11 +1340,15 @@ server.tool(
       .array(
         z.object({
           time: z.number().describe("Comp time in seconds."),
-          value: z.number().describe("Source time in seconds the layer should show at this comp time."),
+          value: z
+            .number()
+            .describe("Source time in seconds the layer should show at this comp time."),
         }),
       )
       .optional()
-      .describe("Time Remap keyframes to add/overwrite at the given comp times. Omit to leave existing keyframes untouched."),
+      .describe(
+        "Time Remap keyframes to add/overwrite at the given comp times. Omit to leave existing keyframes untouched.",
+      ),
   },
   async (parameters) => {
     try {
@@ -1304,7 +1369,9 @@ server.tool(
     "temporal ease (speed/influence). Covers Transform, effect, and text properties.",
   {
     ...LayerIdentifierSchema,
-    propertyName: z.string().describe("Name of the property to read (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+    propertyName: z
+      .string()
+      .describe("Name of the property to read (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
   },
   async (parameters) => {
     try {
@@ -1326,8 +1393,12 @@ server.tool(
     "time are dropped (After Effects does not allow negative keyframe times) and reported.",
   {
     ...LayerIdentifierSchema,
-    propertyName: z.string().describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
-    offsetSeconds: z.number().describe("Seconds to add to every keyframe's time (negative to shift earlier)."),
+    propertyName: z
+      .string()
+      .describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+    offsetSeconds: z
+      .number()
+      .describe("Seconds to add to every keyframe's time (negative to shift earlier)."),
   },
   async (parameters) => {
     try {
@@ -1349,9 +1420,20 @@ server.tool(
     "and reported.",
   {
     ...LayerIdentifierSchema,
-    propertyName: z.string().describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
-    scale: z.number().describe("Scale factor for the time between each keyframe and the anchor (e.g. 2 = twice as slow, 0.5 = twice as fast)."),
-    anchorTime: z.number().optional().describe("Time (seconds) the scale pivots around. Defaults to the property's first keyframe time."),
+    propertyName: z
+      .string()
+      .describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+    scale: z
+      .number()
+      .describe(
+        "Scale factor for the time between each keyframe and the anchor (e.g. 2 = twice as slow, 0.5 = twice as fast).",
+      ),
+    anchorTime: z
+      .number()
+      .optional()
+      .describe(
+        "Time (seconds) the scale pivots around. Defaults to the property's first keyframe time.",
+      ),
   },
   async (parameters) => {
     try {
@@ -1372,7 +1454,9 @@ server.tool(
     "keyframe's in/out interpolation and ease so the animation plays backwards correctly.",
   {
     ...LayerIdentifierSchema,
-    propertyName: z.string().describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+    propertyName: z
+      .string()
+      .describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
   },
   async (parameters) => {
     try {
@@ -1393,12 +1477,27 @@ server.tool(
     "be the same layer, a different property), preserving value/interpolation/ease. " +
     "Additive - does not clear existing keyframes on the target.",
   {
-    compIndex: z.number().int().positive().describe("1-based index of the composition (both layers must be in this comp)."),
-    sourceLayerIndex: z.number().int().positive().describe("1-based index of the layer to copy keyframes from."),
+    compIndex: z
+      .number()
+      .int()
+      .positive()
+      .describe("1-based index of the composition (both layers must be in this comp)."),
+    sourceLayerIndex: z
+      .number()
+      .int()
+      .positive()
+      .describe("1-based index of the layer to copy keyframes from."),
     sourceProperty: z.string().describe("Name of the property to copy from (e.g., 'Position')."),
-    targetLayerIndex: z.number().int().positive().describe("1-based index of the layer to copy keyframes to."),
+    targetLayerIndex: z
+      .number()
+      .int()
+      .positive()
+      .describe("1-based index of the layer to copy keyframes to."),
     targetProperty: z.string().describe("Name of the property to copy to."),
-    timeOffset: z.number().optional().describe("Seconds added to each copied keyframe's time (default 0)."),
+    timeOffset: z
+      .number()
+      .optional()
+      .describe("Seconds added to each copied keyframe's time (default 0)."),
   },
   async (parameters) => {
     try {
@@ -1420,9 +1519,19 @@ server.tool(
     "when multiple keyframes are selected.",
   {
     ...LayerIdentifierSchema,
-    propertyName: z.string().describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
-    keyframeIndex: z.number().int().positive().optional().describe("1-based keyframe index. Omit to apply to all keyframes on the property."),
-    type: z.enum(["in", "out", "both"]).optional().describe("Which side(s) of the keyframe(s) to ease (default 'both')."),
+    propertyName: z
+      .string()
+      .describe("Name of the property (e.g., 'Position', 'Scale', 'Rotation', 'Opacity')."),
+    keyframeIndex: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("1-based keyframe index. Omit to apply to all keyframes on the property."),
+    type: z
+      .enum(["in", "out", "both"])
+      .optional()
+      .describe("Which side(s) of the keyframe(s) to ease (default 'both')."),
   },
   async (parameters) => {
     try {
@@ -1443,15 +1552,36 @@ server.tool(
     "bar, title, and optional subtitle) and add it to a composition. Style controls bar " +
     "height, text size, default font, and animation timing.",
   {
-    compName: z.string().optional().describe("Composition to add the lower third to (defaults to the active comp)."),
+    compName: z
+      .string()
+      .optional()
+      .describe("Composition to add the lower third to (defaults to the active comp)."),
     title: z.string().describe("Main title text."),
     subtitle: z.string().optional().describe("Optional subtitle text below the title."),
-    style: z.enum(["modern", "corporate", "news", "minimal", "social"]).optional().describe("Visual style preset (default 'modern')."),
-    primaryColor: z.array(z.number()).length(3).optional().describe("Main bar color as [r,g,b], each 0-1 (default a blue)."),
-    secondaryColor: z.array(z.number()).length(3).optional().describe("Accent stripe color as [r,g,b], each 0-1 (defaults to primaryColor)."),
-    textColor: z.array(z.number()).length(3).optional().describe("Text color as [r,g,b], each 0-1 (default white)."),
+    style: z
+      .enum(["modern", "corporate", "news", "minimal", "social"])
+      .optional()
+      .describe("Visual style preset (default 'modern')."),
+    primaryColor: z
+      .array(z.number())
+      .length(3)
+      .optional()
+      .describe("Main bar color as [r,g,b], each 0-1 (default a blue)."),
+    secondaryColor: z
+      .array(z.number())
+      .length(3)
+      .optional()
+      .describe("Accent stripe color as [r,g,b], each 0-1 (defaults to primaryColor)."),
+    textColor: z
+      .array(z.number())
+      .length(3)
+      .optional()
+      .describe("Text color as [r,g,b], each 0-1 (default white)."),
     fontFamily: z.string().optional().describe("Font override (defaults to a per-style font)."),
-    position: z.enum(["bottomLeft", "bottomRight", "bottomCenter"]).optional().describe("Where to place it in the target comp (default 'bottomLeft')."),
+    position: z
+      .enum(["bottomLeft", "bottomRight", "bottomCenter"])
+      .optional()
+      .describe("Where to place it in the target comp (default 'bottomLeft')."),
     startTime: z.number().optional().describe("Start time in seconds (default 0)."),
     duration: z.number().optional().describe("Total duration in seconds (default 5)."),
     animateIn: z.boolean().optional().describe("Fade in at the start (default true)."),
@@ -1476,14 +1606,28 @@ server.tool(
     "composition, animated per style: cinematic (scale+fade), documentary (fade only), " +
     "social (bounce in), or minimal (simple fade).",
   {
-    compName: z.string().optional().describe("Composition to add the title card to (defaults to the active comp)."),
+    compName: z
+      .string()
+      .optional()
+      .describe("Composition to add the title card to (defaults to the active comp)."),
     title: z.string().describe("Title text."),
     subtitle: z.string().optional().describe("Optional subtitle text below the title."),
-    style: z.enum(["cinematic", "documentary", "social", "minimal"]).optional().describe("Animation style (default 'minimal')."),
-    backgroundColor: z.array(z.number()).length(3).optional().describe("Full-frame background color as [r,g,b], each 0-1. Omit for no background layer."),
+    style: z
+      .enum(["cinematic", "documentary", "social", "minimal"])
+      .optional()
+      .describe("Animation style (default 'minimal')."),
+    backgroundColor: z
+      .array(z.number())
+      .length(3)
+      .optional()
+      .describe("Full-frame background color as [r,g,b], each 0-1. Omit for no background layer."),
     fontFamily: z.string().optional().describe("Font for the title (default 'Arial-BoldMT')."),
     fontSize: z.number().optional().describe("Title font size (default 64)."),
-    textColor: z.array(z.number()).length(3).optional().describe("Text color as [r,g,b], each 0-1 (default white)."),
+    textColor: z
+      .array(z.number())
+      .length(3)
+      .optional()
+      .describe("Text color as [r,g,b], each 0-1 (default white)."),
     startTime: z.number().optional().describe("Start time in seconds (default 0)."),
     duration: z.number().optional().describe("Duration in seconds (default 4)."),
   },
@@ -1507,12 +1651,33 @@ server.tool(
     "and is genuinely applied (linear = literal linear motion, easeIn/easeOut/easeInOut = " +
     "eased bezier motion).",
   {
-    compName: z.string().optional().describe("Composition to add the transition to (defaults to the active comp)."),
-    type: z.enum(["wipe_left", "wipe_right", "wipe_up", "wipe_down", "dissolve", "push", "slide", "zoom"]).describe("Transition type."),
-    color: z.array(z.number()).length(3).optional().describe("Transition layer color as [r,g,b], each 0-1 (default black)."),
+    compName: z
+      .string()
+      .optional()
+      .describe("Composition to add the transition to (defaults to the active comp)."),
+    type: z
+      .enum([
+        "wipe_left",
+        "wipe_right",
+        "wipe_up",
+        "wipe_down",
+        "dissolve",
+        "push",
+        "slide",
+        "zoom",
+      ])
+      .describe("Transition type."),
+    color: z
+      .array(z.number())
+      .length(3)
+      .optional()
+      .describe("Transition layer color as [r,g,b], each 0-1 (default black)."),
     startTime: z.number().optional().describe("Start time in seconds (default 0)."),
     duration: z.number().optional().describe("Duration in seconds (default 1)."),
-    easing: z.enum(["linear", "easeIn", "easeOut", "easeInOut"]).optional().describe("Keyframe easing (default 'linear')."),
+    easing: z
+      .enum(["linear", "easeIn", "easeOut", "easeInOut"])
+      .optional()
+      .describe("Keyframe easing (default 'linear')."),
   },
   async (parameters) => {
     try {
@@ -1533,11 +1698,27 @@ server.tool(
     "scale, slide, spin, or glitch (a wiggle expression + opacity flicker). Requires " +
     "logoItemId or logoItemName.",
   {
-    compName: z.string().optional().describe("Composition to add the logo to (defaults to the active comp)."),
-    logoItemId: z.number().int().optional().describe("Project item id of the logo footage (from getProjectInfo). Provide this or logoItemName."),
-    logoItemName: z.string().optional().describe("Project item name of the logo footage. Provide this or logoItemId."),
+    compName: z
+      .string()
+      .optional()
+      .describe("Composition to add the logo to (defaults to the active comp)."),
+    logoItemId: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        "Project item id of the logo footage (from getProjectInfo). Provide this or logoItemName.",
+      ),
+    logoItemName: z
+      .string()
+      .optional()
+      .describe("Project item name of the logo footage. Provide this or logoItemId."),
     style: z.enum(["fade", "scale", "slide", "spin", "glitch"]).describe("Reveal style."),
-    backgroundColor: z.array(z.number()).length(3).optional().describe("Full-frame background color as [r,g,b], each 0-1. Omit for no background layer."),
+    backgroundColor: z
+      .array(z.number())
+      .length(3)
+      .optional()
+      .describe("Full-frame background color as [r,g,b], each 0-1. Omit for no background layer."),
     startTime: z.number().optional().describe("Start time in seconds (default 0)."),
     duration: z.number().optional().describe("Duration in seconds (default 3)."),
   },
@@ -1562,12 +1743,23 @@ server.tool(
     "across characters.",
   {
     ...LayerIdentifierSchema,
-    animatorType: z.enum(["typewriter", "fadeInChars", "scaleInChars", "slideInChars", "randomize", "wave"]).describe("Animator type."),
+    animatorType: z
+      .enum(["typewriter", "fadeInChars", "scaleInChars", "slideInChars", "randomize", "wave"])
+      .describe("Animator type."),
     startTime: z.number().optional().describe("Start time in seconds (default 0)."),
-    duration: z.number().optional().describe("Duration of the character reveal in seconds (default 2)."),
+    duration: z
+      .number()
+      .optional()
+      .describe("Duration of the character reveal in seconds (default 2)."),
     delay: z.number().optional().describe("Per-character stagger in seconds (default 0.05)."),
-    waveAmplitude: z.number().optional().describe("For the 'wave' type: oscillation amplitude in pixels (default 20)."),
-    waveSpeed: z.number().optional().describe("For the 'wave' type: oscillation speed (default 4)."),
+    waveAmplitude: z
+      .number()
+      .optional()
+      .describe("For the 'wave' type: oscillation amplitude in pixels (default 20)."),
+    waveSpeed: z
+      .number()
+      .optional()
+      .describe("For the 'wave' type: oscillation speed (default 4)."),
   },
   async (parameters) => {
     try {
@@ -3428,7 +3620,7 @@ server.tool(
 
 // Bump this whenever the bridge .jsx protocol changes, and keep it in sync with
 // BRIDGE_VERSION in src/scripts/mcp-bridge-auto.jsx. check-bridge warns on mismatch.
-const EXPECTED_BRIDGE_VERSION = "1.11.0-mcp-enhanced";
+const EXPECTED_BRIDGE_VERSION = "1.12.0-mcp-socket";
 
 server.tool(
   "check-bridge",
@@ -3855,17 +4047,23 @@ server.tool(
     layerName: z
       .string()
       .optional()
-      .describe("Layer name (alternative to layerIndex). Also names the layer when createLayer is true."),
+      .describe(
+        "Layer name (alternative to layerIndex). Also names the layer when createLayer is true.",
+      ),
     createLayer: z
       .boolean()
       .optional()
-      .describe("Create a new shape layer when no existing layer matches (default: false, which errors instead)."),
+      .describe(
+        "Create a new shape layer when no existing layer matches (default: false, which errors instead).",
+      ),
     groupIndex: z
       .number()
       .int()
       .positive()
       .optional()
-      .describe("1-based index of an existing group in the layer's Contents. Omit to append a new group."),
+      .describe(
+        "1-based index of an existing group in the layer's Contents. Omit to append a new group.",
+      ),
     pathIndex: z
       .number()
       .int()
@@ -3887,7 +4085,9 @@ server.tool(
         }),
       )
       .optional()
-      .describe("Path morph: one entry per keyframe. All entries must resolve to the same vertex count."),
+      .describe(
+        "Path morph: one entry per keyframe. All entries must resolve to the same vertex count.",
+      ),
     fillColor: z
       .tuple([z.number(), z.number(), z.number()])
       .optional()
@@ -3896,7 +4096,10 @@ server.tool(
       .tuple([z.number(), z.number(), z.number()])
       .optional()
       .describe("Stroke color as [r,g,b], each 0-1."),
-    strokeWidth: z.number().optional().describe("Stroke width in pixels (default 2 when strokeColor is given)."),
+    strokeWidth: z
+      .number()
+      .optional()
+      .describe("Stroke width in pixels (default 2 when strokeColor is given)."),
   },
   async (parameters) => {
     try {
@@ -3915,7 +4118,9 @@ server.tool(
         assertMorphCompatible(resolved);
         payload = { ...rest, keyframes: resolved };
       } else {
-        const path = resolvePathInput({ ...rest, generator } as Parameters<typeof resolvePathInput>[0]);
+        const path = resolvePathInput({ ...rest, generator } as Parameters<
+          typeof resolvePathInput
+        >[0]);
         payload = { ...rest, ...path };
       }
 
@@ -3937,8 +4142,18 @@ server.tool(
     ...CompIdentifierSchema,
     layerIndex: z.number().int().positive().optional().describe("1-based layer index."),
     layerName: z.string().optional().describe("Layer name (alternative to layerIndex)."),
-    groupIndex: z.number().int().positive().optional().describe("Restrict to this 1-based group index."),
-    pathIndex: z.number().int().positive().optional().describe("Restrict to this 1-based path index within the group."),
+    groupIndex: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("Restrict to this 1-based group index."),
+    pathIndex: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("Restrict to this 1-based path index within the group."),
   },
   async (parameters) => {
     try {
@@ -4125,7 +4340,9 @@ server.tool(
     moveAttributes: z
       .boolean()
       .optional()
-      .describe("Move all attributes (transform, effects, etc.) into the new comp (default true, matches AE's own UI default)."),
+      .describe(
+        "Move all attributes (transform, effects, etc.) into the new comp (default true, matches AE's own UI default).",
+      ),
   },
   async (parameters) => {
     try {
@@ -4154,7 +4371,10 @@ server.tool(
       .optional()
       .describe("1-based effect index within the layer's Effects group."),
     effectName: z.string().optional().describe("Display name of the effect to reorder."),
-    effectMatchName: z.string().optional().describe("Internal match name of the effect to reorder."),
+    effectMatchName: z
+      .string()
+      .optional()
+      .describe("Internal match name of the effect to reorder."),
     newIndex: z.number().int().positive().describe("1-based target position in the effect stack."),
   },
   async (parameters) => {
@@ -4175,14 +4395,32 @@ server.tool(
   "Copy one or more effects (with their current static property values) from one layer to another. Omit effectIndices to copy every effect on the source layer. Does not copy keyframes or expressions on effect properties - use copy-keyframes afterward for a specific property if needed.",
   {
     ...CompIdentifierSchema,
-    sourceLayerIndex: z.number().int().positive().optional().describe("1-based source layer index."),
-    sourceLayerName: z.string().optional().describe("Source layer name (alternative to sourceLayerIndex)."),
-    targetLayerIndex: z.number().int().positive().optional().describe("1-based target layer index."),
-    targetLayerName: z.string().optional().describe("Target layer name (alternative to targetLayerIndex)."),
+    sourceLayerIndex: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("1-based source layer index."),
+    sourceLayerName: z
+      .string()
+      .optional()
+      .describe("Source layer name (alternative to sourceLayerIndex)."),
+    targetLayerIndex: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("1-based target layer index."),
+    targetLayerName: z
+      .string()
+      .optional()
+      .describe("Target layer name (alternative to targetLayerIndex)."),
     effectIndices: z
       .array(z.number().int().positive())
       .optional()
-      .describe("1-based indices of effects to copy (omit to copy all effects on the source layer)."),
+      .describe(
+        "1-based indices of effects to copy (omit to copy all effects on the source layer).",
+      ),
   },
   async (parameters) => {
     try {
@@ -4202,9 +4440,23 @@ server.tool(
   "Delete a marker from a composition or a layer. Provide layerIndex/layerName for a layer marker, or omit both for a composition marker.",
   {
     ...CompIdentifierSchema,
-    layerIndex: z.number().int().positive().optional().describe("1-based layer index (layer marker) - omit for a composition marker."),
-    layerName: z.string().optional().describe("Layer name (alternative to layerIndex, layer marker only)."),
-    markerIndex: z.number().int().positive().describe("1-based marker index (as returned by get-markers-equivalent tooling or add-marker)."),
+    layerIndex: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("1-based layer index (layer marker) - omit for a composition marker."),
+    layerName: z
+      .string()
+      .optional()
+      .describe("Layer name (alternative to layerIndex, layer marker only)."),
+    markerIndex: z
+      .number()
+      .int()
+      .positive()
+      .describe(
+        "1-based marker index (as returned by get-markers-equivalent tooling or add-marker).",
+      ),
   },
   async (parameters) => {
     try {
@@ -4417,7 +4669,11 @@ server.tool(
           compIndex: typeof comp === "number" ? comp : undefined,
           times: times === undefined ? undefined : Array.isArray(times) ? times : [times],
           frameNumbers:
-            frameNumbers === undefined ? undefined : Array.isArray(frameNumbers) ? frameNumbers : [frameNumbers],
+            frameNumbers === undefined
+              ? undefined
+              : Array.isArray(frameNumbers)
+                ? frameNumbers
+                : [frameNumbers],
           maxWidth,
           includeState,
           motionBlur,
