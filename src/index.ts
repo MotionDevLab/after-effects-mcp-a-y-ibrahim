@@ -19,8 +19,22 @@ import {
   buildFfmpegConvertArgs,
   tail,
   nextPollDelay,
+  bridgeTimeoutResult,
   POLL_START_MS,
 } from "./lib/bridge-core.js";
+import {
+  parseRendezvous,
+  parseRendezvousFileName,
+  rendezvousFileName,
+  isSupportedRendezvous,
+  isStaleRendezvous,
+  selectRendezvous,
+  readTransportMode,
+  readPinnedPort,
+  shouldRediscover,
+  type Rendezvous,
+} from "./lib/bridge-socket.js";
+import { sendOverSocket, type SendPhase } from "./lib/bridge-socket-client.js";
 import { collectPresetFiles } from "./lib/preset-scan.js";
 import { resolvePathInput, assertMorphCompatible } from "./lib/shape-path.js";
 import { analyzeWavBuffer, WavAnalysis } from "./lib/wav.js";
@@ -62,6 +76,94 @@ function getAETempDir(): string {
     fs.mkdirSync(bridgeDir, { recursive: true });
   }
   return bridgeDir;
+}
+
+// ---------------------------------------------------------------------------
+// Transport selection
+//
+// The AE panel serves BOTH transports. This server prefers the socket and falls
+// back to files, so a panel older than 1.12 (which publishes no rendezvous file)
+// keeps working unchanged, and so does a new panel whose listener failed to bind
+// because the network permission is off. Policy lives in src/lib/bridge-socket.ts;
+// only the I/O is here.
+// ---------------------------------------------------------------------------
+
+const transportState = {
+  /** auto (default) | socket (never fall back, for CI) | file (kill switch). */
+  mode: readTransportMode(process.env),
+  /** AE_MCP_BRIDGE_PORT means "connect HERE only" on this side. */
+  pinnedPort: readPinnedPort(process.env),
+  rendezvous: null as Rendezvous | null,
+  lastDiscoveryAt: null as number | null,
+};
+
+/** The most recent successful bridge result, for the `get-results` tool. */
+let lastBridgeResult: { raw: string; transport: "socket" | "file"; at: number } | null = null;
+
+/**
+ * Every listener currently advertising itself in the bridge folder. Never
+ * throws: a half-written or hand-mangled file is simply not a listener, which
+ * the caller already has to tolerate because the panel can die between
+ * publishing the file and binding the port.
+ */
+function readAllRendezvous(): Rendezvous[] {
+  const found: Rendezvous[] = [];
+  let dir: string;
+  let names: string[];
+  try {
+    dir = getAETempDir();
+    names = fs.readdirSync(dir);
+  } catch {
+    return found;
+  }
+  for (const name of names) {
+    const port = parseRendezvousFileName(name);
+    if (port === null) continue;
+    try {
+      const parsed = parseRendezvous(fs.readFileSync(path.join(dir, name), "utf8"), port);
+      if (parsed && isSupportedRendezvous(parsed)) found.push(parsed);
+    } catch {
+      /* unreadable or mid-write: skip it, discovery runs again in REDISCOVER_MS */
+    }
+  }
+  return found;
+}
+
+/**
+ * The listener to talk to, cached for REDISCOVER_MS. The cache is what keeps a
+ * closed panel cheap: it costs one wasted connection refusal every 5 seconds
+ * rather than a directory scan plus a refusal on every single command.
+ */
+function maybeDiscover(): Rendezvous | null {
+  const now = Date.now();
+  if (!shouldRediscover(transportState.lastDiscoveryAt, now)) {
+    return transportState.rendezvous;
+  }
+  transportState.lastDiscoveryAt = now;
+  transportState.rendezvous = selectRendezvous(readAllRendezvous(), transportState.pinnedPort);
+  return transportState.rendezvous;
+}
+
+/**
+ * A socket attempt failed. Drop the cached target so the next command
+ * rediscovers rather than retrying a listener we just proved is not there.
+ *
+ * Only a `connect` failure proves the port is dead, and only then is deleting
+ * the rendezvous file justified, and only once it is old enough that no live
+ * panel could still own it. Deleting on any other phase would race a working
+ * panel that merely hit one bad command.
+ */
+function noteSocketFailure(target: Rendezvous, phase: SendPhase): void {
+  transportState.rendezvous = null;
+  transportState.lastDiscoveryAt = null;
+  if (phase !== "connect") return;
+  if (!isStaleRendezvous(target, Date.now())) return;
+  try {
+    fs.unlinkSync(path.join(getAETempDir(), rendezvousFileName(target.port)));
+    console.error(`Removed stale bridge rendezvous file for port ${target.port}.`);
+  } catch {
+    /* already gone, or not ours to remove */
+  }
 }
 
 function readResultsFromTempFile(): string {
@@ -165,15 +267,20 @@ async function waitForBridgeResult(
     await new Promise((r) => setTimeout(r, delay));
     delay = nextPollDelay(delay, pollMs);
   }
-  return JSON.stringify({
-    error: `Timed out waiting for bridge result${expectedCommand ? ` for command '${expectedCommand}'` : ""}.`,
-  });
+  return bridgeTimeoutResult(expectedCommand);
 }
 
-function writeCommandFile(command: string, args: Record<string, any> = {}): string {
+// `existingId` lets the caller mint the id ONCE and share it across both
+// transports, so a socket attempt and its file-transport retry carry the same
+// _commandId and the panel's own dedup can recognize them as one command.
+function writeCommandFile(
+  command: string,
+  args: Record<string, any> = {},
+  existingId?: string,
+): string {
   try {
     const commandFile = path.join(getAETempDir(), "ae_command.json");
-    const commandId = nextCommandId();
+    const commandId = existingId || nextCommandId();
     lastCommandId = commandId;
     const commandData = {
       command,
@@ -223,11 +330,29 @@ function bridgeMutex<T>(fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
-// One-stop bridge call used by every tool: atomically (under the mutex) clear the
-// result file, write the command with a unique id, and wait for the matching
-// result. Returns the raw result string, or a synthetic {status:"error"} JSON if
-// the command file could not be written (permission / OneDrive), so callers never
-// silently fall back to a previous command's id.
+// One-stop bridge call used by every tool. Tries the TCP socket first and falls
+// back to the file transport, all under the mutex so each bridge interaction
+// stays atomic with respect to the others.
+//
+// The signature and contract are UNCHANGED from the file-only version: returns
+// the raw result string, returns a synthetic {"error":"Timed out..."} on timeout,
+// returns a {status:"error"} envelope if the command could not be delivered at
+// all, and never throws. All 83 call sites and the bridgeToolResult wiring are
+// untouched. `pollMs` is kept because it still governs the file fallback.
+//
+// WHEN IS FALLING BACK SAFE? Only from a state that proves nothing executed.
+// The panel writes its ACK BEFORE dispatching to executeCommand, which is what
+// makes that provable:
+//
+//   phase "connect"  -> FALL BACK. Zero bytes reached a socket.
+//   phase "ack"      -> FALL BACK. No valid ACK, so the panel never dispatched.
+//   phase "auth"     -> FALL BACK. The panel refused before dispatching.
+//   phase "io"       -> DO NOT. Failed AFTER a valid ACK; the command may have run.
+//   phase "deadline" -> DO NOT. Same, and this reproduces today's exact behavior.
+//
+// Retrying a command that already ran would double-execute it, and deleteLayer
+// is not idempotent. That is the entire argument; canFallbackFrom() in
+// src/lib/bridge-socket-client.ts is where it is encoded.
 async function sendBridgeCommand(
   command: string,
   args: Record<string, any> = {},
@@ -235,15 +360,83 @@ async function sendBridgeCommand(
   pollMs: number = 250,
 ): Promise<string> {
   return bridgeMutex(async () => {
+    // Minted once and shared by both transports, so a fallback retry carries the
+    // same id the socket attempt used.
+    const id = nextCommandId();
+
+    if (transportState.mode !== "file") {
+      const target = maybeDiscover();
+
+      if (!target) {
+        if (transportState.mode === "socket") {
+          return JSON.stringify({
+            status: "error",
+            error: `No After Effects bridge listener found in ${getAETempDir()}. AE_MCP_BRIDGE_TRANSPORT=socket forbids the file fallback. Open the MCP Bridge Auto panel, or unset the variable to allow files.`,
+          });
+        }
+        // No listener published: an older panel, or one whose bind failed. The
+        // file transport is exactly right here, so this is not even a warning.
+      } else {
+        const sent = await sendOverSocket({
+          port: target.port,
+          token: target.token,
+          commandId: id,
+          command,
+          args,
+          timeoutMs,
+        });
+
+        if (sent.ok) {
+          lastCommandId = id;
+          lastBridgeResult = { raw: sent.raw, transport: "socket", at: Date.now() };
+          return sent.raw;
+        }
+
+        noteSocketFailure(target, sent.phase);
+
+        if (!sent.canFallback) {
+          // The command may already be running inside AE. Retrying it over the
+          // file transport could execute it a second time, so we report instead.
+          if (sent.phase === "deadline") {
+            // Byte for byte what the file transport returns on a timeout, so a
+            // slow command looks the same to every caller on either transport.
+            return bridgeTimeoutResult(command);
+          }
+          return JSON.stringify({
+            status: "error",
+            error: `The After Effects bridge connection failed after the command was acknowledged (${sent.reason}). The command may have already run, so it was NOT retried. Check the panel's log before running it again.`,
+            _commandId: id,
+            _transport: "socket",
+          });
+        }
+
+        if (transportState.mode === "socket") {
+          return JSON.stringify({
+            status: "error",
+            error: `The socket transport failed (${sent.phase}: ${sent.error}). AE_MCP_BRIDGE_TRANSPORT=socket forbids the file fallback.`,
+            _commandId: id,
+            _transport: "socket",
+          });
+        }
+
+        console.error(
+          `Socket transport unavailable for '${command}' (${sent.phase}: ${sent.reason}); falling back to the file transport.`,
+        );
+      }
+    }
+
+    // File transport: unchanged from before the socket existed.
     clearResultsFile();
-    const id = writeCommandFile(command, args);
-    if (!id) {
+    const written = writeCommandFile(command, args, id);
+    if (!written) {
       return JSON.stringify({
         status: "error",
         error: `Failed to write the '${command}' command to the bridge folder. Check folder permissions / that it is not a OneDrive-redirected path.`,
       });
     }
-    return waitForBridgeResult(command, timeoutMs, pollMs, id);
+    const raw = await waitForBridgeResult(command, timeoutMs, pollMs, id);
+    lastBridgeResult = { raw, transport: "file", at: Date.now() };
+    return raw;
   });
 }
 

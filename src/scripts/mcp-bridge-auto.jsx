@@ -6354,18 +6354,22 @@ function logToPanel(message) {
  */
 function emitResult(resultString) {
     if (currentResultSink) {
-        // The file-transport format is pretty-printed (JSON.stringify(...,
-        // null, 2)) with real embedded newline bytes. NDJSON framing requires
-        // exactly one line per frame, so sent as-is this would fragment into
-        // several bogus lines under the client's byte-0x0A frame reader.
-        // Collapse to compact single-line JSON before it goes on the wire.
-        try {
-            currentResultSink(JSON.stringify(JSON.parse(resultString)));
-        } catch (e) {
-            // Not valid JSON (should not happen; executeCommand always wraps
-            // non-JSON results). Send as-is rather than lose the result.
-            currentResultSink(resultString);
-        }
+        /*
+         * NDJSON framing needs exactly ONE line per frame, and the envelope is
+         * built with JSON.stringify(obj, null, 2), so it is full of real
+         * newline bytes. Worse, ExtendScript emits them even where a compact
+         * serializer would not: an empty array comes out as "[\n\n]" no matter
+         * what indent argument is passed, which is what truncated the first
+         * findMissingFootage result at "items":[ .
+         *
+         * Stripping raw CR/LF is safe and complete. In serialized JSON a raw
+         * 0x0A byte is ALWAYS insignificant whitespace between tokens: a
+         * newline inside a string value is escaped to the two characters
+         * backslash-n by every serializer here (see the esc() shim above), so
+         * it is never a 0x0A byte. Removing them therefore cannot corrupt a
+         * payload, only the indentation nobody reads on this path.
+         */
+        currentResultSink(("" + resultString).replace(/[\r\n]+/g, ""));
         return;
     }
     var resultFile = new File(getResultFilePath());

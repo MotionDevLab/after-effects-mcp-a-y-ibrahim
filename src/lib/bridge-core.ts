@@ -243,6 +243,20 @@ export function nextPollDelay(current: number, cap: number, factor: number = 1.5
 }
 
 /**
+ * The exact result string the server synthesizes when a command times out.
+ *
+ * Both transports must produce this byte for byte: a socket command that blows
+ * its deadline is indistinguishable, from the caller's point of view, from a
+ * file command that was never answered, and 83 tools plus their tests already
+ * depend on this wording. Extracted so the two paths cannot drift apart.
+ */
+export function bridgeTimeoutResult(expectedCommand?: string): string {
+  return JSON.stringify({
+    error: `Timed out waiting for bridge result${expectedCommand ? ` for command '${expectedCommand}'` : ""}.`,
+  });
+}
+
+/**
  * Create a monotonic command-id generator. Each call to the returned function
  * yields a unique, strictly increasing id of the form `${now}-${seq}` so the
  * server can match the exact result for a command instead of guessing by

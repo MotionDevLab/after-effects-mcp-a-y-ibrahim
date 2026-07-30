@@ -247,11 +247,39 @@ export function sendOverSocket(opts: SendOverSocketOptions): Promise<SendResult>
 
     socket.on("close", () => {
       if (settled) return;
-      // A peer that closed without a trailing newline still owes us its last
-      // frame; take it before deciding this was a failure.
+      // A peer that closed without a trailing newline may still owe us its last
+      // frame. Accept it ONLY if it parses as a JSON object.
+      //
+      // An unterminated fragment is far more likely to be a TRUNCATED result
+      // than a well-formed one missing its newline, and handing a caller half a
+      // JSON document as though it succeeded is the worst possible outcome: it
+      // is silent. This is not hypothetical, it is how a real panel bug reached
+      // a caller looking like success. If it does not parse, report io: the
+      // command was acknowledged so it did run, we merely lost the answer, and
+      // it must NOT be retried.
       const rest = reader.flush();
       if (rest !== null && rest.length > 0 && phase === "await-result") {
-        finish({ ok: true, raw: rest, ackMs: ackAt - startedAt, totalMs: Date.now() - startedAt });
+        let complete: boolean;
+        try {
+          const parsed = JSON.parse(rest);
+          complete = !!parsed && typeof parsed === "object";
+        } catch {
+          complete = false;
+        }
+        if (complete) {
+          finish({
+            ok: true,
+            raw: rest,
+            ackMs: ackAt - startedAt,
+            totalMs: Date.now() - startedAt,
+          });
+        } else {
+          fail(
+            "io",
+            "truncated",
+            `The AE bridge closed mid-result; the ${rest.length} bytes received are not valid JSON. The command ran, so it was NOT retried.`,
+          );
+        }
         return;
       }
       if (phase === "connecting") {
