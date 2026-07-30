@@ -49,7 +49,61 @@ line-art.
 object, `vertices`/`inTangents`/`outTangents` arrays) is fiddly but
 well-trodden ground.
 
-### 2. Puppet pin / mesh deformation
+### 2. Puppet pin / mesh deformation — INVESTIGATED 2026-07-30: already covered, no new tool needed
+Verified live (branch `feature/puppet-pin-investigation`) against a real
+puppet-pinned layer in the user's working project (a layer with the
+Advanced Puppet engine and 6 pins already placed by hand in the AE UI).
+
+**Good news, unlike the layer-styles block**: once a mesh/pins exist,
+Puppet shows up as an entirely ordinary effect - `layer.Effects` contains
+`"Puppet"` (matchName `"ADBE FreePin3"`) - and its properties are fully
+readable AND writable through the tools this repo already has
+(`list-layer-effects`, `set-effect-property`, `add-any-effect`). No
+"hidden property" restriction like Layer Styles had. Confirmed:
+- `list-layer-effects` (`includeProperties: true, includeValues: true`)
+  walks all the way down through `Puppet` -> `"ADBE FreePin3 ARAP Group"`
+  -> `"ADBE FreePin3 Mesh Group"` -> `"ADBE FreePin3 Mesh Atom"` ("Mesh 1")
+  -> `"ADBE FreePin3 PosPins"` ("Deform") -> each pin (`"Puppet Pin 1"`
+  .. `"Puppet Pin 6"`), each with real `Position`/`Scale`/`Rotation` values
+  and `canSetExpression: true`, `canVaryOverTime: true` - the same
+  writable-property signature every other scriptable property in this
+  codebase shows (Layer Styles showed the opposite).
+- `set-effect-property` successfully wrote to a pin's Position (verified
+  with a fully reversible test: toggle an identity expression on, confirm
+  `expressionEnabled: true` with the value unchanged, then toggle it back
+  off - avoided touching the user's real hand-placed mesh/keyframes).
+  Setting `value`/`timeInSeconds` to keyframe pin motion follows the exact
+  same call shape already used for every other effect property.
+
+**One real gotcha to document**: a pin's property-GROUP matchName
+(`"ADBE FreePin3 PosPin Atom"`) is **shared by all pins** - it does not
+disambiguate which pin. You must select the specific pin by its **display
+name** (`"Puppet Pin 1"`, `"Puppet Pin 2"`, ...) as one segment of
+`propertyPath`, then the matchName again for the property within it
+(e.g. `"ADBE FreePin3 PosPin Position"`). Example working path used in the
+live test:
+```
+["ADBE FreePin3 ARAP Group", "ADBE FreePin3 Mesh Group",
+ "ADBE FreePin3 Mesh Atom", "ADBE FreePin3 PosPins",
+ "Puppet Pin 1", "ADBE FreePin3 PosPin Position"]
+```
+
+**Still not scriptable, confirmed by AE's own scripting model (not tested
+live, no code path exists to test)**: creating the mesh itself - placing
+pins, triangulating - has no ExtendScript API. That step still requires a
+human using the Puppet Pin tool interactively in the AE UI. This gap is
+therefore scoped narrower than originally written: not "no puppet
+exposure at all," but specifically "no way to *create* a puppet mesh" -
+*animating* one that already exists needs zero new code.
+
+**Conclusion: no new tool built.** This isn't a code gap, it's a
+documentation gap - closed by this entry. Anyone wanting to animate an
+existing puppet-pinned layer can already do so today via
+`list-layer-effects` (to enumerate pins and read current values) and
+`set-effect-property` (to keyframe a pin's Position/Scale/Rotation over
+time), following the property-path pattern above.
+
+Original assessment (kept for reference):
 No exposure of the Puppet tool (pins, mesh, starch) at all. This is a
 distinct AE subsystem from shape/mask paths.
 **Value**: niche — only matters for character/organic deformation work.
@@ -176,8 +230,13 @@ item #1 (shape path authoring) was implemented and verified live:
    `see-frame`'s `frameNumbers` param above.
 4. ~~**Shape layer path authoring** (#1)~~ — **done**, see
    `set-shape-path`/`get-shape-path` in `CONTEXT.md`.
-5. **Puppet pin / mesh** (#2) — the only remaining candidate, and still
-   the lowest recommended priority: niche use case, high implementation
-   cost, thin scripting API to build against. Nothing else is currently
-   tracked here; new gaps should be added as they're found rather than
-   forcing work against this one for completeness.
+5. ~~**Puppet pin / mesh** (#2)~~ — **investigated, no new tool needed**:
+   animating an existing puppet mesh is already fully covered by
+   `list-layer-effects`/`set-effect-property`, confirmed live. See the
+   corrected assessment above for the working property-path pattern.
+
+All five tracked candidates are now resolved (three shipped as new tools,
+one confirmed already covered by existing tools, one confirmed blocked by
+AE's own scripting API). Nothing is currently tracked here; new gaps
+should be added as they're found rather than manufacturing work against
+this list for completeness.
